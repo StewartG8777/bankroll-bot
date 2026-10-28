@@ -216,5 +216,23 @@ client.on('error', (e) => console.error('Client error:', e));
 client.on('shardError', (e) => console.error('Shard error:', e));
 client.on('shardDisconnect', (ev, id) => console.error('Shard disconnected', id, ev.code));
 client.on('warn', (m) => console.warn('Warn:', m));
+client.on('shardReady', (id) => console.log('Shard ready', id));
+client.on('shardReconnecting', (id) => console.log('Shard reconnecting', id));
+client.on('debug', (m) => {
+  if (!DISCORD_TOKEN || !m.includes(DISCORD_TOKEN)) console.log('[debug]', m);
+});
 console.log('Token present:', !!DISCORD_TOKEN, 'length:', DISCORD_TOKEN?.length);
-client.login(DISCORD_TOKEN).catch((e) => console.error('Login failed:', e));
+
+// Check whether Discord is reachable from this server at all
+fetch('https://discord.com/api/v10/gateway')
+  .then(async (r) => console.log('Discord API check:', r.status, (await r.text()).slice(0, 150)))
+  .catch((e) => console.error('Discord API check failed:', e.message));
+
+setTimeout(() => {
+  if (!started) console.error('NOT logged in after 45 seconds');
+}, 45000);
+
+client
+  .login(DISCORD_TOKEN)
+  .then(() => console.log('login() resolved'))
+  .catch((e) => console.error('Login failed:', e));
