@@ -490,6 +490,60 @@ let lastJsonMsg = null;
 
 // Every stored file (vault, files waiting for payment, hosted downloads), as paths under DATA_DIR.
 const BLOB_CHUNK = 9 * 1024 * 1024; // Discord allows about 10 MB per upload, so big files go up in 9 MB parts
+
+// Logs an invoice embed plus a copy of its file (vault or uploaded) to the bankroll log channel.
+// The whole file goes up with the embed; only if Discord refuses it (too big for the server)
+// does it fall back to the embed followed by the file in 9 MB parts.
+async function logInvoiceWithFile(embed, fileData, filePath, label) {
+  const size = fileData?.size;
+  if (!filePath || !size || !fs.existsSync(filePath)) {
+    await logToServer({ embeds: [embed] });
+    return;
+  }
+  const buffer = await fs.promises.readFile(filePath);
+  if (size <= BLOB_CHUNK) {
+    await logToServer({ embeds: [embed], files: [{ buffer, name: fileData.name }] });
+    return;
+  }
+  const ch0 = await getLogChannel();
+  if (ch0) {
+    try {
+      await ch0.send({
+        embeds: [embed],
+        files: [new AttachmentBuilder(buffer, { name: fileData.name })],
+        allowedMentions: { parse: [] },
+      });
+      return;
+    } catch (e) {
+      console.error('Whole-file log post failed, sending in parts:', e.message);
+    }
+  }
+  await logToServer({ embeds: [embed] });
+  const ch = await getLogChannel();
+  if (!ch) {
+    console.error('Log copy of big file skipped: no log channel (webhook cannot take files)');
+    return;
+  }
+  const total = Math.ceil(size / BLOB_CHUNK);
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    for (let i = 0; i < total; i++) {
+      const len = Math.min(BLOB_CHUNK, size - i * BLOB_CHUNK);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, i * BLOB_CHUNK);
+      await ch.send({
+        content: `File copy for invoice \`${label}\`: **${fileData.name}** (part ${i + 1}/${total})`,
+        files: [new AttachmentBuilder(buf, { name: total === 1 ? fileData.name : `${fileData.name}.part${i + 1}of${total}` })],
+        allowedMentions: { parse: [] },
+      });
+    }
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
 const blobBackedUp = {}; // relative path -> size already in the backup channel
 function relData(p) {
   if (!p) return null;
@@ -1577,17 +1631,10 @@ async function sendStripeCheckout(interaction) {
       stripe.checkout.sessions.update(session.id, { metadata: { invoice_msg_url: sentInvoice.url } }).catch(() => {});
     }
     
-    // GUARANTEED LOGGING
-    (async () => {
-      let logFiles;
-      const dp = deliveries[session.id]?.path;
-      if (fileData && dp && (fileData.size ?? 0) <= 100 * 1024 * 1024) {
-        try {
-          logFiles = [{ buffer: await fs.promises.readFile(dp), name: fileData.name }];
-        } catch {}
-      }
-      await logToServer({ embeds: [embed], files: logFiles });
-    })().catch((e) => console.error('Logging failed:', e.message));
+    // GUARANTEED LOGGING (invoice + a copy of the file, any size)
+    logInvoiceWithFile(embed, fileData, deliveries[session.id]?.path, session.id).catch((e) =>
+      console.error('Logging failed:', e.message)
+    );
 
     if (fileData || linkUrl) {
       liveInteractions.set(session.id, { interaction, at: Date.now() });
@@ -1747,16 +1794,9 @@ async function sendMonzoInvoice(interaction) {
       monzoLedger[key].msgUrl = sentInvoice.url;
       saveMonzo();
     }
-    (async () => {
-      let logFiles;
-      const dp = deliveries[key]?.path;
-      if (fileData && dp && (fileData.size ?? 0) <= 100 * 1024 * 1024) {
-        try {
-          logFiles = [{ buffer: await fs.promises.readFile(dp), name: fileData.name }];
-        } catch {}
-      }
-      await logToServer({ embeds: [embed], files: logFiles });
-    })().catch((e) => console.error('Logging failed:', e.message));
+    logInvoiceWithFile(embed, fileData, deliveries[key]?.path, key).catch((e) =>
+      console.error('Logging failed:', e.message)
+    );
 
     liveInteractions.set(key, { interaction, at: Date.now() });
     setTimeout(() => liveInteractions.delete(key), 14 * 60 * 1000);
