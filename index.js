@@ -35,7 +35,15 @@ const {
   PORT = 3000,
   PUBLIC_URL = '',
   BACKUP_CHANNEL_ID = '',
+  MONZO_ME_URL = '',
+  MONZO_PAYMENT_DETAILS = '',
+  MONZO_WEBHOOK_TOKEN = '',
+  MONZO_USERNAME = '',
+  MONZO_ACCOUNT_ID = '',
+  MONZO_ACCESS_TOKEN = '',
 } = process.env;
+
+const MONZO_LINK = (MONZO_ME_URL || (MONZO_USERNAME ? `https://monzo.me/${MONZO_USERNAME.replace(/^\/+|\/+$/g, '')}` : '')).replace(/\/+$/, '');
 
 const stripe = new Stripe(STRIPE_SECRET_KEY);
 const client = new Client({
@@ -372,6 +380,7 @@ async function deliverFile(key, paymentIntentId) {
     owner = await client.users.fetch(OWNER_ID);
   } catch {}
 
+  const noFile = !d.link && !d.path;
   let dlink = d.link || null;
   let hosted = false;
   if (!dlink && BASE_URL && d.mode !== 'direct' && d.path && fs.existsSync(d.path)) {
@@ -379,7 +388,7 @@ async function deliverFile(key, paymentIntentId) {
     hosted = true;
   }
   let buffer = null;
-  if (!dlink) {
+  if (!dlink && !noFile) {
     try {
       buffer = fs.readFileSync(d.path);
     } catch {
@@ -395,7 +404,9 @@ async function deliverFile(key, paymentIntentId) {
   }
 
   const payload = () =>
-    dlink
+    noFile
+      ? { content: `<@${d.customerId}> payment received. Thank you!` }
+      : dlink
       ? { content: `<@${d.customerId}> payment received. Here is your download link${hosted ? ' (works once, expires in 24 hours)' : ''}:\n<${dlink}>` }
       : {
           content: `<@${d.customerId}> payment received. Here is the file for this purchase.`,
@@ -413,8 +424,10 @@ async function deliverFile(key, paymentIntentId) {
       const original = await live.interaction.fetchReply();
       const old = original.embeds[0];
       if (old) {
+        const paidEmbed = EmbedBuilder.from(old).setColor(GREY).setTitle(`PAID - ${old.title}`);
+        if (d.type === 'monzo') paidEmbed.setDescription('Payment received. Thank you!');
         await live.interaction.editReply({
-          embeds: [EmbedBuilder.from(old).setColor(GREY).setTitle(`PAID - ${old.title}`)],
+          embeds: [paidEmbed],
           components: [],
         });
       }
@@ -545,6 +558,37 @@ const bankrollCmd = common(
       o
         .setName('expires')
         .setDescription('Expiration time, e.g. 30m, 2h, 24h, or 7d (default: no expiry)')
+    )
+);
+
+const monzoCmd = common(
+  new SlashCommandBuilder()
+    .setName('monzo')
+    .setDescription('Create a Monzo (bank transfer) invoice for a customer')
+    .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
+    .addNumberOption((o) =>
+      o.setName('amount').setDescription('Amount to charge in GBP').setMinValue(1).setRequired(true)
+    )
+    .addStringOption((o) =>
+      o.setName('description').setDescription('What the purchase is for').setRequired(true)
+    )
+    .addAttachmentOption((o) =>
+      o.setName('file').setDescription('File to send the customer once they have paid')
+    )
+    .addStringOption((o) =>
+      o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true)
+    )
+    .addStringOption((o) =>
+      o
+        .setName('delivery')
+        .setDescription('How to deliver the file (only used with a file)')
+        .addChoices(
+          { name: 'Hosted one-time link', value: 'link' },
+          { name: 'Direct file upload', value: 'direct' }
+        )
+    )
+    .addStringOption((o) =>
+      o.setName('link').setDescription('Download link to send once they have paid (for big files)')
     )
 );
 
@@ -705,7 +749,7 @@ const setupCmd = new SlashCommandBuilder()
   .setIntegrationTypes([ApplicationIntegrationType.GuildInstall])
   .setContexts([InteractionContextType.Guild]);
 
-const commands = [bankrollCmd, vaultCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
+const commands = [bankrollCmd, monzoCmd, vaultCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -1052,6 +1096,125 @@ async function sendStripeCheckout(interaction) {
   } catch (err) {
     console.error(err);
     await interaction.editReply({ content: `Failed to create invoice: ${err.message}` });
+  }
+}
+
+// ---------- Monzo invoice (/monzo) ----------
+async function sendMonzoInvoice(interaction) {
+  const customer = interaction.options.getUser('customer');
+  const amount = Math.round(interaction.options.getNumber('amount') * 100) / 100;
+  const description = interaction.options.getString('description');
+  const agent = interaction.user;
+
+  await interaction.deferReply();
+
+  try {
+    const file = interaction.options.getAttachment('file');
+    const vaultKey = interaction.options.getString('vault_file');
+    const linkRaw = interaction.options.getString('link');
+
+    if ((file && vaultKey) || (file && linkRaw) || (vaultKey && linkRaw)) {
+      throw new Error('Use only one of: attached file, vault file, or download link.');
+    }
+    if (!MONZO_LINK && !MONZO_PAYMENT_DETAILS) {
+      throw new Error('Monzo is not set up yet. Add MONZO_USERNAME (or MONZO_ME_URL / MONZO_PAYMENT_DETAILS) in the bot environment variables.');
+    }
+
+    let linkUrl = null;
+    if (linkRaw) {
+      try {
+        const u = new URL(linkRaw.trim());
+        if (!/^https?:$/.test(u.protocol)) throw new Error();
+        linkUrl = u.href;
+      } catch {
+        throw new Error('That link is not valid. It must start with https://');
+      }
+    }
+
+    const mode = interaction.options.getString('delivery') ?? (BASE_URL ? 'link' : 'direct');
+    if ((file || vaultKey) && mode === 'link' && !BASE_URL) {
+      throw new Error('Hosted links are not set up yet (PUBLIC_URL is missing). Pick Direct file upload.');
+    }
+
+    let fileData = null;
+    if (file) {
+      fileData = await downloadAttachment(file, mode === 'link');
+    } else if (vaultKey) {
+      const item = vault[vaultKey];
+      if (!item || !fs.existsSync(item.path)) {
+        throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
+      }
+      fileData = { buffer: fs.readFileSync(item.path), name: item.originalName };
+    }
+
+    const reference = 'BR' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
+    const key = `monzo_${crypto.randomBytes(8).toString('hex')}`;
+
+    if (fileData) saveDelivery(key, fileData, interaction, customer);
+    else if (linkUrl) saveLinkDelivery(key, linkUrl, interaction, customer);
+    else {
+      deliveries[key] = {
+        name: 'no file',
+        channelId: interaction.channelId,
+        customerId: customer.id,
+        agentId: agent.id,
+        savedAt: Date.now(),
+      };
+    }
+    Object.assign(deliveries[key], {
+      type: 'monzo',
+      paid: false,
+      amount,
+      reference,
+      description,
+    });
+    saveDeliveries();
+
+    const where = whereFrom(interaction, customer);
+    const embed = new EmbedBuilder()
+      .setColor(GREEN)
+      .setTitle('Bankroll Monzo Invoice Created')
+      .setDescription('Awaiting payment. Pay the exact amount below and include the reference.')
+      .addFields(
+        { name: 'Sales Agent', value: `<@${agent.id}>` },
+        { name: 'Customer', value: `<@${customer.id}>` },
+        { name: 'Amount', value: money(amount, 'gbp'), inline: true },
+        { name: 'Payment reference', value: `\`${reference}\``, inline: true },
+        { name: 'Description', value: description }
+      );
+    if (MONZO_PAYMENT_DETAILS) embed.addFields({ name: 'Pay to', value: MONZO_PAYMENT_DETAILS.replace(/\\n/g, '\n') });
+    if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (sent here as soon as payment lands)` });
+    if (linkUrl) embed.addFields({ name: 'Download', value: 'Link sent here as soon as payment lands' });
+    embed
+      .addFields(
+        { name: 'Generated In Guild', value: where.guild },
+        { name: 'Generated In Channel', value: where.channel }
+      )
+      .setFooter({ text: `Created by ${agent.username} | ID: ${key}` });
+
+    const row = new ActionRowBuilder();
+    if (MONZO_LINK) {
+      const payUrl = `${MONZO_LINK}/${amount.toFixed(2)}?d=${encodeURIComponent(reference)}`;
+      row.addComponents(new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(payUrl));
+    }
+    if (fileData || linkUrl) {
+      row.addComponents(
+        new ButtonBuilder().setCustomId(`getfile:${key}`).setLabel('Get my file').setStyle(ButtonStyle.Secondary)
+      );
+    }
+
+    await interaction.editReply({
+      content: `<@${customer.id}>`,
+      embeds: [embed],
+      components: row.components.length ? [row] : [],
+    });
+    await logToServer({ embeds: [embed] });
+
+    liveInteractions.set(key, { interaction, at: Date.now() });
+    setTimeout(() => liveInteractions.delete(key), 14 * 60 * 1000);
+  } catch (err) {
+    console.error(err);
+    await interaction.editReply({ content: `Failed to create Monzo invoice: ${err.message}` });
   }
 }
 
@@ -1569,7 +1732,8 @@ async function onAutocomplete(interaction) {
     // Vault remove/info autocomplete
     if (
       (interaction.commandName === 'vault' && ['remove', 'info'].includes(interaction.options.getSubcommand())) ||
-      interaction.commandName === 'bankroll'
+      interaction.commandName === 'bankroll' ||
+      interaction.commandName === 'monzo'
     ) {
       const typed = interaction.options.getFocused().toLowerCase();
       const entries = Object.entries(vault);
@@ -1776,6 +1940,14 @@ async function onGetFile(interaction) {
     return interaction.reply({ content: 'Only the customer can get this file.', ephemeral: true });
   }
 
+  if (d.type === 'monzo') {
+    if (!d.paid) {
+      return interaction.reply({ content: 'Payment has not been received yet.', ephemeral: true });
+    }
+    await interaction.reply({ content: 'Sending your file now.', ephemeral: true });
+    return deliverFile(key, null);
+  }
+
   const session = await stripe.checkout.sessions.retrieve(key);
   if (session.payment_status !== 'paid') {
     return interaction.reply({
@@ -1915,6 +2087,8 @@ client.on('interactionCreate', async (interaction) => {
     switch (interaction.commandName) {
       case 'bankroll':
         return await sendStripeCheckout(interaction);
+      case 'monzo':
+        return await sendMonzoInvoice(interaction);
       case 'vault':
         return await cmdVault(interaction);
       case 'cancel':
@@ -1959,31 +2133,69 @@ client.on('interactionCreate', async (interaction) => {
 // ---------- Monzo Webhook Listener ----------
 const app = express();
 
+const processedMonzoTx = new Set();
+
 app.post('/monzo-webhook', express.json(), async (req, res) => {
-  console.log('Monzo webhook hit! Body:', JSON.stringify(req.body));
+  if (MONZO_WEBHOOK_TOKEN && req.query.token !== MONZO_WEBHOOK_TOKEN) {
+    console.error('Monzo webhook rejected: bad or missing token');
+    return res.status(403).send('Forbidden');
+  }
+  console.log('Monzo webhook hit! Type:', req.body?.type);
+  res.status(200).send('OK');
+
   try {
     const data = req.body?.data;
-    if ((req.body?.type === 'transaction.created' || req.body?.type === 'transaction.create') && data) {
-      const amountPaid = data.amount / 100;
-      console.log(`Monzo transaction.create received for amount: ${amountPaid}`);
-      if (amountPaid > 0) {
-        for (const [key, delivery] of Object.entries(deliveries)) {
-          if (delivery.type === 'monzo' && !delivery.paid) {
-            if (Math.abs(amountPaid - delivery.amount) < 0.01) {
-              delivery.paid = true;
-              saveDeliveries();
-              await deliverFile(key, null);
-              console.log(`Monzo payment amount-matched and delivered for invoice: ${key} (${amountPaid})`);
-              break;
-            }
-          }
-        }
+    if (req.body?.type !== 'transaction.created' || !data) return;
+    if (MONZO_ACCOUNT_ID && data.account_id && data.account_id !== MONZO_ACCOUNT_ID) return;
+    if (data.id) {
+      if (processedMonzoTx.has(data.id)) return;
+      processedMonzoTx.add(data.id);
+    }
+
+    // If an access token is set, double-check the transaction with Monzo's API (best effort:
+    // Monzo tokens expire, so on any failure we fall back to the webhook data).
+    let tx = data;
+    if (MONZO_ACCESS_TOKEN && data.id) {
+      try {
+        const r = await fetch(`https://api.monzo.com/transactions/${encodeURIComponent(data.id)}`, {
+          headers: { Authorization: `Bearer ${MONZO_ACCESS_TOKEN}` },
+        });
+        if (r.ok) tx = (await r.json()).transaction ?? data;
+        else console.log(`Monzo API check skipped (${r.status}); using webhook data. Token may have expired.`);
+      } catch (e) {
+        console.log('Monzo API check failed:', e.message);
       }
     }
-    res.status(200).send('OK');
+    if (tx.decline_reason) return;
+
+    const amountPaid = Math.round(Number(tx.amount)) / 100;
+    if (!(amountPaid > 0)) return;
+    console.log(`Monzo incoming payment: ${amountPaid}`);
+
+    const text = [tx.description, tx.notes, tx.counterparty?.name, tx.metadata?.notes, data.description, data.notes]
+      .filter(Boolean)
+      .join(' ')
+      .toUpperCase();
+
+    const open = Object.entries(deliveries).filter(
+      ([, d]) => d.type === 'monzo' && !d.paid && Math.abs(amountPaid - d.amount) < 0.01
+    );
+    let matches = open.filter(([, d]) => d.reference && text.includes(d.reference));
+    if (!matches.length) matches = open;
+
+    if (matches.length === 1) {
+      const [key, delivery] = matches[0];
+      delivery.paid = true;
+      saveDeliveries();
+      await deliverFile(key, null);
+      console.log(`Monzo payment delivered for invoice ${key} (${amountPaid})`);
+    } else if (matches.length > 1) {
+      await notifyOwner({
+        content: `Monzo payment of ${money(amountPaid, 'gbp')} arrived but ${matches.length} open invoices match that amount, so nothing was sent automatically. Ask the customer for their reference, then mark the right one as paid manually.`,
+      });
+    }
   } catch (e) {
     console.error('Monzo webhook error:', e.message);
-    res.status(500).send('Error processing webhook');
   }
 });
 
