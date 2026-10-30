@@ -1139,29 +1139,28 @@ function parseExpiresToMinutes(input) {
 const CHECKIN_PCTS = [25, 50, 75];
 const agentReminderTimers = new Map();
 
-function checkinEmbed({ pct, customerId, amount, currency, description, expiresSec, reference, label = 'Invoice' }) {
+function checkinEmbed({ pct, customerId, amount, currency, description, expiresSec, reference, msgUrl, label = 'Invoice' }) {
   const filled = Math.round(pct / 25);
-  const bar = '🟩'.repeat(filled) + '⬜'.repeat(4 - filled);
+  const bar = '▰'.repeat(filled) + '▱'.repeat(4 - filled);
   const e = new EmbedBuilder()
     .setColor(pct >= 75 ? RED : pct >= 50 ? 0xf1c40f : GREEN)
     .setTitle(`⏰ ${label} check-in: ${pct}% of the time used`)
-    .setDescription(`⚠️ <@${customerId}> still hasn't paid.`)
+    .setDescription(`<@${customerId}> still hasn't paid.`)
     .addFields(
-      { name: '💷 Amount', value: money(amount, currency), inline: true },
-      { name: '⏳ Expires', value: `<t:${expiresSec}:R>`, inline: true },
-      ...(reference ? [{ name: '🔖 Reference', value: `\`${reference}\``, inline: true }] : []),
-      { name: '📝 Description', value: short(description, 200) || 'No description' },
-      { name: '📊 Time used', value: `${bar}  ${pct}%` }
+      { name: 'Amount', value: money(amount, currency), inline: true },
+      { name: 'Expires', value: `<t:${expiresSec}:R>`, inline: true },
+      ...(reference ? [{ name: 'Reference', value: `\`${reference}\``, inline: true }] : []),
+      { name: 'Description', value: short(description, 200) || 'No description' },
+      ...(msgUrl ? [{ name: 'Invoice message', value: `[Click here to see where the invoice was sent](${msgUrl})` }] : []),
+      { name: 'Time used', value: `${bar}  ${pct}%` }
     )
-    .setFooter({ text: '💬 Nudge them with /remind customer:@them' });
+    .setFooter({ text: 'Nudge them with /remind customer:@them' });
   return e;
 }
 
-function checkinRow(payUrl, msgUrl) {
-  const row = new ActionRowBuilder();
-  if (payUrl) row.addComponents(new ButtonBuilder().setLabel('💳 Pay link').setStyle(ButtonStyle.Link).setURL(payUrl));
-  if (msgUrl) row.addComponents(new ButtonBuilder().setLabel('🔗 Go to invoice message').setStyle(ButtonStyle.Link).setURL(msgUrl));
-  return row.components.length ? [row] : [];
+function checkinRow(payUrl) {
+  if (!payUrl) return [];
+  return [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('Pay link').setStyle(ButtonStyle.Link).setURL(payUrl))];
 }
 
 async function sendCheckin(agentId, payload, tag) {
@@ -1189,10 +1188,10 @@ function scheduleAgentReminder({ customerId, agentId, sessionId, amount, descrip
         const s = await stripe.checkout.sessions.retrieve(sessionId);
         if (s.status !== 'open' || s.metadata?.[`agent_notified_${pct}`]) return;
 
-        const embed = checkinEmbed({ pct, customerId, amount, currency, description, expiresSec: expiresAt });
+        const embed = checkinEmbed({ pct, customerId, amount, currency, description, expiresSec: expiresAt, msgUrl: s.metadata?.invoice_msg_url });
         const delivered = await sendCheckin(
           agentId,
-          { embeds: [embed], components: checkinRow(s.url, s.metadata?.invoice_msg_url) },
+          { embeds: [embed], components: checkinRow(s.url) },
           `${pct}% reminder`
         );
         if (delivered) {
@@ -1245,12 +1244,13 @@ function scheduleMonzoReminder(m) {
           description: e.description,
           expiresSec: tsec(end),
           reference: e.reference,
+          msgUrl: e.msgUrl,
           label: 'Monzo invoice',
         });
         const payUrl = MONZO_LINK ? `${MONZO_LINK}/${e.amount.toFixed(2)}?d=${encodeURIComponent(e.reference)}` : null;
         const delivered = await sendCheckin(
           e.agentId,
-          { embeds: [embed], components: checkinRow(payUrl, e.msgUrl) },
+          { embeds: [embed], components: checkinRow(payUrl) },
           `Monzo ${pct}% reminder`
         );
         if (delivered) {
