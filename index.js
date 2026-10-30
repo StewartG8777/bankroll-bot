@@ -33,6 +33,7 @@ const {
   BACKUP_CHANNEL_ID = '',
   MONZO_ACCESS_TOKEN = '',
   MONZO_ACCOUNT_ID = '',
+  MONZO_USERNAME = 'sstewart32',
 } = process.env;
 
 const stripe = new Stripe(STRIPE_SECRET_KEY);
@@ -357,7 +358,8 @@ async function deliverFile(key, paymentIntentId) {
 
   const payload = () =>
     dlink
-      ? { content: `<@${d.customerId}> payment received. Here is your download link${hosted ? ' (works once, expires in 24 hours)' : ''}:\n<${dlink}>` }
+      ? { content: `<@${d.customerId}> payment received. Here is your download link${hosted ? ' (works once, expires in 24 hours)' : ''}:
+<${dlink}>` }
       : buffer
       ? {
           content: `<@${d.customerId}> payment received. Here is the file for this purchase.`,
@@ -417,7 +419,8 @@ async function deliverFile(key, paymentIntentId) {
     try {
       await owner.send(
         dlink
-          ? { content: `Couldn't reach <@${d.customerId}>. Here is their download link:\n<${dlink}>` }
+          ? { content: `Couldn't reach <@${d.customerId}>. Here is their download link:
+<${dlink}>` }
           : buffer
           ? {
               content: `Couldn't reach <@${d.customerId}>. Here is their file.`,
@@ -489,7 +492,7 @@ const invoiceCmd = common(
 const monzoCmd = common(
   new SlashCommandBuilder()
     .setName('monzo')
-    .setDescription('Create a manual Monzo bank transfer invoice')
+    .setDescription('Create a Monzo.me bank transfer invoice with automated tracking')
     .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
     .addNumberOption((o) => o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true))
     .addStringOption((o) => o.setName('description').setDescription('What the purchase is for').setRequired(true))
@@ -536,19 +539,25 @@ client.on('interactionCreate', async (interaction) => {
     else if (linkRaw) saveLinkDelivery(invoiceKey, linkRaw, interaction, customer, 'monzo', amount);
     else saveDelivery(invoiceKey, null, interaction, customer, 'monzo', amount);
 
+    const monzoUrl = `https://monzo.me/${MONZO_USERNAME}/${amount.toFixed(2)}`;
+
     const embed = new EmbedBuilder()
       .setColor(GREEN)
       .setTitle('Monzo Bank Transfer Invoice')
-      .setDescription(`Please send a bank transfer using your Monzo app with the exact details below.`)
+      .setDescription(`Please click the button below to pay via Monzo.me.\n**Important:** Ensure you include reference code \\`${invoiceKey}\\` in the payment notes if prompted!`)
       .addFields(
-        { name: 'Amount to Send', value: money(amount, CURRENCY) },
-        { name: 'Reference / Notes Required', value: `\`${invoiceKey}\`` },
+        { name: 'Amount to Pay', value: money(amount, 'gbp') },
+        { name: 'Reference Required', value: `\\`${invoiceKey}\\`` },
         { name: 'Description', value: description },
-        { name: 'Status', value: '⏳ Waiting for incoming payment match...' }
+        { name: 'Status', value: '⏳ Waiting for automated payment match...' }
       )
       .setFooter({ text: `Invoice Ref: ${invoiceKey}` });
 
-    await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed] });
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(monzoUrl)
+    );
+
+    await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
     liveInteractions.set(invoiceKey, { interaction, at: Date.now() });
   }
 
