@@ -63,26 +63,26 @@ app.use(express.urlencoded({ extended: true }));
 // Basic uptime check route
 app.get('/', (req, res) => res.send('Bot and Webhooks are active!'));
 
-// --- Monzo Webhook Listener ---
+// --- Monzo Webhook Listener (Amount-Based Matching) ---
 app.post('/monzo-webhook', async (req, res) => {
   try {
     const data = req.body?.data;
     if (req.body?.type === 'transaction.create' && data) {
-      const amountPaid = data.amount / 100; // Monzo amounts are in pence/cents
-      const description = (data.description || '').toLowerCase();
-      const notes = (data.notes || '').toLowerCase();
-      const referenceText = `${description} ${notes}`;
+      // Monzo amounts are in minor units (pence/cents). Positive amounts indicate money coming in (credits).
+      const amountPaid = data.amount / 100;
 
-      // Check if this incoming payment matches any pending manual bank invoices
-      for (const [key, delivery] of Object.entries(deliveries)) {
-        if (delivery.type === 'monzo' && !delivery.paid) {
-          // Match if amount is correct and description/notes contain the unique reference code
-          if (Math.abs(amountPaid - delivery.amount) < 0.01 && referenceText.includes(key.toLowerCase())) {
-            delivery.paid = true;
-            saveDeliveries();
-            await deliverFile(key, null);
-            console.log(`Monzo payment matched and delivered for invoice: ${key}`);
-            break;
+      if (amountPaid > 0) {
+        // Check if this incoming credit amount matches any pending Monzo invoices
+        for (const [key, delivery] of Object.entries(deliveries)) {
+          if (delivery.type === 'monzo' && !delivery.paid) {
+            // Match if the incoming credit matches the exact invoice amount (within 1p margin)
+            if (Math.abs(amountPaid - delivery.amount) < 0.01) {
+              delivery.paid = true;
+              saveDeliveries();
+              await deliverFile(key, null);
+              console.log(`Monzo payment amount-matched and delivered for invoice: ${key} (${amountPaid})`);
+              break;
+            }
           }
         }
       }
@@ -490,12 +490,13 @@ const invoiceCmd = common(
 const monzoCmd = common(
   new SlashCommandBuilder()
     .setName('monzo')
-    .setDescription('Create a Monzo.me bank transfer invoice with automated tracking')
+    .setDescription('Create a Monzo.me bank transfer invoice with automated amount tracking')
     .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
     .addNumberOption((o) => o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true))
     .addStringOption((o) => o.setName('description').setDescription('What the purchase is for').setRequired(true))
     .addAttachmentOption((o) => o.setName('file').setDescription('File to send once paid'))
-    .addStringOption((o) => o.setName('link').setDescription('Link to send once paid'))
+    .addStringOption((o) => o.setName('delivery').setDescription('Delivery method').addChoices({ name: 'Hosted link', value: 'link' }, { name: 'Direct upload', value: 'direct' }))
+    .addStringOption((o) => o.setName('link').setDescription('Download link to send once paid'))
 );
 
 const commands = [bankrollCmd, invoiceCmd, monzoCmd];
@@ -527,38 +528,57 @@ client.on('interactionCreate', async (interaction) => {
     const description = interaction.options.getString('description');
     const file = interaction.options.getAttachment('file');
     const linkRaw = interaction.options.getString('link');
-    const invoiceKey = `DISCORD-${Math.floor(1000 + Math.random() * 9000)}`;
+    const invoiceKey = `MONZO-${Math.floor(1000 + Math.random() * 9000)}`;
 
     await interaction.deferReply();
-    let fileData = null;
-    if (file) fileData = await downloadAttachment(file, false);
+    
+    try {
+      if (file && linkRaw) throw new Error('Use either a file or a link, not both.');
 
-    if (fileData) saveDelivery(invoiceKey, fileData, interaction, customer, 'monzo', amount);
-    else if (linkRaw) saveLinkDelivery(invoiceKey, linkRaw, interaction, customer, 'monzo', amount);
-    else saveDelivery(invoiceKey, null, interaction, customer, 'monzo', amount);
+      let linkUrl = null;
+      if (linkRaw) {
+        try {
+          const u = new URL(linkRaw.trim());
+          if (!/^https?:$/.test(u.protocol)) throw new Error();
+          linkUrl = u.href;
+        } catch {
+          throw new Error('That link is not valid. It must start with https://');
+        }
+      }
 
-    const monzoUrl = `https://monzo.me/${MONZO_USERNAME}/${amount.toFixed(2)}`;
+      const mode = interaction.options.getString('delivery') ?? (BASE_URL ? 'link' : 'direct');
+      const fileData = file ? await downloadAttachment(file, mode === 'link') : null;
 
-    const embed = new EmbedBuilder()
-      .setColor(GREEN)
-      .setTitle('Monzo Bank Transfer Invoice')
-      .setDescription(`Please click the button below to pay via Monzo.me.\n**Important:** Ensure you include reference code \`${invoiceKey}\` in the payment notes if prompted!`)
-      .addFields(
-        { name: 'Amount to Pay', value: money(amount, 'gbp') },
-        { name: 'Reference Required', value: `${invoiceKey}` },
-        { name: 'Description', value: description },
-        { name: 'Status', value: '⏳ Waiting for automated payment match...' }
-      )
-      .setFooter({ text: `Invoice Ref: ${invoiceKey}` });
+      if (fileData) saveDelivery(invoiceKey, fileData, interaction, customer, 'monzo', amount);
+      else if (linkUrl) saveLinkDelivery(invoiceKey, linkUrl, interaction, customer, 'monzo', amount);
+      else saveDelivery(invoiceKey, null, interaction, customer, 'monzo', amount);
 
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(monzoUrl)
-    );
+      const monzoUrl = `https://monzo.me/${MONZO_USERNAME}/${amount.toFixed(2)}`;
 
-    await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
-    liveInteractions.set(invoiceKey, { interaction, at: Date.now() });
+      const embed = new EmbedBuilder()
+        .setColor(GREEN)
+        .setTitle('Monzo Bank Transfer Invoice')
+        .setDescription('Please click the button below to pay via Monzo.me. Once the exact amount debits to your account, the file/link will unlock automatically!')
+        .addFields(
+          { name: 'Customer', value: `<@${customer.id}>` },
+          { name: 'Amount to Pay', value: money(amount, 'gbp') },
+          { name: 'Description', value: description },
+          { name: 'Status', value: '⏳ Waiting for incoming payment match...' }
+        )
+        .setFooter({ text: `Invoice Ref: ${invoiceKey}` });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(monzoUrl)
+      );
+
+      await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
+      liveInteractions.set(invoiceKey, { interaction, at: Date.now() });
+    } catch (e) {
+      await interaction.editReply({ content: `Could not create Monzo invoice: ${e.message}`, embeds: [], components: [] });
+    }
   }
 
+  // Handle Stripe Bankroll / Invoice commands as normal
   if (interaction.commandName === 'bankroll' || interaction.commandName === 'invoice') {
     const customer = interaction.options.getUser('customer');
     const amount = interaction.options.getNumber('amount');
@@ -644,6 +664,7 @@ client.on('interactionCreate', async (interaction) => {
 
 // Start Express web server alongside Discord bot
 app.listen(PORT, () => {
+  const fileGenQuery = "";
   console.log(`Web server listening on port ${PORT}`);
 });
 
