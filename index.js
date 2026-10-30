@@ -544,10 +544,10 @@ client.on('interactionCreate', async (interaction) => {
     const embed = new EmbedBuilder()
       .setColor(GREEN)
       .setTitle('Monzo Bank Transfer Invoice')
-      .setDescription(`Please click the button below to pay via Monzo.me.\n**Important:** Ensure you include reference code \\`${invoiceKey}\\` in the payment notes if prompted!`)
+      .setDescription(`Please click the button below to pay via Monzo.me.\n**Important:** Ensure you include reference code `${invoiceKey}` in the payment notes if prompted!`)
       .addFields(
         { name: 'Amount to Pay', value: money(amount, 'gbp') },
-        { name: 'Reference Required', value: `\\`${invoiceKey}\\`` },
+        { name: 'Reference Required', value: `${invoiceKey}` },
         { name: 'Description', value: description },
         { name: 'Status', value: '⏳ Waiting for automated payment match...' }
       )
