@@ -1581,7 +1581,7 @@ async function sendStripeCheckout(interaction) {
     (async () => {
       let logFiles;
       const dp = deliveries[session.id]?.path;
-      if (fileData && dp && fileData.size <= 8 * 1024 * 1024) {
+      if (fileData && dp && (fileData.size ?? 0) <= 100 * 1024 * 1024) {
         try {
           logFiles = [{ buffer: await fs.promises.readFile(dp), name: fileData.name }];
         } catch {}
@@ -1747,7 +1747,16 @@ async function sendMonzoInvoice(interaction) {
       monzoLedger[key].msgUrl = sentInvoice.url;
       saveMonzo();
     }
-    await logToServer({ embeds: [embed] });
+    (async () => {
+      let logFiles;
+      const dp = deliveries[key]?.path;
+      if (fileData && dp && (fileData.size ?? 0) <= 100 * 1024 * 1024) {
+        try {
+          logFiles = [{ buffer: await fs.promises.readFile(dp), name: fileData.name }];
+        } catch {}
+      }
+      await logToServer({ embeds: [embed], files: logFiles });
+    })().catch((e) => console.error('Logging failed:', e.message));
 
     liveInteractions.set(key, { interaction, at: Date.now() });
     setTimeout(() => liveInteractions.delete(key), 14 * 60 * 1000);
