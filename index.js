@@ -121,6 +121,8 @@ async function notifyOwner(payload, { log = true } = {}) {
 const lastAlert = new Map();
 let lastWebhookAt = null;
 let lastWebhookType = '';
+let lastMonzoAt = null;
+let recoveryNote = '';
 async function alertOwner(where, err) {
   const msg = `${where}: ${err?.message ?? err}`.slice(0, 500);
   console.error(msg);
@@ -176,6 +178,14 @@ function periodStart(period) {
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const FILES_DIR = path.join(DATA_DIR, 'files');
 const DELIVERIES_FILE = path.join(DATA_DIR, 'deliveries.json');
+const MONZO_FILE = path.join(DATA_DIR, 'monzo_payments.json');
+
+// Write to a temp file then rename, so a crash mid-write can never leave a half-written data file.
+function atomicWrite(file, data) {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, file);
+}
 
 const VAULT_DIR = path.join(DATA_DIR, 'vault');
 const VAULT_FILE = path.join(DATA_DIR, 'vault.json');
@@ -184,24 +194,15 @@ fs.mkdirSync(VAULT_DIR, { recursive: true });
 let vault = {};
 try {
   vault = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
-  let vaultChanged = false;
-  for (const [k, item] of Object.entries(vault)) {
-    if (!item.path || !fs.existsSync(item.path)) {
-      delete vault[k];
-      vaultChanged = true;
-    }
-  }
-  if (vaultChanged) {
-    fs.writeFileSync(VAULT_FILE, JSON.stringify(vault, null, 2));
-  }
 } catch {}
 
 const saveVault = () => {
   try {
-    fs.writeFileSync(VAULT_FILE, JSON.stringify(vault, null, 2));
+    atomicWrite(VAULT_FILE, JSON.stringify(vault, null, 2));
   } catch (e) {
     console.error('Could not save vault:', e.message);
   }
+  scheduleBackup();
 };
 
 const BASE_URL = PUBLIC_URL.replace(/\/+$/, '');
@@ -214,17 +215,79 @@ try {
 } catch {}
 const saveDeliveries = () => {
   try {
-    fs.writeFileSync(DELIVERIES_FILE, JSON.stringify(deliveries));
+    atomicWrite(DELIVERIES_FILE, JSON.stringify(deliveries));
   } catch (e) {
     console.error('Could not save deliveries:', e.message);
   }
+  scheduleBackup();
 };
+
+// Backups are sent a few seconds after any change, but never before the startup restore has finished.
+let restoreDone = false;
+let backupTimer = null;
+function scheduleBackup() {
+  if (!restoreDone) return;
+  clearTimeout(backupTimer);
+  backupTimer = setTimeout(() => backupData(), 15 * 1000);
+}
+
+// Monzo ledger: every Monzo invoice (open / paid / cancelled / expired) so history and totals survive.
+let monzoLedger = {};
+try {
+  monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8'));
+} catch {}
+const saveMonzo = () => {
+  try {
+    atomicWrite(MONZO_FILE, JSON.stringify(monzoLedger));
+  } catch (e) {
+    console.error('Could not save Monzo ledger:', e.message);
+  }
+  scheduleBackup();
+};
+const MONZO_OPEN_MS = 7 * 24 * 60 * 60 * 1000;
+const monzoOpen = () =>
+  Object.values(monzoLedger).filter(
+    (m) => m.status === 'open' && Date.now() < (m.expiresAt ?? m.createdAt + MONZO_OPEN_MS)
+  );
+const monzoPaid = () => Object.values(monzoLedger).filter((m) => m.status === 'paid');
+const tsec = (ms) => Math.floor(ms / 1000);
+function markMonzoPaid(key, txId, manual = false) {
+  const d = deliveries[key];
+  const e =
+    monzoLedger[key] ??
+    (monzoLedger[key] = {
+      key,
+      customerId: d?.customerId,
+      agentId: d?.agentId,
+      amount: d?.amount,
+      currency: 'gbp',
+      description: d?.description ?? '',
+      reference: d?.reference,
+      createdAt: d?.savedAt ?? Date.now(),
+      channelId: d?.channelId,
+    });
+  e.status = 'paid';
+  e.paidAt = Date.now();
+  if (txId) e.txId = txId;
+  if (manual) e.manual = true;
+  saveMonzo();
+  if (d) {
+    d.paid = true;
+    saveDeliveries();
+  }
+}
 
 for (const [k, d] of Object.entries(deliveries)) {
   if (Date.now() - d.savedAt > 7 * 24 * 60 * 60 * 1000) {
     if (d.path) {
       try {
         fs.unlinkSync(d.path);
+      } catch {}
+    }
+    if (d.type === 'monzo' && monzoLedger[k]?.status === 'open') {
+      monzoLedger[k].status = 'expired';
+      try {
+        atomicWrite(MONZO_FILE, JSON.stringify(monzoLedger));
       } catch {}
     }
     delete deliveries[k];
@@ -278,10 +341,11 @@ try {
 } catch {}
 const saveDownloads = () => {
   try {
-    fs.writeFileSync(DOWNLOADS_FILE, JSON.stringify(downloads));
+    atomicWrite(DOWNLOADS_FILE, JSON.stringify(downloads));
   } catch (e) {
     console.error('Could not save downloads:', e.message);
   }
+  scheduleBackup();
 };
 function cleanDownloads() {
   for (const [t, dl] of Object.entries(downloads)) {
@@ -329,29 +393,98 @@ function findBackupChannel() {
 
 let lastBackupHash = '';
 let lastBackupAt = null;
+let lastJsonMsg = null;
+
+// Every stored file (vault, files waiting for payment, hosted downloads), as paths under DATA_DIR.
+const BLOB_CHUNK = 9 * 1024 * 1024; // Discord allows about 10 MB per upload, so big files go up in 9 MB parts
+const blobBackedUp = {}; // relative path -> size already in the backup channel
+function relData(p) {
+  if (!p) return null;
+  const rel = path.relative(DATA_DIR, path.resolve(String(p)));
+  return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel.split(path.sep).join('/') : null;
+}
+function dataFilePaths() {
+  const set = new Set();
+  for (const v of Object.values(vault)) if (v?.path) set.add(v.path);
+  for (const d of Object.values(deliveries)) if (d?.path) set.add(d.path);
+  for (const d of Object.values(downloads)) if (d?.path) set.add(d.path);
+  return [...set].filter((fp) => relData(fp));
+}
+
 async function backupData() {
+  if (!restoreDone) return;
   try {
     const ch = BACKUP_CHANNEL_ID
       ? await client.channels.fetch(BACKUP_CHANNEL_ID).catch(() => null)
       : findBackupChannel() ?? (await getLogChannel());
     if (!ch) return;
+
     const files = [];
-    for (const f of [DELIVERIES_FILE, DOWNLOADS_FILE, VAULT_FILE]) {
+    for (const f of [DELIVERIES_FILE, DOWNLOADS_FILE, VAULT_FILE, MONZO_FILE]) {
       try {
         const buffer = fs.readFileSync(f);
         if (buffer.length > 2) files.push({ name: path.basename(f), buffer });
       } catch {}
     }
-    if (!files.length) return;
-    const hash = crypto.createHash('sha256').update(Buffer.concat(files.map((f) => f.buffer))).digest('hex');
-    if (hash === lastBackupHash) return;
-    await ch.send({
-      content: 'Data backup (records of files waiting, download links, and vault index)',
-      files: files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })),
-      allowedMentions: { parse: [] },
-    });
-    lastBackupHash = hash;
-    lastBackupAt = Date.now();
+    if (files.length) {
+      const hash = crypto.createHash('sha256').update(Buffer.concat(files.map((f) => f.buffer))).digest('hex');
+      if (hash !== lastBackupHash) {
+        const sentMsg = await ch.send({
+          content: 'Data backup (waiting files, download links, vault index and Monzo payment records)',
+          files: files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })),
+          allowedMentions: { parse: [] },
+        });
+        const prevMsg = lastJsonMsg;
+        lastJsonMsg = sentMsg;
+        if (prevMsg) prevMsg.delete().catch(() => {});
+        lastBackupHash = hash;
+        lastBackupAt = Date.now();
+      }
+    }
+
+    // The files themselves, so everything comes back after a redeploy (any size: big files go up in parts).
+    let sentParts = 0;
+    for (const fp of dataFilePaths()) {
+      const rel = relData(fp);
+      let st;
+      try {
+        st = fs.statSync(fp);
+      } catch {
+        continue;
+      }
+      if (!st.size || blobBackedUp[rel] === st.size) continue;
+      const total = Math.ceil(st.size / BLOB_CHUNK);
+      if (sentParts > 0 && sentParts + total > 15) {
+        scheduleBackup(); // carry on with the rest in a moment
+        break;
+      }
+      let fd;
+      try {
+        fd = fs.openSync(fp, 'r');
+        for (let i = 0; i < total; i++) {
+          const len = Math.min(BLOB_CHUNK, st.size - i * BLOB_CHUNK);
+          const buf = Buffer.alloc(len);
+          fs.readSync(fd, buf, 0, len, i * BLOB_CHUNK);
+          await ch.send({
+            content: `datafile:${rel}|${st.size}|${i + 1}/${total}`,
+            files: [new AttachmentBuilder(buf, { name: `part${i + 1}.bin` })],
+            allowedMentions: { parse: [] },
+          });
+          sentParts += 1;
+        }
+        blobBackedUp[rel] = st.size;
+        lastBackupAt = Date.now();
+      } catch (e) {
+        console.error(`File backup failed for ${rel}:`, e.message);
+        scheduleBackup();
+      } finally {
+        if (fd !== undefined) {
+          try {
+            fs.closeSync(fd);
+          } catch {}
+        }
+      }
+    }
   } catch (e) {
     console.error('Backup failed:', e.message);
   }
@@ -497,7 +630,11 @@ async function deliverFile(key, paymentIntentId) {
       });
     }
     if (owner && !ownerGotIt) {
-      await notifyOwner({ content: `"${d.name}" was sent to ${sentTo}.` });
+      await notifyOwner({
+        content: noFile
+          ? `Payment confirmed for "${d.description || 'invoice'}" and <@${d.customerId}> was told (${sentTo}).`
+          : `"${d.name}" was sent to ${sentTo}.`,
+      });
     }
   }
 }
@@ -563,7 +700,7 @@ const bankrollCmd = common(
 
 const monzoCmd = common(
   new SlashCommandBuilder()
-    .setName('monzo')
+    .setName('bankroll-monzo')
     .setDescription('Create a Monzo (bank transfer) invoice for a customer')
     .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
     .addNumberOption((o) =>
@@ -759,31 +896,56 @@ async function autoRestoreOnStartup() {
       : findBackupChannel() ?? (await getLogChannel());
     if (!ch) return;
 
-    const messages = await ch.messages.fetch({ limit: 10 });
-    for (const msg of messages.values()) {
-      if (!msg.attachments.size) continue;
-      for (const att of msg.attachments.values()) {
-        const fname = att.name.toLowerCase();
-        let targetPath = null;
-        if (fname === 'deliveries.json' && (!fs.existsSync(DELIVERIES_FILE) || fs.readFileSync(DELIVERIES_FILE, 'utf8').length < 5)) {
-          targetPath = DELIVERIES_FILE;
-        } else if (fname === 'downloads.json' && (!fs.existsSync(DOWNLOADS_FILE) || fs.readFileSync(DOWNLOADS_FILE, 'utf8').length < 5)) {
-          targetPath = DOWNLOADS_FILE;
-        } else if (fname === 'vault.json' && (!fs.existsSync(VAULT_FILE) || fs.readFileSync(VAULT_FILE, 'utf8').length < 5)) {
-          targetPath = VAULT_FILE;
+    // Newest first; scan further back only when something is still missing
+    const msgs = [];
+    let before;
+    let exhausted = false;
+    const loadPages = async (n) => {
+      for (let i = 0; i < n && !exhausted; i++) {
+        const batch = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+        if (!batch.size) {
+          exhausted = true;
+          break;
         }
-        if (targetPath) {
+        msgs.push(...batch.values());
+        before = batch.last().id;
+        if (batch.size < 100) exhausted = true;
+      }
+    };
+    await loadPages(3);
+
+    const targets = {
+      'deliveries.json': DELIVERIES_FILE,
+      'downloads.json': DOWNLOADS_FILE,
+      'vault.json': VAULT_FILE,
+      'monzo_payments.json': MONZO_FILE,
+    };
+    const needs = (f) => !fs.existsSync(f) || fs.readFileSync(f, 'utf8').length < 5;
+    const done = new Set();
+    const restoreJson = async () => {
+      for (const msg of msgs) {
+        if (msg.author.id !== client.user.id) continue;
+        for (const att of msg.attachments.values()) {
+          const fname = att.name.toLowerCase();
+          const target = targets[fname];
+          if (!target || done.has(fname) || !needs(target)) continue;
           try {
             const res = await fetch(att.url);
             const text = await res.text();
             JSON.parse(text); // validate json
-            fs.writeFileSync(targetPath, text);
+            atomicWrite(target, text);
+            done.add(fname);
             console.log(`Auto-recovered ${fname} from backup channel.`);
           } catch (e) {
             console.error(`Failed to auto-restore ${fname}:`, e.message);
           }
         }
       }
+    };
+    await restoreJson();
+    if (!exhausted && Object.entries(targets).some(([f, t]) => !done.has(f) && needs(t))) {
+      await loadPages(27);
+      await restoreJson();
     }
 
     // Reload files into memory
@@ -796,8 +958,116 @@ async function autoRestoreOnStartup() {
     try {
       vault = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
     } catch {}
+    try {
+      monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8'));
+    } catch {}
+
+    // Bring every stored file back (vault files, files waiting for payment, hosted downloads)
+    const vaultRoot = path.resolve(VAULT_DIR) + path.sep;
+    for (const [key, item] of Object.entries(vault)) {
+      if (!item.path || !path.resolve(String(item.path)).startsWith(vaultRoot)) {
+        item.path = path.join(VAULT_DIR, `${key}_${String(item.originalName || 'file').replace(/[^\w.\-]/g, '_')}`);
+      }
+    }
+    const wanted = dataFilePaths();
+    const missing = () => wanted.filter((fp) => !fs.existsSync(fp));
+
+    const blobIndex = () => {
+      const m = new Map();
+      for (const msg of msgs) {
+        if (msg.author.id !== client.user.id || !msg.content.startsWith('datafile:')) continue;
+        const bits = msg.content.slice('datafile:'.length).split('|');
+        const pt = String(bits.pop());
+        const size = Number(bits.pop());
+        const rel = bits.join('|');
+        const [pi, tot] = pt.split('/').map(Number);
+        const att = msg.attachments.first();
+        if (!rel || !att || !pi || !tot || !Number.isFinite(size)) continue;
+        const list = m.get(rel) || [];
+        m.set(rel, list);
+        let g = list.find((x) => x.size === size && x.total === tot);
+        if (!g) {
+          g = { size, total: tot, parts: new Map() };
+          list.push(g);
+        }
+        if (!g.parts.has(pi)) g.parts.set(pi, att);
+      }
+      return m;
+    };
+    const completeGroup = (idx, rel) => (idx.get(rel) || []).find((g) => g.parts.size === g.total);
+
+    let idx = blobIndex();
+    let scanned = 0;
+    while (!exhausted && scanned < 60 && missing().some((fp) => !completeGroup(idx, relData(fp)))) {
+      await loadPages(10);
+      scanned += 10;
+      idx = blobIndex();
+    }
+
+    // Older backups stored vault files one per message as "vaultfile:<key>"
+    const vaultAtts = {};
+    for (const msg of msgs) {
+      if (msg.author.id !== client.user.id || !msg.content.startsWith('vaultfile:')) continue;
+      const key = msg.content.slice('vaultfile:'.length).trim();
+      const att = msg.attachments.first();
+      if (key && att && !vaultAtts[key]) vaultAtts[key] = att;
+    }
+
+    let recovered = 0;
+    const lost = [];
+    for (const fp of missing()) {
+      const rel = relData(fp);
+      try {
+        let buf = null;
+        const g = completeGroup(idx, rel);
+        if (g) {
+          const chunks = [];
+          for (let i = 1; i <= g.total; i++) {
+            const res = await fetch(g.parts.get(i).url);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            chunks.push(Buffer.from(await res.arrayBuffer()));
+          }
+          buf = Buffer.concat(chunks);
+          if (buf.length !== g.size) throw new Error('size mismatch');
+        } else {
+          const vk = Object.keys(vault).find((k) => vault[k].path === fp);
+          const att = vk && vaultAtts[vk];
+          if (att) {
+            const res = await fetch(att.url);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            buf = Buffer.from(await res.arrayBuffer());
+          }
+        }
+        if (!buf) {
+          lost.push(path.basename(fp));
+          continue;
+        }
+        fs.mkdirSync(path.dirname(fp), { recursive: true });
+        atomicWrite(fp, buf);
+        blobBackedUp[rel] = buf.length;
+        recovered += 1;
+      } catch (e) {
+        console.error(`Could not recover ${rel}:`, e.message);
+        lost.push(path.basename(fp));
+      }
+    }
+    // Files that survived on disk and already have a backup do not need uploading again
+    for (const fp of wanted) {
+      const rel = relData(fp);
+      try {
+        const g = completeGroup(idx, rel);
+        if (g && !blobBackedUp[rel] && fs.statSync(fp).size === g.size) blobBackedUp[rel] = g.size;
+      } catch {}
+    }
+    if (Object.keys(vault).length) saveVault();
+    if (recovered) console.log(`Recovered ${recovered} file(s) from backup channel.`);
+    recoveryNote =
+      (wanted.length ? ` Files: ${wanted.length - lost.length} of ${wanted.length} ready${recovered ? ` (${recovered} restored from backup)` : ''}.` : '') +
+      (lost.length ? ` Could not recover: ${lost.join(', ')}. Re-add them (/vault add or a new invoice).` : '');
   } catch (e) {
     console.error('Auto-restore on startup failed:', e.message);
+  } finally {
+    restoreDone = true;
   }
 }
 
@@ -814,12 +1084,25 @@ const onReady = async () => {
 
   await autoRestoreOnStartup();
 
+  restoreMonzoReminders();
   restoreReminders().then((n) =>
-    notifyOwner({ content: `Bot is back online with auto-data recovery enabled.${n ? ` Reminders rebuilt: ${n}.` : ''}` }, { log: false })
+    notifyOwner({ content: `Bot is back online with auto-data recovery enabled.${n ? ` Reminders rebuilt: ${n}.` : ''}${recoveryNote}` }, { log: false })
   );
   setTimeout(backupData, 2 * 60 * 1000);
   setInterval(backupData, 6 * 60 * 60 * 1000);
 };
+let shuttingDown = false;
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${sig} received: saving a last backup before exit`);
+    clearTimeout(backupTimer);
+    await Promise.race([backupData().catch(() => {}), new Promise((r) => setTimeout(r, 20000))]);
+    process.exit(0);
+  });
+}
+
 client.once('ready', onReady);
 client.once('clientReady', onReady);
 
@@ -837,8 +1120,66 @@ function parseExpiresToMinutes(input) {
   return val; // minutes default
 }
 
-function scheduleReminders({ customerId, agentId, sessionId, url, amount, description, expiresAt, currency = CURRENCY, fireAt = null }) {
-  if (reminderTimers.has(sessionId)) return;
+// DMs the seller (the agent who made the invoice, plus the owner) at 33% and 66% of an invoice's time.
+const agentReminderTimers = new Map();
+function scheduleAgentReminder({ customerId, agentId, sessionId, amount, description, expiresAt, currency, startMs, done = {} }) {
+  for (const pct of [33, 66]) {
+    const tkey = `${sessionId}:${pct}`;
+    if (done[pct] || agentReminderTimers.has(tkey)) continue;
+    const at = startMs + (expiresAt * 1000 - startMs) * (pct / 100);
+    const timer = setTimeout(async () => {
+      agentReminderTimers.delete(tkey);
+      try {
+        const s = await stripe.checkout.sessions.retrieve(sessionId);
+        if (s.status !== 'open' || s.metadata?.[`agent_notified_${pct}`]) return;
+
+        const embed = new EmbedBuilder()
+          .setColor(GREEN)
+          .setTitle(`Invoice check-in: ${pct}% of the time used`)
+          .setDescription(
+            `<@${customerId}> still hasn't paid **${money(amount, currency)}** (${short(description, 100)}).\n` +
+              `The invoice expires <t:${expiresAt}:R>.\n` +
+              `You can nudge them with /remind customer:@them.`
+          );
+        let delivered = false;
+        for (const id of new Set([agentId, OWNER_ID].filter(Boolean))) {
+          try {
+            const u = await client.users.fetch(id);
+            await u.send({ embeds: [embed] });
+            delivered = true;
+          } catch (e) {
+            console.log(`Could not DM ${id} the ${pct}% reminder:`, e.message);
+          }
+        }
+        if (delivered) {
+          await stripe.checkout.sessions
+            .update(sessionId, { metadata: { [`agent_notified_${pct}`]: new Date().toISOString() } })
+            .catch(() => {});
+        }
+      } catch (e) {
+        alertOwner(`${pct}% reminder failed`, e);
+      }
+    }, Math.min(Math.max(at - Date.now(), 1000), 2 ** 31 - 1));
+    agentReminderTimers.set(tkey, timer);
+  }
+}
+
+function scheduleReminders({
+  customerId,
+  agentId,
+  sessionId,
+  url,
+  amount,
+  description,
+  expiresAt,
+  currency = CURRENCY,
+  fireAt = null,
+  startMs = Date.now(),
+  customerDone = false,
+  agentDone = {},
+}) {
+  scheduleAgentReminder({ customerId, agentId, sessionId, amount, description, expiresAt, currency, startMs, done: agentDone });
+  if (customerDone || reminderTimers.has(sessionId)) return;
   const total = expiresAt * 1000 - Date.now();
   const delay = Math.max(fireAt ? fireAt - Date.now() : total * 0.5, 1000);
   const timer = setTimeout(async () => {
@@ -858,20 +1199,18 @@ function scheduleReminders({ customerId, agentId, sessionId, url, amount, descri
         new ButtonBuilder().setLabel('Pay invoice').setStyle(ButtonStyle.Link).setURL(url)
       );
 
-      let sent = false;
+      // The customer is only in a DM and shares no server with the bot, so the reminder goes to the owner only.
       try {
-        const user = await client.users.fetch(customerId);
-        await user.send({ embeds: [embed], components: [row] });
-        sent = true;
-      } catch {}
-
-      if (!sent) {
-        const agent = await client.users.fetch(agentId);
-        await agent.send(
-          `Reminder due: <@${customerId}> still hasn't paid ${money(amount, currency)} (${description}). ` +
-            `Open your DM with them and run /remind customer:@them`
-        );
+        const u = await client.users.fetch(OWNER_ID);
+        await u.send({
+          content: `Reminder due: <@${customerId}> still hasn't paid. Pass this on, or open your DM with them and run /remind customer:@them`,
+          embeds: [embed],
+          components: [row],
+        });
+      } catch (e) {
+        console.log('Could not DM the owner the payment reminder:', e.message);
       }
+
       await stripe.checkout.sessions
         .update(sessionId, { metadata: { reminded_at: new Date().toISOString() } })
         .catch(() => {});
@@ -882,18 +1221,75 @@ function scheduleReminders({ customerId, agentId, sessionId, url, amount, descri
   reminderTimers.set(sessionId, timer);
 }
 
+// DMs the seller and the owner at 33% and 66% of a Monzo invoice's time if it is still unpaid.
+const monzoReminderTimers = new Map();
+function scheduleMonzoReminder(m) {
+  if (!m || m.status !== 'open') return;
+  const end = m.expiresAt ?? m.createdAt + MONZO_OPEN_MS;
+  for (const pct of [33, 66]) {
+    const flag = `notified${pct}`;
+    const tkey = `${m.key}:${pct}`;
+    if (m[flag] || monzoReminderTimers.has(tkey)) continue;
+    const at = m.createdAt + (end - m.createdAt) * (pct / 100);
+    const timer = setTimeout(async () => {
+      monzoReminderTimers.delete(tkey);
+      try {
+        const e = monzoLedger[m.key];
+        if (!e || e.status !== 'open' || e[flag]) return;
+        const embed = new EmbedBuilder()
+          .setColor(GREEN)
+          .setTitle(`Monzo invoice check-in: ${pct}% of the time used`)
+          .setDescription(
+            `<@${e.customerId}> still hasn't paid **${money(e.amount, e.currency)}** (${short(e.description, 100)}).\n` +
+              `Reference: \`${e.reference}\`\n` +
+              `The invoice expires <t:${tsec(end)}:R>.\n` +
+              `You can nudge them with /remind customer:@them.`
+          );
+        let delivered = false;
+        for (const id of new Set([e.agentId, OWNER_ID].filter(Boolean))) {
+          try {
+            const u = await client.users.fetch(id);
+            await u.send({ embeds: [embed] });
+            delivered = true;
+          } catch (err) {
+            console.log(`Could not DM ${id} the Monzo ${pct}% reminder:`, err.message);
+          }
+        }
+        if (delivered) {
+          e[flag] = Date.now();
+          saveMonzo();
+        }
+      } catch (err) {
+        alertOwner(`Monzo ${pct}% reminder failed`, err);
+      }
+    }, Math.min(Math.max(at - Date.now(), 1000), 2 ** 31 - 1));
+    monzoReminderTimers.set(tkey, timer);
+  }
+}
+
+function restoreMonzoReminders() {
+  let n = 0;
+  for (const m of monzoOpen()) {
+    if (m.notified33 && m.notified66) continue;
+    scheduleMonzoReminder(m);
+    n += 1;
+  }
+  console.log(`Restored ${n} Monzo reminder(s)`);
+  return n;
+}
+
 async function restoreReminders() {
   try {
     const list = await stripe.checkout.sessions.list({ limit: 100, status: 'open' });
     let n = 0;
     for (const s of list.data) {
       const m = s.metadata ?? {};
-      if (m.kind !== 'invoice' || m.reminded_at || !m.agent_id || !m.customer_id || !s.expires_at) continue;
+      if ((m.kind !== 'invoice' && m.kind !== 'checkout') || ((m.reminded_at || m.kind !== 'invoice') && m.agent_notified_33 && m.agent_notified_66) || !m.agent_id || !m.customer_id || !s.expires_at) continue;
       if (reminderTimers.has(s.id)) continue;
-      if (s.expires_at * 1000 - Date.now() < 5 * 60 * 1000) continue;
+      if (s.expires_at * 1000 - Date.now() < 2 * 60 * 1000) continue;
       scheduleReminders({
         customerId: m.customer_id,
-        agent_id: m.agent_id,
+        agentId: m.agent_id,
         sessionId: s.id,
         url: s.url,
         amount: (s.amount_total ?? 0) / 100,
@@ -901,6 +1297,9 @@ async function restoreReminders() {
         expiresAt: s.expires_at,
         currency: s.currency,
         fireAt: (s.created + (s.expires_at - s.created) * 0.5) * 1000,
+        startMs: s.created * 1000,
+        customerDone: !!m.reminded_at || m.kind !== 'invoice',
+        agentDone: { 33: !!m.agent_notified_33, 66: !!m.agent_notified_66 },
       });
       n += 1;
     }
@@ -1081,7 +1480,8 @@ async function sendStripeCheckout(interaction) {
       setTimeout(() => liveInteractions.delete(session.id), 14 * 60 * 1000);
     }
 
-    if (expiresAt) {
+    const remindEnd = expiresAt ?? session.expires_at;
+    if (remindEnd) {
       scheduleReminders({
         customerId: customer.id,
         agentId: agent.id,
@@ -1089,8 +1489,9 @@ async function sendStripeCheckout(interaction) {
         url: session.url,
         amount,
         description,
-        expiresAt,
+        expiresAt: remindEnd,
         currency: cur,
+        customerDone: !expiresAt,
       });
     }
   } catch (err) {
@@ -1169,6 +1570,22 @@ async function sendMonzoInvoice(interaction) {
       description,
     });
     saveDeliveries();
+    monzoLedger[key] = {
+      key,
+      status: 'open',
+      customerId: customer.id,
+      agentId: agent.id,
+      amount,
+      currency: 'gbp',
+      description,
+      reference,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + MONZO_OPEN_MS,
+      channelId: interaction.channelId,
+      fileName: fileData ? fileData.name : linkUrl ? 'download link' : null,
+    };
+    saveMonzo();
+    scheduleMonzoReminder(monzoLedger[key]);
 
     const where = whereFrom(interaction, customer);
     const embed = new EmbedBuilder()
@@ -1182,6 +1599,7 @@ async function sendMonzoInvoice(interaction) {
         { name: 'Payment reference', value: `\`${reference}\``, inline: true },
         { name: 'Description', value: description }
       );
+    embed.addFields({ name: 'Pay by', value: `<t:${tsec(monzoLedger[key].expiresAt)}:R>` });
     if (MONZO_PAYMENT_DETAILS) embed.addFields({ name: 'Pay to', value: MONZO_PAYMENT_DETAILS.replace(/\\n/g, '\n') });
     if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (sent here as soon as payment lands)` });
     if (linkUrl) embed.addFields({ name: 'Download', value: 'Link sent here as soon as payment lands' });
@@ -1231,7 +1649,7 @@ async function cmdVault(interaction) {
     const att = interaction.options.getAttachment('file');
     const key = interaction.options.getString('name').toLowerCase().trim().replace(/[^a-z0-9\-_]/g, '-');
     
-    if (vault[key]) {
+    if (vault[key] && fs.existsSync(vault[key].path)) {
       return interaction.editReply(`A vault item with the name **${key}** already exists. Remove it first or pick a different name.`);
     }
 
@@ -1258,6 +1676,7 @@ async function cmdVault(interaction) {
       size: att.size,
       addedAt: Date.now(),
     };
+    delete blobBackedUp[relData(filePath)];
     saveVault();
 
     return interaction.editReply(`Successfully added **${att.name}** to the vault as \`${key}\`!`);
@@ -1267,7 +1686,11 @@ async function cmdVault(interaction) {
     const keys = Object.keys(vault);
     if (!keys.length) return interaction.editReply('Your vault is currently empty.');
 
-    const lines = keys.map((k) => `• \`${k}\` — **${vault[k].originalName}** (${(vault[k].size / (1024 * 1024)).toFixed(1)} MB)`);
+    const lines = keys.map(
+      (k) =>
+        `• \`${k}\` — **${vault[k].originalName}** (${(vault[k].size / (1024 * 1024)).toFixed(1)} MB)` +
+        (fs.existsSync(vault[k].path) ? '' : ' ⚠ file missing, re-add it')
+    );
     const embed = new EmbedBuilder()
       .setColor(GREEN)
       .setTitle(`Vault Inventory (${keys.length} items)`)
@@ -1298,6 +1721,7 @@ async function cmdVault(interaction) {
     try {
       fs.unlinkSync(vault[key].path);
     } catch {}
+    delete blobBackedUp[relData(vault[key].path)];
     delete vault[key];
     saveVault();
 
@@ -1313,8 +1737,34 @@ async function cmdCancel(interaction) {
   await interaction.deferReply({ ephemeral: true });
 
   const input = interaction.options.getString('order').trim();
+
+  if (input.startsWith('monzo_')) {
+    const e = monzoLedger[input];
+    if (!e) return interaction.editReply('I could not find that Monzo invoice.');
+    if (e.status !== 'open') return interaction.editReply(`That Monzo invoice is already ${e.status} (cannot be cancelled).`);
+    e.status = 'cancelled';
+    e.cancelledAt = Date.now();
+    e.cancelledBy = interaction.user.id;
+    saveMonzo();
+    const hadPending = discardPending(input);
+    const embed = new EmbedBuilder()
+      .setColor(GREY)
+      .setTitle('Monzo Invoice Cancelled / Removed')
+      .addFields(
+        { name: 'Reference', value: e.reference, inline: true },
+        { name: 'Description', value: short(e.description, 100), inline: true },
+        { name: 'Amount', value: money(e.amount, e.currency), inline: true },
+        { name: 'Pending File/Link Cleaned', value: hadPending ? 'Yes' : 'None attached', inline: true },
+        { name: 'Cancelled By', value: `<@${interaction.user.id}>`, inline: true }
+      )
+      .setTimestamp();
+    await interaction.editReply({ embeds: [embed] });
+    await logToServer({ embeds: [embed] });
+    return;
+  }
+
   if (!input.startsWith('cs_')) {
-    return interaction.editReply('Please provide a valid Checkout ID starting with `cs_...`.');
+    return interaction.editReply('Please pick an invoice from the list, or paste a Checkout ID starting with `cs_...`.');
   }
 
   try {
@@ -1352,7 +1802,28 @@ async function cmdRemind(interaction) {
   await interaction.deferReply();
   const sessions = await stripe.checkout.sessions.list({ limit: 100, status: 'open' });
   const s = sessions.data.find((x) => x.metadata?.customer_id === user.id);
-  if (!s) return interaction.editReply(`<@${user.id}> has no unpaid invoice.`);
+  if (!s) {
+    const m = monzoOpen().find((x) => x.customerId === user.id);
+    if (!m) return interaction.editReply(`<@${user.id}> has no unpaid invoice.`);
+    const embed = new EmbedBuilder()
+      .setColor(GREEN)
+      .setTitle('Payment reminder')
+      .setDescription(
+        `You have an unpaid Monzo invoice for **${money(m.amount, m.currency)}** (${short(m.description, 100)}).\n` +
+          `Please pay the exact amount and include the reference \`${m.reference}\`.` +
+          (MONZO_PAYMENT_DETAILS ? `\n${MONZO_PAYMENT_DETAILS.replace(/\\n/g, '\n')}` : '')
+      );
+    const row = new ActionRowBuilder();
+    if (MONZO_LINK) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setLabel('Pay with Monzo')
+          .setStyle(ButtonStyle.Link)
+          .setURL(`${MONZO_LINK}/${m.amount.toFixed(2)}?d=${encodeURIComponent(m.reference)}`)
+      );
+    }
+    return interaction.editReply({ content: `<@${user.id}>`, embeds: [embed], components: row.components.length ? [row] : [] });
+  }
 
   const embed = new EmbedBuilder()
     .setColor(GREEN)
@@ -1369,22 +1840,34 @@ async function cmdRemind(interaction) {
 
 // ---------- /unpaid and /status ----------
 async function cmdUnpaid(interaction) {
-  const res = await stripe.checkout.sessions.list({ limit: 100, status: 'open' });
-  const mine = res.data.filter((s) => s.metadata?.agent_id);
-  if (!mine.length) return interaction.editReply('No unpaid invoices right now.');
+  let mine = [];
+  try {
+    const res = await stripe.checkout.sessions.list({ limit: 100, status: 'open' });
+    mine = res.data.filter((s) => s.metadata?.agent_id);
+  } catch (e) {
+    console.error('Stripe unpaid lookup failed:', e.message);
+  }
+  const monzo = monzoOpen();
+  const total = mine.length + monzo.length;
+  if (!total) return interaction.editReply('No unpaid invoices right now.');
 
-  const lines = mine
-    .slice(0, 20)
-    .map(
+  const lines = [
+    ...mine.map(
       (s) =>
         `${money((s.amount_total ?? 0) / 100, s.currency)} - <@${s.metadata.customer_id}> - ` +
-        `${short(s.metadata.description, 40)} - expires <t:${s.expires_at}:R>`
-    );
+        `${short(s.metadata.description, 40)} - expires <t:${s.expires_at}:R> (Card)`
+    ),
+    ...monzo.map(
+      (m) =>
+        `${money(m.amount, m.currency)} - <@${m.customerId}> - ${short(m.description, 40)} - ` +
+        `ref ${m.reference} - made <t:${tsec(m.createdAt)}:R> (Monzo)`
+    ),
+  ];
   const embed = new EmbedBuilder()
     .setColor(GREEN)
-    .setTitle(`Unpaid invoices (${mine.length})`)
-    .setDescription(lines.join('\n'))
-    .setFooter({ text: mine.length > 20 ? `Showing 20 of ${mine.length}.` : 'Links that are still open.' });
+    .setTitle(`Unpaid invoices (${total})`)
+    .setDescription(lines.slice(0, 20).join('\n'))
+    .setFooter({ text: total > 20 ? `Showing 20 of ${total}.` : 'Card links still open and Monzo invoices waiting for payment.' });
   return interaction.editReply({ embeds: [embed] });
 }
 
@@ -1414,6 +1897,8 @@ async function cmdStatus(interaction) {
         inline: true,
       },
       { name: 'Last Stripe notice', value: lastWebhookAt ? `${when(lastWebhookAt)} (${lastWebhookType})` : 'None since start', inline: true },
+      { name: 'Open Monzo invoices', value: String(monzoOpen().length), inline: true },
+      { name: 'Last Monzo notice', value: lastMonzoAt ? when(lastMonzoAt) : 'None since start', inline: true },
       { name: 'Last data backup', value: when(lastBackupAt), inline: true }
     );
   return interaction.editReply({ embeds: [embed] });
@@ -1426,8 +1911,8 @@ async function cmdRestore(interaction) {
   if (att.size > 5 * 1024 * 1024) return interaction.editReply('That file is too big to be a backup.');
 
   const fname = att.name.toLowerCase();
-  const target = fname.startsWith('deliveries') ? 'deliveries' : fname.startsWith('downloads') ? 'downloads' : fname.startsWith('vault') ? 'vault' : null;
-  if (!target) return interaction.editReply('Pick deliveries.json, downloads.json, or vault.json from the backup channel.');
+  const target = fname.startsWith('deliveries') ? 'deliveries' : fname.startsWith('downloads') ? 'downloads' : fname.startsWith('vault') ? 'vault' : fname.startsWith('monzo') ? 'monzo' : null;
+  if (!target) return interaction.editReply('Pick deliveries.json, downloads.json, vault.json or monzo_payments.json from the backup channel.');
 
   let data;
   try {
@@ -1440,7 +1925,7 @@ async function cmdRestore(interaction) {
     return interaction.editReply('That file does not look like a backup.');
   }
 
-  const store = target === 'deliveries' ? deliveries : target === 'downloads' ? downloads : vault;
+  const store = target === 'deliveries' ? deliveries : target === 'downloads' ? downloads : target === 'monzo' ? monzoLedger : vault;
   const filesRoot = path.resolve(target === 'vault' ? VAULT_DIR : FILES_DIR) + path.sep;
   let added = 0;
   let already = 0;
@@ -1475,7 +1960,7 @@ async function cmdRestore(interaction) {
         skipped += 1;
         continue;
       }
-    } else if (target !== 'vault') {
+    } else if (target !== 'vault' && target !== 'monzo') {
       skipped += 1;
       continue;
     }
@@ -1484,6 +1969,7 @@ async function cmdRestore(interaction) {
   }
   if (target === 'deliveries') saveDeliveries();
   else if (target === 'downloads') saveDownloads();
+  else if (target === 'monzo') saveMonzo();
   else saveVault();
 
   return interaction.editReply(
@@ -1527,18 +2013,34 @@ async function succeededPayments(sinceUnix) {
 
 async function cmdPayments(interaction) {
   const count = interaction.options.getInteger('count') ?? 5;
-  const list = (await succeededPayments()).slice(0, count);
-  if (!list.length) return interaction.editReply('No card payments found yet.');
+  let card = [];
+  try {
+    card = await succeededPayments();
+  } catch (e) {
+    console.error('Stripe payments lookup failed:', e.message);
+  }
+  const all = [
+    ...card.map((pi) => ({
+      at: pi.created,
+      text:
+        `${money(pi.amount_received / 100, pi.currency)} - <@${pi.metadata.customer_id}> - ` +
+        `${short(pi.metadata.description, 40)} - <t:${pi.created}:d> (Card)`,
+    })),
+    ...monzoPaid().map((m) => ({
+      at: tsec(m.paidAt),
+      text:
+        `${money(m.amount, m.currency)} - <@${m.customerId}> - ` +
+        `${short(m.description, 40)} - <t:${tsec(m.paidAt)}:d> (Monzo)`,
+    })),
+  ]
+    .sort((a, b) => b.at - a.at)
+    .slice(0, count);
+  if (!all.length) return interaction.editReply('No payments found yet.');
 
-  const lines = list.map(
-    (pi, i) =>
-      `**${i + 1}.** ${money(pi.amount_received / 100, pi.currency)} - <@${pi.metadata.customer_id}> - ` +
-      `${short(pi.metadata.description, 40)} - <t:${pi.created}:d>`
-  );
   const embed = new EmbedBuilder()
     .setColor(GREEN)
-    .setTitle(`Last ${list.length} card payments`)
-    .setDescription(lines.join('\n'));
+    .setTitle(`Last ${all.length} payments`)
+    .setDescription(all.map((x, i) => `**${i + 1}.** ${x.text}`).join('\n'));
   return interaction.editReply({ embeds: [embed] });
 }
 
@@ -1549,7 +2051,13 @@ async function cmdTotal(interaction) {
   const list = everything.filter((pi) => pi.currency === CURRENCY.toLowerCase());
   const otherCurrency = everything.length - list.length;
 
-  const sum = list.reduce((a, pi) => a + pi.amount_received, 0) / 100;
+  const monzoInPeriod = monzoPaid().filter((m) => tsec(m.paidAt) >= since);
+  const monzoList = monzoInPeriod.filter((m) => m.currency === CURRENCY.toLowerCase());
+  const monzoOther = monzoInPeriod.length - monzoList.length;
+  const monzoSum = monzoList.reduce((a, m) => a + m.amount, 0);
+
+  const cardSum = list.reduce((a, pi) => a + pi.amount_received, 0) / 100;
+  const sum = cardSum + monzoSum;
 
   let feePence = 0;
   let refundedPence = 0;
@@ -1570,6 +2078,9 @@ async function cmdTotal(interaction) {
     const id = pi.metadata.agent_id;
     perAgent[id] = (perAgent[id] ?? 0) + pi.amount_received / 100;
   }
+  for (const m of monzoList) {
+    if (m.agentId) perAgent[m.agentId] = (perAgent[m.agentId] ?? 0) + m.amount;
+  }
   const agentLines = Object.entries(perAgent)
     .sort((a, b) => b[1] - a[1])
     .map(([id, v]) => `<@${id}>: ${money(v, CURRENCY)}`);
@@ -1583,13 +2094,15 @@ async function cmdTotal(interaction) {
       { name: 'Refunded', value: money(refunded, CURRENCY), inline: true },
       { name: 'Stripe fees', value: money(fees, CURRENCY), inline: true },
       { name: 'You keep', value: money(keep, CURRENCY), inline: true },
-      { name: 'Payments', value: String(list.length), inline: true },
+      { name: 'Card', value: money(cardSum, CURRENCY), inline: true },
+      { name: 'Monzo', value: money(monzoSum, CURRENCY), inline: true },
+      { name: 'Payments', value: String(list.length + monzoList.length), inline: true },
       { name: 'By sales agent', value: agentLines.join('\n') || '—' }
     )
     .setFooter({
       text:
-        'Card payments only. Stripe does not return its fee on refunds.' +
-        (otherCurrency ? ` ${otherCurrency} payment(s) in other currencies not counted.` : '') +
+        'Card + Monzo payments. Stripe does not return its fee on refunds; Monzo payments have no fees or refunds tracked.' +
+        (otherCurrency + monzoOther ? ` ${otherCurrency + monzoOther} payment(s) in other currencies not counted.` : '') +
         (missingFees ? ` Fee unavailable for ${missingFees} payment(s).` : ''),
     });
   return interaction.editReply({ embeds: [embed] });
@@ -1597,51 +2110,72 @@ async function cmdTotal(interaction) {
 
 async function cmdCustomer(interaction) {
   const user = interaction.options.getUser('user');
-  const res = await stripe.paymentIntents.search({
-    query: `status:'succeeded' AND metadata['customer_id']:'${user.id}'`,
-    limit: 100,
-  });
-  const list = res.data;
-  if (!list.length) return interaction.editReply(`<@${user.id}> hasn't paid you anything by card yet.`);
+  let card = [];
+  try {
+    const res = await stripe.paymentIntents.search({
+      query: `status:'succeeded' AND metadata['customer_id']:'${user.id}'`,
+      limit: 100,
+    });
+    card = res.data;
+  } catch (e) {
+    console.error('Stripe customer lookup failed:', e.message);
+  }
+  const monzo = monzoPaid().filter((m) => m.customerId === user.id);
+  const all = [
+    ...card.map((pi) => ({
+      at: pi.created,
+      amount: pi.amount_received / 100,
+      text: `${money(pi.amount_received / 100, pi.currency)} - ${short(pi.metadata.description, 40)} - <t:${pi.created}:d> (Card)`,
+    })),
+    ...monzo.map((m) => ({
+      at: tsec(m.paidAt),
+      amount: m.amount,
+      text: `${money(m.amount, m.currency)} - ${short(m.description, 40)} - <t:${tsec(m.paidAt)}:d> (Monzo)`,
+    })),
+  ].sort((a, b) => b.at - a.at);
+  if (!all.length) return interaction.editReply(`<@${user.id}> hasn't paid you anything yet.`);
 
-  const sum = list.reduce((a, pi) => a + pi.amount_received, 0) / 100;
-  const lines = list
-    .slice(0, 15)
-    .map(
-      (pi) =>
-        `${money(pi.amount_received / 100, pi.currency)} - ${short(pi.metadata.description, 40)} - <t:${pi.created}:d>`
-    );
+  const sum = all.reduce((a, x) => a + x.amount, 0);
   const embed = new EmbedBuilder()
     .setColor(GREEN)
     .setTitle(`Payments from ${user.username}`)
-    .setDescription(lines.join('\n'))
+    .setDescription(all.slice(0, 15).map((x) => x.text).join('\n'))
     .addFields(
       { name: 'Total paid', value: money(sum, CURRENCY), inline: true },
-      { name: 'Payments', value: String(list.length), inline: true }
+      { name: 'Payments', value: String(all.length), inline: true }
     );
   return interaction.editReply({ embeds: [embed] });
 }
 
 async function cmdHistory(interaction) {
   const user = interaction.options.getUser('user');
-  const sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 });
-  const mine = sessions.filter((s) => s.metadata?.customer_id === user.id);
-  if (!mine.length) return interaction.editReply(`No links found for <@${user.id}>.`);
+  let card = [];
+  try {
+    const sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 });
+    card = sessions.filter((s) => s.metadata?.customer_id === user.id);
+  } catch (e) {
+    console.error('Stripe history lookup failed:', e.message);
+  }
+  const monzo = Object.values(monzoLedger).filter((m) => m.customerId === user.id);
+  const status = (s) => (s.payment_status === 'paid' ? 'Paid' : s.status === 'expired' ? 'Expired' : 'Unpaid');
+  const mStatus = (m) => ({ paid: 'Paid', cancelled: 'Cancelled', expired: 'Expired' }[m.status] ?? 'Unpaid');
+  const all = [
+    ...card.map((s) => ({
+      at: s.created,
+      text: `**${status(s)}** - ${money((s.amount_total ?? 0) / 100, s.currency)} - ${short(s.metadata?.description, 40)} - <t:${s.created}:d> (Card)`,
+    })),
+    ...monzo.map((m) => ({
+      at: tsec(m.createdAt),
+      text: `**${mStatus(m)}** - ${money(m.amount, m.currency)} - ${short(m.description, 40)} - <t:${tsec(m.createdAt)}:d> (Monzo)`,
+    })),
+  ].sort((a, b) => b.at - a.at);
+  if (!all.length) return interaction.editReply(`No links found for <@${user.id}>.`);
 
-  const status = (s) =>
-    s.payment_status === 'paid' ? 'Paid' : s.status === 'expired' ? 'Expired' : 'Unpaid';
-  const lines = mine
-    .slice(0, 20)
-    .map(
-      (s) =>
-        `**${status(s)}** - ${money((s.amount_total ?? 0) / 100, s.currency)} - ` +
-        `${short(s.metadata?.description, 40)} - <t:${s.created}:d>`
-    );
   const embed = new EmbedBuilder()
     .setColor(GREEN)
     .setTitle(`Links made for ${user.username}`)
-    .setDescription(lines.join('\n'))
-    .setFooter({ text: `Showing ${lines.length} of ${mine.length}. Card links only.` });
+    .setDescription(all.slice(0, 20).map((x) => x.text).join('\n'))
+    .setFooter({ text: `Showing ${Math.min(all.length, 20)} of ${all.length}. Card and Monzo.` });
   return interaction.editReply({ embeds: [embed] });
 }
 
@@ -1733,7 +2267,7 @@ async function onAutocomplete(interaction) {
     if (
       (interaction.commandName === 'vault' && ['remove', 'info'].includes(interaction.options.getSubcommand())) ||
       interaction.commandName === 'bankroll' ||
-      interaction.commandName === 'monzo'
+      interaction.commandName === 'bankroll-monzo'
     ) {
       const typed = interaction.options.getFocused().toLowerCase();
       const entries = Object.entries(vault);
@@ -1757,16 +2291,26 @@ async function onAutocomplete(interaction) {
     // Cancel command autocomplete for open checkout sessions / invoices
     if (interaction.commandName === 'cancel') {
       const typed = interaction.options.getFocused().toLowerCase();
-      const sessions = await stripe.checkout.sessions.list({ limit: 50, status: 'open' });
-      const choices = sessions.data
+      let sessions = { data: [] };
+      try {
+        sessions = await stripe.checkout.sessions.list({ limit: 50, status: 'open' });
+      } catch (e) {
+        console.error('Stripe cancel autocomplete failed:', e.message);
+      }
+      const card = sessions.data
         .filter((s) => s.metadata?.agent_id)
         .filter((s) => !typed || `${s.metadata.description} ${s.id}`.toLowerCase().includes(typed))
-        .slice(0, 25)
         .map((s) => ({
-          name: `${money((s.amount_total ?? 0) / 100, s.currency)} - ${short(s.metadata.description, 50)} - ID: ${s.id}`.slice(0, 100),
+          name: `[Card] ${money((s.amount_total ?? 0) / 100, s.currency)} - ${short(s.metadata.description, 50)} - ID: ${s.id}`.slice(0, 100),
           value: s.id,
         }));
-      return await interaction.respond(choices);
+      const monzo = monzoOpen()
+        .filter((m) => !typed || `${m.description} ${m.reference} ${m.key}`.toLowerCase().includes(typed))
+        .map((m) => ({
+          name: `[Monzo] ${money(m.amount, m.currency)} - ${short(m.description, 50)} - ${m.reference}`.slice(0, 100),
+          value: m.key,
+        }));
+      return await interaction.respond([...monzo, ...card].slice(0, 25));
     }
 
     if (interaction.commandName !== 'refund' || interaction.user.id !== OWNER_ID) {
@@ -2087,7 +2631,7 @@ client.on('interactionCreate', async (interaction) => {
     switch (interaction.commandName) {
       case 'bankroll':
         return await sendStripeCheckout(interaction);
-      case 'monzo':
+      case 'bankroll-monzo':
         return await sendMonzoInvoice(interaction);
       case 'vault':
         return await cmdVault(interaction);
@@ -2171,6 +2715,7 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
     const amountPaid = Math.round(Number(tx.amount)) / 100;
     if (!(amountPaid > 0)) return;
     console.log(`Monzo incoming payment: ${amountPaid}`);
+    lastMonzoAt = Date.now();
 
     const text = [tx.description, tx.notes, tx.counterparty?.name, tx.metadata?.notes, data.description, data.notes]
       .filter(Boolean)
@@ -2184,14 +2729,13 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
     if (!matches.length) matches = open;
 
     if (matches.length === 1) {
-      const [key, delivery] = matches[0];
-      delivery.paid = true;
-      saveDeliveries();
+      const [key] = matches[0];
+      markMonzoPaid(key, data.id);
       await deliverFile(key, null);
       console.log(`Monzo payment delivered for invoice ${key} (${amountPaid})`);
     } else if (matches.length > 1) {
       await notifyOwner({
-        content: `Monzo payment of ${money(amountPaid, 'gbp')} arrived but ${matches.length} open invoices match that amount, so nothing was sent automatically. Ask the customer for their reference, then mark the right one as paid manually.`,
+        content: `Monzo payment of ${money(amountPaid, 'gbp')} arrived but ${matches.length} open invoices match that amount, so nothing was sent automatically. Check which customer paid before sending anything.`,
       });
     }
   } catch (e) {
