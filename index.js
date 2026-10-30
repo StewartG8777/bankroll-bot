@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const express = require('express');
 const Stripe = require('stripe');
 const { pipeline } = require('stream/promises');
-const { Readable } = require('stream');
+const { Readable, Transform } = require('stream');
 const {
   Client,
   GatewayIntentBits,
@@ -78,12 +78,23 @@ async function logToServer(payload) {
   try {
     const ch = await getLogChannel();
     if (ch) {
-      await ch.send({
-        content: payload.content || undefined,
-        embeds: payload.embeds,
-        files: payload.files?.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })),
-        allowedMentions: { parse: [] },
-      });
+      try {
+        await ch.send({
+          content: payload.content || undefined,
+          embeds: payload.embeds,
+          files: payload.files?.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })),
+          allowedMentions: { parse: [] },
+        });
+      } catch (e) {
+        if (!payload.files?.length) throw e;
+        // The file made the post fail (for example too big): log the embed without it.
+        console.error('Log post with file failed, retrying without it:', e.message);
+        await ch.send({
+          content: payload.content || undefined,
+          embeds: payload.embeds,
+          allowedMentions: { parse: [] },
+        });
+      }
       return;
     }
   } catch (e) {
@@ -209,6 +220,8 @@ const saveVault = () => {
 const BASE_URL = PUBLIC_URL.replace(/\/+$/, '');
 const MAX_FILE_BYTES = (BASE_URL ? 100 : 10) * 1024 * 1024;
 fs.mkdirSync(FILES_DIR, { recursive: true });
+const TMP_DIR = path.join(DATA_DIR, 'tmp');
+fs.mkdirSync(TMP_DIR, { recursive: true });
 
 let deliveries = {};
 try {
@@ -298,18 +311,96 @@ saveDeliveries();
 
 const liveInteractions = new Map();
 
-async function downloadAttachment(att, hosted) {
-  const limit = (hosted ? 100 : 10) * 1024 * 1024;
-  if (att.size > limit) throw new Error(`That file is over ${hosted ? 100 : 10} MB. ${hosted ? '' : 'Use the hosted link option for bigger files.'}`);
-  const res = await fetch(att.url);
-  if (!res.ok) throw new Error('Could not download the file you attached.');
-  return { buffer: Buffer.from(await res.arrayBuffer()), name: att.name };
+// Streams a download straight to disk (no big file held in memory), hashing and size-checking on the way.
+async function streamToFile(url, dest, limitBytes) {
+  let lastErr;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(5 * 60 * 1000) });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      const hash = crypto.createHash('sha256');
+      let size = 0;
+      const meter = new Transform({
+        transform(chunk, _enc, cb) {
+          size += chunk.length;
+          if (size > limitBytes) return cb(new Error('TOO_BIG'));
+          hash.update(chunk);
+          cb(null, chunk);
+        },
+      });
+      await pipeline(Readable.fromWeb(res.body), meter, fs.createWriteStream(dest));
+      return { size, sha256: hash.digest('hex') };
+    } catch (e) {
+      lastErr = e;
+      try {
+        fs.unlinkSync(dest);
+      } catch {}
+      if (e.message === 'TOO_BIG') break;
+    }
+  }
+  throw lastErr;
 }
+
+function sha256File(fp) {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256');
+    fs.createReadStream(fp)
+      .on('data', (c) => h.update(c))
+      .on('end', () => resolve(h.digest('hex')))
+      .on('error', reject);
+  });
+}
+
+async function downloadAttachment(att, hosted) {
+  const limitMb = hosted ? 100 : 10;
+  const limit = limitMb * 1024 * 1024;
+  if (att.size > limit) throw new Error(`That file is over ${limitMb} MB. ${hosted ? '' : 'Use the hosted link option for bigger files.'}`);
+  const tmp = path.join(TMP_DIR, `${crypto.randomBytes(8).toString('hex')}.part`);
+  try {
+    const { size, sha256 } = await streamToFile(att.url, tmp, limit);
+    return { path: tmp, temp: true, name: att.name, size, sha256 };
+  } catch (e) {
+    if (e.message === 'TOO_BIG') throw new Error(`That file is over ${limitMb} MB.`);
+    console.error('Attachment download failed:', e.message);
+    throw new Error('Could not download the file you attached.');
+  }
+}
+
+// Old half-finished downloads are cleared out.
+function sweepTmp() {
+  try {
+    for (const f of fs.readdirSync(TMP_DIR)) {
+      const fp = path.join(TMP_DIR, f);
+      try {
+        if (Date.now() - fs.statSync(fp).mtimeMs > 60 * 60 * 1000) fs.unlinkSync(fp);
+      } catch {}
+    }
+  } catch {}
+}
+sweepTmp();
+setInterval(sweepTmp, 60 * 60 * 1000);
 
 function saveDelivery(key, fileData, interaction, customer) {
   const safeName = fileData.name.replace(/[^\w.\-]/g, '_');
   const filePath = path.join(FILES_DIR, `${key.replace(/[^\w\-]/g, '_')}_${safeName}`);
-  fs.writeFileSync(filePath, fileData.buffer);
+  if (fileData.temp) {
+    try {
+      fs.renameSync(fileData.path, filePath);
+    } catch {
+      fs.copyFileSync(fileData.path, filePath);
+      try {
+        fs.unlinkSync(fileData.path);
+      } catch {}
+    }
+  } else {
+    // Vault file: a hard link is instant and uses no extra space (copy if links are not possible).
+    try {
+      fs.rmSync(filePath, { force: true });
+      fs.linkSync(fileData.path, filePath);
+    } catch {
+      fs.copyFileSync(fileData.path, filePath);
+    }
+  }
   deliveries[key] = {
     path: filePath,
     name: fileData.name,
@@ -369,6 +460,7 @@ function makeDownloadLink(d, paymentIntentId) {
     name: d.name,
     customerId: d.customerId,
     agentId: d.agentId,
+    vaultKey: d.vaultKey ?? null,
     paymentIntentId: paymentIntentId ?? null,
     expiresAt: Date.now() + 24 * 60 * 60 * 1000,
     used: false,
@@ -407,12 +499,20 @@ function relData(p) {
 function dataFilePaths() {
   const set = new Set();
   for (const v of Object.values(vault)) if (v?.path) set.add(v.path);
-  for (const d of Object.values(deliveries)) if (d?.path) set.add(d.path);
-  for (const d of Object.values(downloads)) if (d?.path) set.add(d.path);
+  for (const d of [...Object.values(deliveries), ...Object.values(downloads)]) {
+    if (!d?.path) continue;
+    if (d.vaultKey && vault[d.vaultKey]) continue; // a link to a vault file: backed up once, re-linked on restore
+    set.add(d.path);
+  }
   return [...set].filter((fp) => relData(fp));
 }
 
-async function backupData() {
+let backupChain = Promise.resolve();
+function backupData() {
+  backupChain = backupChain.then(() => backupDataOnce()).catch((e) => console.error('Backup failed:', e.message));
+  return backupChain;
+}
+async function backupDataOnce() {
   if (!restoreDone) return;
   try {
     const ch = BACKUP_CHANNEL_ID
@@ -468,7 +568,7 @@ async function backupData() {
           fs.readSync(fd, buf, 0, len, i * BLOB_CHUNK);
           await ch.send({
             content: `datafile:${rel}|${st.size}|${i + 1}/${total}`,
-            files: [new AttachmentBuilder(buf, { name: `part${i + 1}.bin` })],
+            files: [new AttachmentBuilder(buf, { name: total === 1 ? path.basename(fp) : `${path.basename(fp)}.part${i + 1}of${total}` })],
             allowedMentions: { parse: [] },
           });
           sentParts += 1;
@@ -1052,6 +1152,22 @@ async function autoRestoreOnStartup() {
         lost.push(path.basename(fp));
       }
     }
+    // Invoice files that are just links to a vault file: link them again from the restored vault file
+    for (const e of [...Object.values(deliveries), ...Object.values(downloads)]) {
+      if (!e?.vaultKey || !e.path || fs.existsSync(e.path)) continue;
+      const v = vault[e.vaultKey];
+      if (!v || !fs.existsSync(v.path)) continue;
+      try {
+        fs.mkdirSync(path.dirname(e.path), { recursive: true });
+        try {
+          fs.linkSync(v.path, e.path);
+        } catch {
+          fs.copyFileSync(v.path, e.path);
+        }
+      } catch (err) {
+        console.error('Could not re-link a vault file:', err.message);
+      }
+    }
     // Files that survived on disk and already have a backup do not need uploading again
     for (const fp of wanted) {
       const rel = relData(fp);
@@ -1347,11 +1463,10 @@ async function sendStripeCheckout(interaction) {
       if (!item || !fs.existsSync(item.path)) {
         throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
       }
-      fileData = {
-        buffer: fs.readFileSync(item.path),
-        name: item.originalName,
-      };
+      fileData = { path: item.path, temp: false, name: item.originalName, size: item.size, sha256: item.sha256 };
     }
+    const fileSha = fileData ? fileData.sha256 ?? (await sha256File(fileData.path)) : null;
+    if (vaultKey && fileSha && vault[vaultKey] && !vault[vaultKey].sha256) vault[vaultKey].sha256 = fileSha;
 
     const record = {
       created_at: new Date().toISOString(),
@@ -1364,7 +1479,7 @@ async function sendStripeCheckout(interaction) {
       ...(fileData
         ? {
             file_name: fileData.name.slice(0, 100),
-            file_sha256: crypto.createHash('sha256').update(fileData.buffer).digest('hex'),
+            file_sha256: fileSha,
           }
         : {}),
       ...(linkUrl ? { delivery_link_host: new URL(linkUrl).hostname } : {}),
@@ -1409,7 +1524,13 @@ async function sendStripeCheckout(interaction) {
     }
 
     const session = await stripe.checkout.sessions.create(params);
-    if (fileData) saveDelivery(session.id, fileData, interaction, customer);
+    if (fileData) {
+      saveDelivery(session.id, fileData, interaction, customer);
+      if (vaultKey) {
+        deliveries[session.id].vaultKey = vaultKey;
+        saveDeliveries();
+      }
+    }
     if (linkUrl) saveLinkDelivery(session.id, linkUrl, interaction, customer);
     const where = whereFrom(interaction, customer);
 
@@ -1457,10 +1578,16 @@ async function sendStripeCheckout(interaction) {
     }
     
     // GUARANTEED LOGGING
-    await logToServer({
-      embeds: [embed],
-      files: fileData ? [{ buffer: fileData.buffer, name: fileData.name }] : undefined,
-    });
+    (async () => {
+      let logFiles;
+      const dp = deliveries[session.id]?.path;
+      if (fileData && dp && fileData.size <= 8 * 1024 * 1024) {
+        try {
+          logFiles = [{ buffer: await fs.promises.readFile(dp), name: fileData.name }];
+        } catch {}
+      }
+      await logToServer({ embeds: [embed], files: logFiles });
+    })().catch((e) => console.error('Logging failed:', e.message));
 
     if (fileData || linkUrl) {
       liveInteractions.set(session.id, { interaction, at: Date.now() });
@@ -1530,14 +1657,19 @@ async function sendMonzoInvoice(interaction) {
       if (!item || !fs.existsSync(item.path)) {
         throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
       }
-      fileData = { buffer: fs.readFileSync(item.path), name: item.originalName };
+      fileData = { path: item.path, temp: false, name: item.originalName, size: item.size, sha256: item.sha256 };
     }
 
     const reference = 'BR' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
     const key = `monzo_${crypto.randomBytes(8).toString('hex')}`;
 
-    if (fileData) saveDelivery(key, fileData, interaction, customer);
-    else if (linkUrl) saveLinkDelivery(key, linkUrl, interaction, customer);
+    if (fileData) {
+      saveDelivery(key, fileData, interaction, customer);
+      if (vaultKey) {
+        deliveries[key].vaultKey = vaultKey;
+        saveDeliveries();
+      }
+    } else if (linkUrl) saveLinkDelivery(key, linkUrl, interaction, customer);
     else {
       deliveries[key] = {
         name: 'no file',
@@ -1648,27 +1780,41 @@ async function cmdVault(interaction) {
 
     const filePath = path.join(VAULT_DIR, `${key}_${att.name.replace(/[^\w.\-]/g, '_')}`);
 
+    const tmpPath = path.join(TMP_DIR, `${crypto.randomBytes(8).toString('hex')}.part`);
+    let info;
     try {
-      const res = await fetch(att.url);
-      if (!res.ok || !res.body) throw new Error('Could not download the file.');
-      
-      const fileStream = fs.createWriteStream(filePath);
-      await pipeline(Readable.fromWeb(res.body), fileStream);
+      info = await streamToFile(att.url, tmpPath, 100 * 1024 * 1024);
+      fs.renameSync(tmpPath, filePath);
     } catch (err) {
-      try { fs.unlinkSync(filePath); } catch {}
-      return interaction.editReply(`Failed to download and save file: ${err.message}`);
+      try { fs.unlinkSync(tmpPath); } catch {}
+      return interaction.editReply(
+        `Failed to download and save file: ${err.message === 'TOO_BIG' ? 'that file is over 100 MB' : err.message}`
+      );
     }
 
     vault[key] = {
       path: filePath,
       originalName: att.name,
-      size: att.size,
+      size: info.size,
+      sha256: info.sha256,
       addedAt: Date.now(),
     };
     delete blobBackedUp[relData(filePath)];
     saveVault();
 
-    return interaction.editReply(`Successfully added **${att.name}** to the vault as \`${key}\`!`);
+    await interaction.editReply(`Successfully added **${att.name}** to the vault as \`${key}\`! Saving a backup copy now...`);
+    clearTimeout(backupTimer);
+    backupData()
+      .then(() =>
+        interaction.followUp({
+          content: blobBackedUp[relData(filePath)]
+            ? `Backup copy of \`${key}\` is saved in the backup channel.`
+            : `Backup copy of \`${key}\` is not saved yet. The bot will keep retrying, check /vault list.`,
+          ephemeral: true,
+        })
+      )
+      .catch(() => {});
+    return;
   }
 
   if (sub === 'list') {
@@ -1678,7 +1824,7 @@ async function cmdVault(interaction) {
     const lines = keys.map(
       (k) =>
         `• \`${k}\` — **${vault[k].originalName}** (${(vault[k].size / (1024 * 1024)).toFixed(1)} MB)` +
-        (fs.existsSync(vault[k].path) ? '' : ' ⚠ file missing, re-add it')
+        (fs.existsSync(vault[k].path) ? (blobBackedUp[relData(vault[k].path)] ? ' - backed up' : ' - backup pending') : ' - file missing, re-add it')
     );
     const embed = new EmbedBuilder()
       .setColor(GREEN)
