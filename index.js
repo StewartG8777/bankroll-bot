@@ -1088,22 +1088,11 @@ const onReady = async () => {
 
   const monzoRebuilt = restoreMonzoReminders();
   restoreReminders().then((n) => {
-    const info = recoveryInfo;
-    const embed = new EmbedBuilder()
-      .setColor(GREEN)
-      .setTitle('🟢 Bot is back online')
-      .setDescription('🛡️ Auto-data recovery is enabled.')
-      .addFields({ name: '🔔 Reminders rebuilt', value: String(n + monzoRebuilt), inline: true });
-    if (info?.total) embed.addFields({ name: '📁 Files ready', value: `${info.ready} of ${info.total}`, inline: true });
-    if (info?.restored) embed.addFields({ name: '♻️ Restored from backup', value: String(info.restored), inline: true });
-    if (info?.lost?.length) {
-      embed.addFields({
-        name: '⚠️ Could not recover',
-        value: `${short(info.lost.join(', '), 900)}\nRe-add them (/vault add or a new invoice).`,
-      });
-    }
-    embed.setTimestamp();
-    return notifyOwner({ embeds: [embed] }, { log: false });
+    const total = n + monzoRebuilt;
+    return notifyOwner(
+      { content: `Bot is back online with auto-data recovery enabled.${total ? ` Reminders rebuilt: ${total}.` : ''}${recoveryNote}` },
+      { log: false }
+    );
   });
   setTimeout(backupData, 2 * 60 * 1000);
   setInterval(backupData, 6 * 60 * 60 * 1000);
@@ -1144,7 +1133,7 @@ function checkinEmbed({ pct, customerId, amount, currency, description, expiresS
   const bar = '▰'.repeat(filled) + '▱'.repeat(4 - filled);
   const e = new EmbedBuilder()
     .setColor(pct >= 75 ? RED : pct >= 50 ? 0xf1c40f : GREEN)
-    .setTitle(`⏰ ${label} check-in: ${pct}% of the time used`)
+    .setTitle(`${label} check-in: ${pct}% of the time used`)
     .setDescription(`<@${customerId}> still hasn't paid.`)
     .addFields(
       { name: 'Amount', value: money(amount, currency), inline: true },
