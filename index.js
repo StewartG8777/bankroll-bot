@@ -123,6 +123,7 @@ let lastWebhookAt = null;
 let lastWebhookType = '';
 let lastMonzoAt = null;
 let recoveryNote = '';
+let recoveryInfo = null;
 async function alertOwner(where, err) {
   const msg = `${where}: ${err?.message ?? err}`.slice(0, 500);
   console.error(msg);
@@ -1061,6 +1062,7 @@ async function autoRestoreOnStartup() {
     }
     if (Object.keys(vault).length) saveVault();
     if (recovered) console.log(`Recovered ${recovered} file(s) from backup channel.`);
+    recoveryInfo = { ready: wanted.length - lost.length, total: wanted.length, restored: recovered, lost: [...lost] };
     recoveryNote =
       (wanted.length ? ` Files: ${wanted.length - lost.length} of ${wanted.length} ready${recovered ? ` (${recovered} restored from backup)` : ''}.` : '') +
       (lost.length ? ` Could not recover: ${lost.join(', ')}. Re-add them (/vault add or a new invoice).` : '');
@@ -1084,10 +1086,25 @@ const onReady = async () => {
 
   await autoRestoreOnStartup();
 
-  restoreMonzoReminders();
-  restoreReminders().then((n) =>
-    notifyOwner({ content: `Bot is back online with auto-data recovery enabled.${n ? ` Reminders rebuilt: ${n}.` : ''}${recoveryNote}` }, { log: false })
-  );
+  const monzoRebuilt = restoreMonzoReminders();
+  restoreReminders().then((n) => {
+    const info = recoveryInfo;
+    const embed = new EmbedBuilder()
+      .setColor(GREEN)
+      .setTitle('🟢 Bot is back online')
+      .setDescription('🛡️ Auto-data recovery is enabled.')
+      .addFields({ name: '🔔 Reminders rebuilt', value: String(n + monzoRebuilt), inline: true });
+    if (info?.total) embed.addFields({ name: '📁 Files ready', value: `${info.ready} of ${info.total}`, inline: true });
+    if (info?.restored) embed.addFields({ name: '♻️ Restored from backup', value: String(info.restored), inline: true });
+    if (info?.lost?.length) {
+      embed.addFields({
+        name: '⚠️ Could not recover',
+        value: `${short(info.lost.join(', '), 900)}\nRe-add them (/vault add or a new invoice).`,
+      });
+    }
+    embed.setTimestamp();
+    return notifyOwner({ embeds: [embed] }, { log: false });
+  });
   setTimeout(backupData, 2 * 60 * 1000);
   setInterval(backupData, 6 * 60 * 60 * 1000);
 };
@@ -1107,8 +1124,6 @@ client.once('ready', onReady);
 client.once('clientReady', onReady);
 
 // ---------- Reminder ----------
-const reminderTimers = new Map();
-
 function parseExpiresToMinutes(input) {
   if (!input) return null;
   const match = input.toLowerCase().trim().match(/^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)?$/);
@@ -1120,10 +1135,51 @@ function parseExpiresToMinutes(input) {
   return val; // minutes default
 }
 
-// DMs the seller (the agent who made the invoice, plus the owner) at 33% and 66% of an invoice's time.
+// DMs the seller (the agent who made the invoice, plus the owner) at 25%, 50% and 75% of an invoice's time.
+const CHECKIN_PCTS = [25, 50, 75];
 const agentReminderTimers = new Map();
+
+function checkinEmbed({ pct, customerId, amount, currency, description, expiresSec, reference, label = 'Invoice' }) {
+  const filled = Math.round(pct / 25);
+  const bar = '🟩'.repeat(filled) + '⬜'.repeat(4 - filled);
+  const e = new EmbedBuilder()
+    .setColor(pct >= 75 ? RED : pct >= 50 ? 0xf1c40f : GREEN)
+    .setTitle(`⏰ ${label} check-in: ${pct}% of the time used`)
+    .setDescription(`⚠️ <@${customerId}> still hasn't paid.`)
+    .addFields(
+      { name: '💷 Amount', value: money(amount, currency), inline: true },
+      { name: '⏳ Expires', value: `<t:${expiresSec}:R>`, inline: true },
+      ...(reference ? [{ name: '🔖 Reference', value: `\`${reference}\``, inline: true }] : []),
+      { name: '📝 Description', value: short(description, 200) || 'No description' },
+      { name: '📊 Time used', value: `${bar}  ${pct}%` }
+    )
+    .setFooter({ text: '💬 Nudge them with /remind customer:@them' });
+  return e;
+}
+
+function checkinRow(payUrl, msgUrl) {
+  const row = new ActionRowBuilder();
+  if (payUrl) row.addComponents(new ButtonBuilder().setLabel('💳 Pay link').setStyle(ButtonStyle.Link).setURL(payUrl));
+  if (msgUrl) row.addComponents(new ButtonBuilder().setLabel('🔗 Go to invoice message').setStyle(ButtonStyle.Link).setURL(msgUrl));
+  return row.components.length ? [row] : [];
+}
+
+async function sendCheckin(agentId, payload, tag) {
+  let delivered = false;
+  for (const id of new Set([agentId, OWNER_ID].filter(Boolean))) {
+    try {
+      const u = await client.users.fetch(id);
+      await u.send(payload);
+      delivered = true;
+    } catch (e) {
+      console.log(`Could not DM ${id} the ${tag}:`, e.message);
+    }
+  }
+  return delivered;
+}
+
 function scheduleAgentReminder({ customerId, agentId, sessionId, amount, description, expiresAt, currency, startMs, done = {} }) {
-  for (const pct of [33, 66]) {
+  for (const pct of CHECKIN_PCTS) {
     const tkey = `${sessionId}:${pct}`;
     if (done[pct] || agentReminderTimers.has(tkey)) continue;
     const at = startMs + (expiresAt * 1000 - startMs) * (pct / 100);
@@ -1133,24 +1189,12 @@ function scheduleAgentReminder({ customerId, agentId, sessionId, amount, descrip
         const s = await stripe.checkout.sessions.retrieve(sessionId);
         if (s.status !== 'open' || s.metadata?.[`agent_notified_${pct}`]) return;
 
-        const embed = new EmbedBuilder()
-          .setColor(GREEN)
-          .setTitle(`Invoice check-in: ${pct}% of the time used`)
-          .setDescription(
-            `<@${customerId}> still hasn't paid **${money(amount, currency)}** (${short(description, 100)}).\n` +
-              `The invoice expires <t:${expiresAt}:R>.\n` +
-              `You can nudge them with /remind customer:@them.`
-          );
-        let delivered = false;
-        for (const id of new Set([agentId, OWNER_ID].filter(Boolean))) {
-          try {
-            const u = await client.users.fetch(id);
-            await u.send({ embeds: [embed] });
-            delivered = true;
-          } catch (e) {
-            console.log(`Could not DM ${id} the ${pct}% reminder:`, e.message);
-          }
-        }
+        const embed = checkinEmbed({ pct, customerId, amount, currency, description, expiresSec: expiresAt });
+        const delivered = await sendCheckin(
+          agentId,
+          { embeds: [embed], components: checkinRow(s.url, s.metadata?.invoice_msg_url) },
+          `${pct}% reminder`
+        );
         if (delivered) {
           await stripe.checkout.sessions
             .update(sessionId, { metadata: { [`agent_notified_${pct}`]: new Date().toISOString() } })
@@ -1168,65 +1212,22 @@ function scheduleReminders({
   customerId,
   agentId,
   sessionId,
-  url,
   amount,
   description,
   expiresAt,
   currency = CURRENCY,
-  fireAt = null,
   startMs = Date.now(),
-  customerDone = false,
   agentDone = {},
 }) {
   scheduleAgentReminder({ customerId, agentId, sessionId, amount, description, expiresAt, currency, startMs, done: agentDone });
-  if (customerDone || reminderTimers.has(sessionId)) return;
-  const total = expiresAt * 1000 - Date.now();
-  const delay = Math.max(fireAt ? fireAt - Date.now() : total * 0.5, 1000);
-  const timer = setTimeout(async () => {
-    reminderTimers.delete(sessionId);
-    try {
-      const s = await stripe.checkout.sessions.retrieve(sessionId);
-      if (s.status !== 'open' || s.metadata?.reminded_at) return;
-
-      const embed = new EmbedBuilder()
-        .setColor(GREEN)
-        .setTitle('Payment reminder')
-        .setDescription(
-          `You have an unpaid invoice for **${money(amount, currency)}** (${description}).\n` +
-            `The link expires <t:${expiresAt}:R>.`
-        );
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setLabel('Pay invoice').setStyle(ButtonStyle.Link).setURL(url)
-      );
-
-      // The customer is only in a DM and shares no server with the bot, so the reminder goes to the owner only.
-      try {
-        const u = await client.users.fetch(OWNER_ID);
-        await u.send({
-          content: `Reminder due: <@${customerId}> still hasn't paid. Pass this on, or open your DM with them and run /remind customer:@them`,
-          embeds: [embed],
-          components: [row],
-        });
-      } catch (e) {
-        console.log('Could not DM the owner the payment reminder:', e.message);
-      }
-
-      await stripe.checkout.sessions
-        .update(sessionId, { metadata: { reminded_at: new Date().toISOString() } })
-        .catch(() => {});
-    } catch (e) {
-      alertOwner('Reminder failed', e);
-    }
-  }, delay);
-  reminderTimers.set(sessionId, timer);
 }
 
-// DMs the seller and the owner at 33% and 66% of a Monzo invoice's time if it is still unpaid.
+// Same three check-ins for Monzo invoices.
 const monzoReminderTimers = new Map();
 function scheduleMonzoReminder(m) {
   if (!m || m.status !== 'open') return;
   const end = m.expiresAt ?? m.createdAt + MONZO_OPEN_MS;
-  for (const pct of [33, 66]) {
+  for (const pct of CHECKIN_PCTS) {
     const flag = `notified${pct}`;
     const tkey = `${m.key}:${pct}`;
     if (m[flag] || monzoReminderTimers.has(tkey)) continue;
@@ -1236,25 +1237,22 @@ function scheduleMonzoReminder(m) {
       try {
         const e = monzoLedger[m.key];
         if (!e || e.status !== 'open' || e[flag]) return;
-        const embed = new EmbedBuilder()
-          .setColor(GREEN)
-          .setTitle(`Monzo invoice check-in: ${pct}% of the time used`)
-          .setDescription(
-            `<@${e.customerId}> still hasn't paid **${money(e.amount, e.currency)}** (${short(e.description, 100)}).\n` +
-              `Reference: \`${e.reference}\`\n` +
-              `The invoice expires <t:${tsec(end)}:R>.\n` +
-              `You can nudge them with /remind customer:@them.`
-          );
-        let delivered = false;
-        for (const id of new Set([e.agentId, OWNER_ID].filter(Boolean))) {
-          try {
-            const u = await client.users.fetch(id);
-            await u.send({ embeds: [embed] });
-            delivered = true;
-          } catch (err) {
-            console.log(`Could not DM ${id} the Monzo ${pct}% reminder:`, err.message);
-          }
-        }
+        const embed = checkinEmbed({
+          pct,
+          customerId: e.customerId,
+          amount: e.amount,
+          currency: e.currency,
+          description: e.description,
+          expiresSec: tsec(end),
+          reference: e.reference,
+          label: 'Monzo invoice',
+        });
+        const payUrl = MONZO_LINK ? `${MONZO_LINK}/${e.amount.toFixed(2)}?d=${encodeURIComponent(e.reference)}` : null;
+        const delivered = await sendCheckin(
+          e.agentId,
+          { embeds: [embed], components: checkinRow(payUrl, e.msgUrl) },
+          `Monzo ${pct}% reminder`
+        );
         if (delivered) {
           e[flag] = Date.now();
           saveMonzo();
@@ -1270,7 +1268,7 @@ function scheduleMonzoReminder(m) {
 function restoreMonzoReminders() {
   let n = 0;
   for (const m of monzoOpen()) {
-    if (m.notified33 && m.notified66) continue;
+    if (CHECKIN_PCTS.every((p) => m[`notified${p}`])) continue;
     scheduleMonzoReminder(m);
     n += 1;
   }
@@ -1284,22 +1282,19 @@ async function restoreReminders() {
     let n = 0;
     for (const s of list.data) {
       const m = s.metadata ?? {};
-      if ((m.kind !== 'invoice' && m.kind !== 'checkout') || ((m.reminded_at || m.kind !== 'invoice') && m.agent_notified_33 && m.agent_notified_66) || !m.agent_id || !m.customer_id || !s.expires_at) continue;
-      if (reminderTimers.has(s.id)) continue;
+      if ((m.kind !== 'invoice' && m.kind !== 'checkout') || !m.agent_id || !m.customer_id || !s.expires_at) continue;
+      if (CHECKIN_PCTS.every((p) => m[`agent_notified_${p}`])) continue;
       if (s.expires_at * 1000 - Date.now() < 2 * 60 * 1000) continue;
       scheduleReminders({
         customerId: m.customer_id,
         agentId: m.agent_id,
         sessionId: s.id,
-        url: s.url,
         amount: (s.amount_total ?? 0) / 100,
         description: m.description || 'your order',
         expiresAt: s.expires_at,
         currency: s.currency,
-        fireAt: (s.created + (s.expires_at - s.created) * 0.5) * 1000,
         startMs: s.created * 1000,
-        customerDone: !!m.reminded_at || m.kind !== 'invoice',
-        agentDone: { 33: !!m.agent_notified_33, 66: !!m.agent_notified_66 },
+        agentDone: Object.fromEntries(CHECKIN_PCTS.map((p) => [p, !!m[`agent_notified_${p}`]])),
       });
       n += 1;
     }
@@ -1467,7 +1462,10 @@ async function sendStripeCheckout(interaction) {
       );
     }
 
-    await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
+    const sentInvoice = await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
+    if (sentInvoice?.url) {
+      stripe.checkout.sessions.update(session.id, { metadata: { invoice_msg_url: sentInvoice.url } }).catch(() => {});
+    }
     
     // GUARANTEED LOGGING
     await logToServer({
@@ -1486,12 +1484,10 @@ async function sendStripeCheckout(interaction) {
         customerId: customer.id,
         agentId: agent.id,
         sessionId: session.id,
-        url: session.url,
         amount,
         description,
         expiresAt: remindEnd,
         currency: cur,
-        customerDone: !expiresAt,
       });
     }
   } catch (err) {
@@ -1621,11 +1617,15 @@ async function sendMonzoInvoice(interaction) {
       );
     }
 
-    await interaction.editReply({
+    const sentInvoice = await interaction.editReply({
       content: `<@${customer.id}>`,
       embeds: [embed],
       components: row.components.length ? [row] : [],
     });
+    if (sentInvoice?.url) {
+      monzoLedger[key].msgUrl = sentInvoice.url;
+      saveMonzo();
+    }
     await logToServer({ embeds: [embed] });
 
     liveInteractions.set(key, { interaction, at: Date.now() });
@@ -1887,7 +1887,7 @@ async function cmdStatus(interaction) {
       { name: 'Uptime', value: `${Math.floor(up / 3600)}h ${Math.floor((up % 3600) / 60)}m`, inline: true },
       { name: 'Discord ping', value: `${client.ws.ping} ms`, inline: true },
       { name: 'Open invoices', value: open, inline: true },
-      { name: 'Reminders queued', value: String(reminderTimers.size), inline: true },
+      { name: 'Reminders queued', value: String(agentReminderTimers.size + monzoReminderTimers.size), inline: true },
       { name: 'Files waiting', value: String(Object.keys(deliveries).length), inline: true },
       { name: 'Vault items', value: String(Object.keys(vault).length), inline: true },
       { name: 'Hosted links', value: BASE_URL ? 'On' : 'Off (PUBLIC_URL not set)', inline: true },
