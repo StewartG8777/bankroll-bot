@@ -63,13 +63,12 @@ app.use(express.urlencoded({ extended: true }));
 // Basic uptime check route
 app.get('/', (req, res) => res.send('Bot and Webhooks are active!'));
 
-// --- Monzo Webhook Listener (Amount-Based Matching) ---
+// --- Monzo Webhook Listener (Amount-Based Tracking) ---
 app.post('/monzo-webhook', async (req, res) => {
   try {
     const data = req.body?.data;
     if (req.body?.type === 'transaction.create' && data) {
-      // Monzo amounts are in minor units (pence/cents). Positive amounts indicate money coming in (credits).
-      const amountPaid = data.amount / 100;
+      const amountPaid = data.amount / 100; // Monzo amounts are in minor units (pence/cents)
 
       if (amountPaid > 0) {
         // Check if this incoming credit amount matches any pending Monzo invoices
@@ -463,14 +462,30 @@ const common = (b) =>
 const bankrollCmd = common(
   new SlashCommandBuilder()
     .setName('bankroll')
-    .setDescription('Create a payment link for a customer')
-    .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
-    .addNumberOption((o) => o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true))
-    .addStringOption((o) => o.setName('description').setDescription('What the purchase is for').setRequired(true))
-    .addAttachmentOption((o) => o.setName('file').setDescription('File to send once paid'))
-    .addStringOption((o) => o.setName('delivery').setDescription('Delivery method').addChoices({ name: 'Hosted link', value: 'link' }, { name: 'Direct upload', value: 'direct' }))
-    .addStringOption((o) => o.setName('currency').setDescription('Currency').addChoices({ name: 'GBP £', value: 'gbp' }, { name: 'USD $', value: 'usd' }, { name: 'EUR €', value: 'eur' }))
-    .addStringOption((o) => o.setName('link').setDescription('Download link to send once paid'))
+    .setDescription('Create payment links for Stripe or Monzo')
+    .addSubcommand(sub =>
+      sub
+        .setName('stripe')
+        .setDescription('Create a Stripe payment link for a customer')
+        .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
+        .addNumberOption((o) => o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true))
+        .addStringOption((o) => o.setName('description').setDescription('What the purchase is for').setRequired(true))
+        .addAttachmentOption((o) => o.setName('file').setDescription('File to send once paid'))
+        .addStringOption((o) => o.setName('delivery').setDescription('Delivery method').addChoices({ name: 'Hosted link', value: 'link' }, { name: 'Direct upload', value: 'direct' }))
+        .addStringOption((o) => o.setName('currency').setDescription('Currency').addChoices({ name: 'GBP £', value: 'gbp' }, { name: 'USD $', value: 'usd' }, { name: 'EUR €', value: 'eur' }))
+        .addStringOption((o) => o.setName('link').setDescription('Download link to send once paid'))
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('monzo')
+        .setDescription('Create a Monzo bank transfer invoice with vault & automated amount tracking')
+        .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
+        .addNumberOption((o) => o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true))
+        .addStringOption((o) => o.setName('description').setDescription('What the purchase is for').setRequired(true))
+        .addAttachmentOption((o) => o.setName('file').setDescription('File to send once paid'))
+        .addStringOption((o) => o.setName('delivery').setDescription('Delivery method').addChoices({ name: 'Hosted link', value: 'link' }, { name: 'Direct upload', value: 'direct' }))
+        .addStringOption((o) => o.setName('link').setDescription('Download link to send once paid'))
+    )
 );
 
 const invoiceCmd = common(
@@ -487,19 +502,7 @@ const invoiceCmd = common(
     .addStringOption((o) => o.setName('expires').setDescription('Expiry time').addChoices({ name: '30 minutes', value: '30' }, { name: '1 hour', value: '60' }, { name: '6 hours', value: '360' }, { name: '24 hours', value: '1440' }))
 );
 
-const monzoCmd = common(
-  new SlashCommandBuilder()
-    .setName('monzo')
-    .setDescription('Create a Monzo.me bank transfer invoice with automated amount tracking')
-    .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
-    .addNumberOption((o) => o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true))
-    .addStringOption((o) => o.setName('description').setDescription('What the purchase is for').setRequired(true))
-    .addAttachmentOption((o) => o.setName('file').setDescription('File to send once paid'))
-    .addStringOption((o) => o.setName('delivery').setDescription('Delivery method').addChoices({ name: 'Hosted link', value: 'link' }, { name: 'Direct upload', value: 'direct' }))
-    .addStringOption((o) => o.setName('link').setDescription('Download link to send once paid'))
-);
-
-const commands = [bankrollCmd, invoiceCmd, monzoCmd];
+const commands = [bankrollCmd, invoiceCmd];
 
 // ---------- Bot Startup & Interaction Handling ----------
 let started = false;
@@ -522,7 +525,8 @@ client.once('clientReady', onReady);
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  if (interaction.commandName === 'monzo') {
+  // Handle /bankroll monzo subcommand
+  if (interaction.commandName === 'bankroll' && interaction.options.getSubcommand() === 'monzo') {
     const customer = interaction.options.getUser('customer');
     const amount = interaction.options.getNumber('amount');
     const description = interaction.options.getString('description');
@@ -578,8 +582,8 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
-  // Handle Stripe Bankroll / Invoice commands as normal
-  if (interaction.commandName === 'bankroll' || interaction.commandName === 'invoice') {
+  // Handle /bankroll stripe subcommand or /invoice command
+  if ((interaction.commandName === 'bankroll' && interaction.options.getSubcommand() === 'stripe') || interaction.commandName === 'invoice') {
     const customer = interaction.options.getUser('customer');
     const amount = interaction.options.getNumber('amount');
     const description = interaction.options.getString('description');
@@ -664,7 +668,6 @@ client.on('interactionCreate', async (interaction) => {
 
 // Start Express web server alongside Discord bot
 app.listen(PORT, () => {
-  const fileGenQuery = "";
   console.log(`Web server listening on port ${PORT}`);
 });
 
