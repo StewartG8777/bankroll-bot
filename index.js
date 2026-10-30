@@ -2116,6 +2116,6 @@ client.on('shardReady', (id) => console.log('Shard ready', id));
 client.on('shardReconnecting', (id) => console.log('Shard reconnecting', id));
 
 client
-  .login(DISTOKEN)
+  .login(DISCORD_TOKEN)
   .then(() => console.log('login() resolved'))
   .catch((e) => console.error('Login failed:', e));
