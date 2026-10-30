@@ -35,6 +35,7 @@ const {
   PORT = 3000,
   PUBLIC_URL = '',
   BACKUP_CHANNEL_ID = '',
+  MONZO_USERNAME = 'sstewart32',
 } = process.env;
 
 const stripe = new Stripe(STRIPE_SECRET_KEY);
@@ -42,6 +43,11 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
   partials: [Partials.Channel],
 });
+
+// Initialize Express app immediately at the top
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Who is allowed to run the commands (owner is always allowed)
 const allowed = new Set(
@@ -226,21 +232,24 @@ saveDeliveries();
 
 const liveInteractions = new Map();
 
-async function downloadAttachment(att, hosted) {
+async function saveAttachmentDirectly(att, key, interaction, customer, type = 'stripe', amount = 0, hosted = false) {
   const limit = (hosted ? 100 : 10) * 1024 * 1024;
   if (att.size > limit) throw new Error(`That file is over ${hosted ? 100 : 10} MB. ${hosted ? '' : 'Use the hosted link option for bigger files.'}`);
   const res = await fetch(att.url);
-  if (!res.ok) throw new Error('Could not download the file you attached.');
-  return { buffer: Buffer.from(await res.arrayBuffer()), name: att.name };
-}
+  if (!res.ok || !res.body) throw new Error('Could not download the file you attached.');
 
-function saveDelivery(key, fileData, interaction, customer) {
-  const safeName = fileData.name.replace(/[^\w.\-]/g, '_');
+  const safeName = att.name.replace(/[^\w.\-]/g, '_');
   const filePath = path.join(FILES_DIR, `${key.replace(/[^\w\-]/g, '_')}_${safeName}`);
-  fs.writeFileSync(filePath, fileData.buffer);
+
+  const fileStream = fs.createWriteStream(filePath);
+  await pipeline(Readable.fromWeb(res.body), fileStream);
+
   deliveries[key] = {
+    type,
+    amount,
+    paid: false,
     path: filePath,
-    name: fileData.name,
+    name: att.name,
     description: interaction.options.getString('description') ?? '',
     mode: interaction.options.getString('delivery') ?? (BASE_URL ? 'link' : 'direct'),
     channelId: interaction.channelId,
@@ -249,10 +258,14 @@ function saveDelivery(key, fileData, interaction, customer) {
     savedAt: Date.now(),
   };
   saveDeliveries();
+  return { path: filePath, name: att.name };
 }
 
-function saveLinkDelivery(key, url, interaction, customer) {
+function saveLinkDelivery(key, url, interaction, customer, type = 'stripe', amount = 0) {
   deliveries[key] = {
+    type,
+    amount,
+    paid: false,
     link: url,
     name: 'download link',
     channelId: interaction.channelId,
@@ -505,46 +518,63 @@ const common = (b) =>
 const bankrollCmd = common(
   new SlashCommandBuilder()
     .setName('bankroll')
-    .setDescription('Create a payment link / invoice for a customer')
-    .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
-    .addNumberOption((o) =>
-      o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true)
-    )
-    .addStringOption((o) =>
-      o.setName('description').setDescription('What the purchase is for').setRequired(true)
-    )
-    .addAttachmentOption((o) =>
-      o.setName('file').setDescription('File to send the customer once they have paid')
-    )
-    .addStringOption((o) =>
-      o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true)
-    )
-    .addStringOption((o) =>
-      o
-        .setName('delivery')
-        .setDescription('How to deliver the file (only used with a file)')
-        .addChoices(
-          { name: 'Hosted one-time link', value: 'link' },
-          { name: 'Direct file upload', value: 'direct' }
+    .setDescription('Create payment links for Stripe or Monzo')
+    .addSubcommand((sub) =>
+      sub
+        .setName('stripe')
+        .setDescription('Create a Stripe payment link / invoice for a customer')
+        .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
+        .addNumberOption((o) =>
+          o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true)
+        )
+        .addStringOption((o) =>
+          o.setName('description').setDescription('What the purchase is for').setRequired(true)
+        )
+        .addAttachmentOption((o) =>
+          o.setName('file').setDescription('File to send the customer once they have paid')
+        )
+        .addStringOption((o) =>
+          o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true)
+        )
+        .addStringOption((o) =>
+          o
+            .setName('delivery')
+            .setDescription('How to deliver the file (only used with a file)')
+            .addChoices(
+              { name: 'Hosted one-time link', value: 'link' },
+              { name: 'Direct file upload', value: 'direct' }
+            )
+        )
+        .addStringOption((o) =>
+          o
+            .setName('currency')
+            .setDescription('Currency for this invoice (default: your usual one)')
+            .addChoices(
+              { name: 'GBP £', value: 'gbp' },
+              { name: 'USD $', value: 'usd' },
+              { name: 'EUR €', value: 'eur' }
+            )
+        )
+        .addStringOption((o) =>
+          o.setName('link').setDescription('Download link to send once they have paid (for big files)')
+        )
+        .addStringOption((o) =>
+          o
+            .setName('expires')
+            .setDescription('Expiration time, e.g. 30m, 2h, 24h, or 7d (default: no expiry)')
         )
     )
-    .addStringOption((o) =>
-      o
-        .setName('currency')
-        .setDescription('Currency for this invoice (default: your usual one)')
-        .addChoices(
-          { name: 'GBP £', value: 'gbp' },
-          { name: 'USD $', value: 'usd' },
-          { name: 'EUR €', value: 'eur' }
-        )
-    )
-    .addStringOption((o) =>
-      o.setName('link').setDescription('Download link to send once they have paid (for big files)')
-    )
-    .addStringOption((o) =>
-      o
-        .setName('expires')
-        .setDescription('Expiration time, e.g. 30m, 2h, 24h, or 7d (default: no expiry)')
+    .addSubcommand((sub) =>
+      sub
+        .setName('monzo')
+        .setDescription('Create a Monzo bank transfer invoice with vault & automated amount tracking')
+        .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
+        .addNumberOption((o) => o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true))
+        .addStringOption((o) => o.setName('description').setDescription('What the purchase is for').setRequired(true))
+        .addAttachmentOption((o) => o.setName('file').setDescription('File to send once paid'))
+        .addStringOption((o) => o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true))
+        .addStringOption((o) => o.setName('delivery').setDescription('Delivery method').addChoices({ name: 'Hosted link', value: 'link' }, { name: 'Direct upload', value: 'direct' }))
+        .addStringOption((o) => o.setName('link').setDescription('Download link to send once paid'))
     )
 );
 
@@ -732,7 +762,7 @@ async function autoRestoreOnStartup() {
           try {
             const res = await fetch(att.url);
             const text = await res.text();
-            JSON.parse(text); // validate json
+            JSON.parse(text);
             fs.writeFileSync(targetPath, text);
             console.log(`Auto-recovered ${fname} from backup channel.`);
           } catch (e) {
@@ -742,7 +772,6 @@ async function autoRestoreOnStartup() {
       }
     }
 
-    // Reload files into memory
     try {
       deliveries = JSON.parse(fs.readFileSync(DELIVERIES_FILE, 'utf8'));
     } catch {}
@@ -790,7 +819,7 @@ function parseExpiresToMinutes(input) {
   const unit = match[2] || 'm';
   if (unit.startsWith('h')) return val * 60;
   if (unit.startsWith('d')) return val * 1440;
-  return val; // minutes default
+  return val;
 }
 
 function scheduleReminders({ customerId, agentId, sessionId, url, amount, description, expiresAt, currency = CURRENCY, fireAt = null }) {
@@ -860,7 +889,6 @@ async function restoreReminders() {
       });
       n += 1;
     }
-    console.log(`Restored ${n} reminder(s)`);
     return n;
   } catch (e) {
     alertOwner('Could not restore reminders', e);
@@ -868,7 +896,7 @@ async function restoreReminders() {
   }
 }
 
-// ---------- Stripe checkout (unified /bankroll command) ----------
+// ---------- Stripe checkout ----------
 async function sendStripeCheckout(interaction) {
   const customer = interaction.options.getUser('customer');
   const amount = interaction.options.getNumber('amount');
@@ -914,7 +942,7 @@ async function sendStripeCheckout(interaction) {
 
     let fileData = null;
     if (file) {
-      fileData = await downloadAttachment(file, mode === 'link');
+      // temporary placeholder before session.id
     } else if (vaultKey) {
       const item = vault[vaultKey];
       if (!item || !fs.existsSync(item.path)) {
@@ -982,8 +1010,12 @@ async function sendStripeCheckout(interaction) {
     }
 
     const session = await stripe.checkout.sessions.create(params);
-    if (fileData) saveDelivery(session.id, fileData, interaction, customer);
-    if (linkUrl) saveLinkDelivery(session.id, linkUrl, interaction, customer);
+    if (file) {
+      await saveAttachmentDirectly(file, session.id, interaction, customer, 'stripe', amount, mode === 'link');
+    } else if (fileData) {
+      saveDelivery(session.id, fileData, interaction, customer);
+    }
+    if (linkUrl) saveLinkDelivery(session.id, linkUrl, interaction, customer, 'stripe', amount);
     const where = whereFrom(interaction, customer);
 
     const embed = new EmbedBuilder()
@@ -999,8 +1031,8 @@ async function sendStripeCheckout(interaction) {
     if (expiresAt) {
       embed.addFields({ name: 'Pay by', value: `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
     }
-    if (fileData) {
-      embed.addFields({ name: 'File', value: `${fileData.name} (sent here after payment, or press Get my file)` });
+    if (file || fileData) {
+      embed.addFields({ name: 'File', value: `${file?.name || fileData?.name} (sent here after payment, or press Get my file)` });
     }
     if (linkUrl) {
       embed.addFields({ name: 'Download', value: 'Link sent here after payment, or press Get my file' });
@@ -1015,7 +1047,7 @@ async function sendStripeCheckout(interaction) {
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setLabel('Pay invoice').setStyle(ButtonStyle.Link).setURL(session.url)
     );
-    if (fileData || linkUrl) {
+    if (file || fileData || linkUrl) {
       row.addComponents(
         new ButtonBuilder()
           .setCustomId(`getfile:${session.id}`)
@@ -1025,14 +1057,9 @@ async function sendStripeCheckout(interaction) {
     }
 
     await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
-    
-    // GUARANTEED LOGGING
-    await logToServer({
-      embeds: [embed],
-      files: fileData ? [{ buffer: fileData.buffer, name: fileData.name }] : undefined,
-    });
+    logToServer({ embeds: [embed] }).catch(() => {});
 
-    if (fileData || linkUrl) {
+    if (file || fileData || linkUrl) {
       liveInteractions.set(session.id, { interaction, at: Date.now() });
       setTimeout(() => liveInteractions.delete(session.id), 14 * 60 * 1000);
     }
@@ -1052,6 +1079,115 @@ async function sendStripeCheckout(interaction) {
   } catch (err) {
     console.error(err);
     await interaction.editReply({ content: `Failed to create invoice: ${err.message}` });
+  }
+}
+
+// ---------- Monzo checkout ----------
+async function sendMonzoCheckout(interaction) {
+  const customer = interaction.options.getUser('customer');
+  const amount = interaction.options.getNumber('amount');
+  const description = interaction.options.getString('description');
+  const agent = interaction.user;
+  const file = interaction.options.getAttachment('file');
+  const vaultKey = interaction.options.getString('vault_file');
+  const linkRaw = interaction.options.getString('link');
+  const invoiceKey = `MONZO-${Math.floor(1000 + Math.random() * 9000)}`;
+
+  await interaction.deferReply();
+
+  try {
+    if ((file && vaultKey) || (file && linkRaw) || (vaultKey && linkRaw)) {
+      throw new Error('Use only one of: attached file, vault file, or download link.');
+    }
+
+    let linkUrl = null;
+    if (linkRaw) {
+      try {
+        const u = new URL(linkRaw.trim());
+        if (!/^https?:$/.test(u.protocol)) throw new Error();
+        linkUrl = u.href;
+      } catch {
+        throw new Error('That link is not valid. It must start with https://');
+      }
+    }
+
+    const mode = interaction.options.getString('delivery') ?? (BASE_URL ? 'link' : 'direct');
+    if ((file || vaultKey) && mode === 'link' && !BASE_URL) {
+      throw new Error('Hosted links are not set up yet (PUBLIC_URL is missing). Pick Direct file upload.');
+    }
+
+    if (file) {
+      await saveAttachmentDirectly(file, invoiceKey, interaction, customer, 'monzo', amount, mode === 'link');
+    } else if (vaultKey) {
+      const item = vault[vaultKey];
+      if (!item || !fs.existsSync(item.path)) {
+        throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
+      }
+      deliveries[invoiceKey] = {
+        type: 'monzo',
+        amount,
+        paid: false,
+        path: item.path,
+        name: item.originalName,
+        description,
+        channelId: interaction.channelId,
+        customerId: customer.id,
+        agentId: agent.id,
+        savedAt: Date.now(),
+      };
+      saveDeliveries();
+    } else if (linkUrl) {
+      saveLinkDelivery(invoiceKey, linkUrl, interaction, customer, 'monzo', amount);
+    } else {
+      deliveries[invoiceKey] = {
+        type: 'monzo',
+        amount,
+        paid: false,
+        name: 'download link',
+        description,
+        channelId: interaction.channelId,
+        customerId: customer.id,
+        agentId: agent.id,
+        savedAt: Date.now(),
+      };
+      saveDeliveries();
+    }
+
+    const monzoUrl = `https://monzo.me/${MONZO_USERNAME}/${amount.toFixed(2)}`;
+
+    const embed = new EmbedBuilder()
+      .setColor(GREEN)
+      .setTitle('Monzo Invoice')
+      .setDescription('Please click the button below to pay via Monzo.me. Once paid, the file/link will unlock automatically!')
+      .addFields(
+        { name: 'Sales Agent', value: `<@${agent.id}>` },
+        { name: 'Customer', value: `<@${customer.id}>` },
+        { name: 'Amount to Pay', value: money(amount, 'gbp') },
+        { name: 'Description', value: description },
+        { name: 'Status', value: '⏳ Waiting for incoming payment match...' }
+      )
+      .setFooter({ text: `Created by ${agent.username} | Invoice Ref: ${invoiceKey}` });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(monzoUrl)
+    );
+    if (file || vaultKey || linkUrl) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`getfile:${invoiceKey}`)
+          .setLabel('Get my file')
+          .setStyle(ButtonStyle.Secondary)
+      );
+    }
+
+    await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
+    logToServer({ embeds: [embed] }).catch(() => {});
+
+    liveInteractions.set(invoiceKey, { interaction, at: Date.now() });
+    setTimeout(() => liveInteractions.delete(invoiceKey), 14 * 60 * 1000);
+  } catch (err) {
+    console.error(err);
+    await interaction.editReply({ content: `Could not create Monzo invoice: ${err.message}` });
   }
 }
 
@@ -1176,7 +1312,7 @@ async function cmdCancel(interaction) {
       .setTimestamp();
 
     await interaction.editReply({ embeds: [embed] });
-    await logToServer({ embeds: [embed] });
+    logToServer({ embeds: [embed] }).catch(() => {});
   } catch (err) {
     console.error('Cancel failed:', err);
     await interaction.editReply(`Failed to cancel invoice: ${err.message}`);
@@ -1566,7 +1702,6 @@ async function onAutocomplete(interaction) {
   try {
     if (!allowed.has(interaction.user.id)) return await interaction.respond([]);
     
-    // Vault remove/info autocomplete
     if (
       (interaction.commandName === 'vault' && ['remove', 'info'].includes(interaction.options.getSubcommand())) ||
       interaction.commandName === 'bankroll'
@@ -1590,7 +1725,6 @@ async function onAutocomplete(interaction) {
       return await interaction.respond(choices);
     }
 
-    // Cancel command autocomplete for open checkout sessions / invoices
     if (interaction.commandName === 'cancel') {
       const typed = interaction.options.getFocused().toLowerCase();
       const sessions = await stripe.checkout.sessions.list({ limit: 50, status: 'open' });
@@ -1736,7 +1870,7 @@ async function onRefundButton(interaction) {
         { name: 'Refund ID', value: refund.id }
       );
     await interaction.editReply({ content: '', embeds: [done], components: [] });
-    await logToServer({ embeds: [done] });
+    logToServer({ embeds: [done] }).catch(() => {});
   } catch (err) {
     console.error('Refund failed:', err);
     await interaction.editReply({ content: `Refund failed: ${err.message}`, embeds: [], components: [] });
@@ -1776,24 +1910,34 @@ async function onGetFile(interaction) {
     return interaction.reply({ content: 'Only the customer can get this file.', ephemeral: true });
   }
 
-  const session = await stripe.checkout.sessions.retrieve(key);
-  if (session.payment_status !== 'paid') {
-    return interaction.reply({
-      content: 'Payment has not been received yet.',
-      ephemeral: true,
-    });
-  }
+  const isMonzo = d.type === 'monzo';
+  let checkPi = null;
 
-  const checkPi = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
-  if (checkPi) {
-    const pi = await stripe.paymentIntents.retrieve(checkPi, { expand: ['latest_charge'] });
-    if (pi.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.refunded) {
-      discardPending(key);
+  if (!isMonzo) {
+    const session = await stripe.checkout.sessions.retrieve(key);
+    if (session.payment_status !== 'paid') {
       return interaction.reply({
-        content: 'This payment was refunded.',
+        content: 'Payment has not been received yet.',
         ephemeral: true,
       });
     }
+
+    checkPi = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
+    if (checkPi) {
+      const pi = await stripe.paymentIntents.retrieve(checkPi, { expand: ['latest_charge'] });
+      if (pi.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.refunded) {
+        discardPending(key);
+        return interaction.reply({
+          content: 'This payment was refunded.',
+          ephemeral: true,
+        });
+      }
+    }
+  } else if (!d.paid && !allowed.has(interaction.user.id)) {
+    return interaction.reply({
+      content: 'Payment has not been verified yet.',
+      ephemeral: true,
+    });
   }
 
   let dlink = d.link || null;
@@ -1839,12 +1983,14 @@ async function onGetFile(interaction) {
   saveDeliveries();
   liveInteractions.delete(key);
 
-  await recordInStripe(checkPi, {
-    delivered_at: new Date().toISOString(),
-    delivered_to: 'Get my file button pressed',
-    delivered_file: d.name.slice(0, 100),
-    delivery_message: msg.url ?? '',
-  });
+  if (checkPi) {
+    await recordInStripe(checkPi, {
+      delivered_at: new Date().toISOString(),
+      delivered_to: 'Get my file button pressed',
+      delivered_file: d.name.slice(0, 100),
+      delivery_message: msg.url ?? '',
+    });
+  }
 
   await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}>.` });
 }
@@ -1913,8 +2059,12 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     switch (interaction.commandName) {
-      case 'bankroll':
-        return await sendStripeCheckout(interaction);
+      case 'bankroll': {
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'stripe') return await sendStripeCheckout(interaction);
+        if (sub === 'monzo') return await sendMonzoCheckout(interaction);
+        break;
+      }
       case 'vault':
         return await cmdVault(interaction);
       case 'cancel':
@@ -1956,7 +2106,8 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ---------- Monzo Webhook Listener ----------
+// ---------- Webhook Routes ----------
+
 app.post('/monzo-webhook', async (req, res) => {
   console.log('Monzo webhook hit! Body:', JSON.stringify(req.body));
   try {
@@ -1984,9 +2135,6 @@ app.post('/monzo-webhook', async (req, res) => {
     res.status(500).send('Error processing webhook');
   }
 });
-
-// ---------- Stripe webhook ----------
-const app = express();
 
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
@@ -2104,7 +2252,7 @@ app.get('/:name/:token', (req, res) => {
   stream.pipe(res);
 });
 
-app.get('/', (_, res) => res.send('Bankroll bot running'));
+app.get('/', (_, res) => res.send('Bankroll bot and Webhooks are active!'));
 app.listen(PORT, () => console.log(`Webhook server listening on :${PORT}`));
 
 client.on('error', (e) => console.error('Client error:', e));
@@ -2115,6 +2263,6 @@ client.on('shardReady', (id) => console.log('Shard ready', id));
 client.on('shardReconnecting', (id) => console.log('Shard reconnecting', id));
 
 client
-  .login(DISTOKEN)
+  .login(DISCORD_TOKEN)
   .then(() => console.log('login() resolved'))
   .catch((e) => console.error('Login failed:', e));
