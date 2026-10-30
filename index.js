@@ -491,6 +491,20 @@ let lastJsonMsg = null;
 // Every stored file (vault, files waiting for payment, hosted downloads), as paths under DATA_DIR.
 const BLOB_CHUNK = 9 * 1024 * 1024; // Discord allows about 10 MB per upload, so big files go up in 9 MB parts
 
+// Files too big for Discord are hosted here as one whole file (7 days) and linked from the log.
+const LOGCOPY_DIR = path.join(DATA_DIR, 'logcopies');
+fs.mkdirSync(LOGCOPY_DIR, { recursive: true });
+for (const f of fs.readdirSync(LOGCOPY_DIR)) { try { fs.unlinkSync(path.join(LOGCOPY_DIR, f)); } catch {} }
+const logCopies = {};
+setInterval(() => {
+  for (const [t, c] of Object.entries(logCopies)) {
+    if (Date.now() > c.expiresAt) {
+      try { fs.unlinkSync(c.path); } catch {}
+      delete logCopies[t];
+    }
+  }
+}, 60 * 60 * 1000);
+
 // Logs an invoice embed with the whole file attached (same as the old version did).
 // Reads the vault file straight from the vault, and if Discord refuses it, says why in the log.
 async function logInvoiceWithFile(embed, fileData, filePath) {
@@ -510,13 +524,25 @@ async function logInvoiceWithFile(embed, fileData, filePath) {
   } catch (e) {
     console.error('Log post with file failed:', e.message);
     await ch.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
-    const limit = ch.guild?.maximumUploadLimit;
+    const mb = (buffer.length / (1024 * 1024)).toFixed(2);
+    if (BASE_URL) {
+      try {
+        const token = crypto.randomBytes(24).toString('hex');
+        const dest = path.join(LOGCOPY_DIR, `${token}_${String(fileData.name).replace(/[^\w.\-]/g, '_')}`);
+        try { fs.linkSync(p, dest); } catch { fs.copyFileSync(p, dest); }
+        logCopies[token] = { path: dest, name: fileData.name, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 };
+        await ch.send({
+          content: `**${fileData.name}** (${mb} MB) is too big to attach here. Download the whole file (valid 7 days): ${BASE_URL}/bankroll-log-copy/${token}`,
+          allowedMentions: { parse: [] },
+        });
+        return;
+      } catch (e2) {
+        console.error('Log copy link failed:', e2.message);
+      }
+    }
     await ch
       .send({
-        content:
-          `Could not attach **${fileData.name}** (${(buffer.length / (1024 * 1024)).toFixed(2)} MB) to the log. ` +
-          `Discord said: ${e.message}` +
-          (limit ? ` (this server's upload limit is ${(limit / (1024 * 1024)).toFixed(0)} MB)` : ''),
+        content: `Could not attach **${fileData.name}** (${mb} MB) to the log. Discord said: ${e.message}`,
         allowedMentions: { parse: [] },
       })
       .catch(() => {});
@@ -527,6 +553,10 @@ function relData(p) {
   if (!p) return null;
   const rel = path.relative(DATA_DIR, path.resolve(String(p)));
   return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel.split(path.sep).join('/') : null;
+}
+// A fixed (not secret-guessable) link to one stored file, used when a backup is too big for Discord.
+function backupToken(rel) {
+  return crypto.createHash('sha256').update(`${DISCORD_TOKEN}|backup|${rel}`).digest('hex').slice(0, 40);
 }
 function dataFilePaths() {
   const set = new Set();
@@ -590,6 +620,36 @@ async function backupDataOnce() {
       if (sentParts > 0 && sentParts + total > 15) {
         scheduleBackup(); // carry on with the rest in a moment
         break;
+      }
+      if (total > 1) {
+        // Big file: try one whole upload first, then a link; only split into parts if there is no PUBLIC_URL.
+        try {
+          await ch.send({
+            content: `datafile:${rel}|${st.size}|1/1`,
+            files: [new AttachmentBuilder(await fs.promises.readFile(fp), { name: path.basename(fp) })],
+            allowedMentions: { parse: [] },
+          });
+          sentParts += 1;
+          blobBackedUp[rel] = st.size;
+          lastBackupAt = Date.now();
+          continue;
+        } catch (e) {
+          console.error(`Whole-file backup failed for ${rel}:`, e.message);
+        }
+        if (BASE_URL) {
+          try {
+            await ch.send({
+              content: `datafilelink:${rel}|${st.size}|${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`,
+              allowedMentions: { parse: [] },
+            });
+            sentParts += 1;
+            blobBackedUp[rel] = st.size;
+            lastBackupAt = Date.now();
+            continue;
+          } catch (e) {
+            console.error(`Backup link post failed for ${rel}:`, e.message);
+          }
+        }
       }
       let fd;
       try {
@@ -3010,6 +3070,26 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   }
 
   res.json({ received: true });
+});
+
+app.get('/bankroll-log-copy/:token', (req, res) => {
+  const c = logCopies[req.params.token];
+  if (!c || Date.now() > c.expiresAt || !fs.existsSync(c.path)) return res.status(410).send('This link has expired.');
+  const ua = req.headers['user-agent'] || '';
+  if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) return res.status(200).send('Log copy');
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(c.name)}`);
+  fs.createReadStream(c.path).on('error', () => res.destroy()).pipe(res);
+});
+
+app.get('/bankroll-backup-file/:token', (req, res) => {
+  const fp = dataFilePaths().find((f) => backupToken(relData(f)) === req.params.token);
+  if (!fp || !fs.existsSync(fp)) return res.status(404).send('Not found');
+  const ua = req.headers['user-agent'] || '';
+  if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) return res.status(200).send('Backup file');
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(fp))}`);
+  fs.createReadStream(fp).on('error', () => res.destroy()).pipe(res);
 });
 
 app.get('/:name/:token', (req, res) => {
