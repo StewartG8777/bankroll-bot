@@ -35,9 +35,6 @@ const {
   PORT = 3000,
   PUBLIC_URL = '',
   BACKUP_CHANNEL_ID = '',
-  MONZO_ACCESS_TOKEN = '',
-  MONZO_ACCOUNT_ID = '',
-  MONZO_USERNAME = 'sstewart32',
 } = process.env;
 
 const stripe = new Stripe(STRIPE_SECRET_KEY);
@@ -237,14 +234,11 @@ async function downloadAttachment(att, hosted) {
   return { buffer: Buffer.from(await res.arrayBuffer()), name: att.name };
 }
 
-function saveDelivery(key, fileData, interaction, customer, type = 'stripe', amount = 0) {
+function saveDelivery(key, fileData, interaction, customer) {
   const safeName = fileData.name.replace(/[^\w.\-]/g, '_');
   const filePath = path.join(FILES_DIR, `${key.replace(/[^\w\-]/g, '_')}_${safeName}`);
   fs.writeFileSync(filePath, fileData.buffer);
   deliveries[key] = {
-    type,
-    amount,
-    paid: false,
     path: filePath,
     name: fileData.name,
     description: interaction.options.getString('description') ?? '',
@@ -257,11 +251,8 @@ function saveDelivery(key, fileData, interaction, customer, type = 'stripe', amo
   saveDeliveries();
 }
 
-function saveLinkDelivery(key, url, interaction, customer, type = 'stripe', amount = 0) {
+function saveLinkDelivery(key, url, interaction, customer) {
   deliveries[key] = {
-    type,
-    amount,
-    paid: false,
     link: url,
     name: 'download link',
     channelId: interaction.channelId,
@@ -514,63 +505,46 @@ const common = (b) =>
 const bankrollCmd = common(
   new SlashCommandBuilder()
     .setName('bankroll')
-    .setDescription('Create payment links for Stripe or Monzo')
-    .addSubcommand((sub) =>
-      sub
-        .setName('stripe')
-        .setDescription('Create a Stripe payment link / invoice for a customer')
-        .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
-        .addNumberOption((o) =>
-          o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true)
-        )
-        .addStringOption((o) =>
-          o.setName('description').setDescription('What the purchase is for').setRequired(true)
-        )
-        .addAttachmentOption((o) =>
-          o.setName('file').setDescription('File to send the customer once they have paid')
-        )
-        .addStringOption((o) =>
-          o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true)
-        )
-        .addStringOption((o) =>
-          o
-            .setName('delivery')
-            .setDescription('How to deliver the file (only used with a file)')
-            .addChoices(
-              { name: 'Hosted one-time link', value: 'link' },
-              { name: 'Direct file upload', value: 'direct' }
-            )
-        )
-        .addStringOption((o) =>
-          o
-            .setName('currency')
-            .setDescription('Currency for this invoice (default: your usual one)')
-            .addChoices(
-              { name: 'GBP £', value: 'gbp' },
-              { name: 'USD $', value: 'usd' },
-              { name: 'EUR €', value: 'eur' }
-            )
-        )
-        .addStringOption((o) =>
-          o.setName('link').setDescription('Download link to send once they have paid (for big files)')
-        )
-        .addStringOption((o) =>
-          o
-            .setName('expires')
-            .setDescription('Expiration time, e.g. 30m, 2h, 24h, or 7d (default: no expiry)')
+    .setDescription('Create a payment link / invoice for a customer')
+    .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
+    .addNumberOption((o) =>
+      o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true)
+    )
+    .addStringOption((o) =>
+      o.setName('description').setDescription('What the purchase is for').setRequired(true)
+    )
+    .addAttachmentOption((o) =>
+      o.setName('file').setDescription('File to send the customer once they have paid')
+    )
+    .addStringOption((o) =>
+      o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true)
+    )
+    .addStringOption((o) =>
+      o
+        .setName('delivery')
+        .setDescription('How to deliver the file (only used with a file)')
+        .addChoices(
+          { name: 'Hosted one-time link', value: 'link' },
+          { name: 'Direct file upload', value: 'direct' }
         )
     )
-    .addSubcommand((sub) =>
-      sub
-        .setName('monzo')
-        .setDescription('Create a Monzo bank transfer invoice with vault & automated amount tracking')
-        .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
-        .addNumberOption((o) => o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true))
-        .addStringOption((o) => o.setName('description').setDescription('What the purchase is for').setRequired(true))
-        .addAttachmentOption((o) => o.setName('file').setDescription('File to send once paid'))
-        .addStringOption((o) => o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true))
-        .addStringOption((o) => o.setName('delivery').setDescription('Delivery method').addChoices({ name: 'Hosted link', value: 'link' }, { name: 'Direct upload', value: 'direct' }))
-        .addStringOption((o) => o.setName('link').setDescription('Download link to send once paid'))
+    .addStringOption((o) =>
+      o
+        .setName('currency')
+        .setDescription('Currency for this invoice (default: your usual one)')
+        .addChoices(
+          { name: 'GBP £', value: 'gbp' },
+          { name: 'USD $', value: 'usd' },
+          { name: 'EUR €', value: 'eur' }
+        )
+    )
+    .addStringOption((o) =>
+      o.setName('link').setDescription('Download link to send once they have paid (for big files)')
+    )
+    .addStringOption((o) =>
+      o
+        .setName('expires')
+        .setDescription('Expiration time, e.g. 30m, 2h, 24h, or 7d (default: no expiry)')
     )
 );
 
@@ -734,6 +708,55 @@ const setupCmd = new SlashCommandBuilder()
 const commands = [bankrollCmd, vaultCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
 
 let started = false;
+async function autoRestoreOnStartup() {
+  try {
+    const ch = BACKUP_CHANNEL_ID
+      ? await client.channels.fetch(BACKUP_CHANNEL_ID).catch(() => null)
+      : findBackupChannel() ?? (await getLogChannel());
+    if (!ch) return;
+
+    const messages = await ch.messages.fetch({ limit: 10 });
+    for (const msg of messages.values()) {
+      if (!msg.attachments.size) continue;
+      for (const att of msg.attachments.values()) {
+        const fname = att.name.toLowerCase();
+        let targetPath = null;
+        if (fname === 'deliveries.json' && (!fs.existsSync(DELIVERIES_FILE) || fs.readFileSync(DELIVERIES_FILE, 'utf8').length < 5)) {
+          targetPath = DELIVERIES_FILE;
+        } else if (fname === 'downloads.json' && (!fs.existsSync(DOWNLOADS_FILE) || fs.readFileSync(DOWNLOADS_FILE, 'utf8').length < 5)) {
+          targetPath = DOWNLOADS_FILE;
+        } else if (fname === 'vault.json' && (!fs.existsSync(VAULT_FILE) || fs.readFileSync(VAULT_FILE, 'utf8').length < 5)) {
+          targetPath = VAULT_FILE;
+        }
+        if (targetPath) {
+          try {
+            const res = await fetch(att.url);
+            const text = await res.text();
+            JSON.parse(text); // validate json
+            fs.writeFileSync(targetPath, text);
+            console.log(`Auto-recovered ${fname} from backup channel.`);
+          } catch (e) {
+            console.error(`Failed to auto-restore ${fname}:`, e.message);
+          }
+        }
+      }
+    }
+
+    // Reload files into memory
+    try {
+      deliveries = JSON.parse(fs.readFileSync(DELIVERIES_FILE, 'utf8'));
+    } catch {}
+    try {
+      downloads = JSON.parse(fs.readFileSync(DOWNLOADS_FILE, 'utf8'));
+    } catch {}
+    try {
+      vault = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
+    } catch {}
+  } catch (e) {
+    console.error('Auto-restore on startup failed:', e.message);
+  }
+}
+
 const onReady = async () => {
   if (started) return;
   started = true;
@@ -744,8 +767,11 @@ const onReady = async () => {
   } catch (e) {
     console.error('Command registration failed:', e);
   }
+
+  await autoRestoreOnStartup();
+
   restoreReminders().then((n) =>
-    notifyOwner({ content: `Bot is back online.${n ? ` Reminders rebuilt: ${n}.` : ''}` }, { log: false })
+    notifyOwner({ content: `Bot is back online with auto-data recovery enabled.${n ? ` Reminders rebuilt: ${n}.` : ''}` }, { log: false })
   );
   setTimeout(backupData, 2 * 60 * 1000);
   setInterval(backupData, 6 * 60 * 60 * 1000);
@@ -842,7 +868,7 @@ async function restoreReminders() {
   }
 }
 
-// ---------- Stripe checkout (/bankroll stripe) ----------
+// ---------- Stripe checkout (unified /bankroll command) ----------
 async function sendStripeCheckout(interaction) {
   const customer = interaction.options.getUser('customer');
   const amount = interaction.options.getNumber('amount');
@@ -956,8 +982,8 @@ async function sendStripeCheckout(interaction) {
     }
 
     const session = await stripe.checkout.sessions.create(params);
-    if (fileData) saveDelivery(session.id, fileData, interaction, customer, 'stripe', amount);
-    if (linkUrl) saveLinkDelivery(session.id, linkUrl, interaction, customer, 'stripe', amount);
+    if (fileData) saveDelivery(session.id, fileData, interaction, customer);
+    if (linkUrl) saveLinkDelivery(session.id, linkUrl, interaction, customer);
     const where = whereFrom(interaction, customer);
 
     const embed = new EmbedBuilder()
@@ -1026,114 +1052,6 @@ async function sendStripeCheckout(interaction) {
   } catch (err) {
     console.error(err);
     await interaction.editReply({ content: `Failed to create invoice: ${err.message}` });
-  }
-}
-
-// ---------- Monzo checkout (/bankroll monzo) ----------
-async function sendMonzoCheckout(interaction) {
-  const customer = interaction.options.getUser('customer');
-  const amount = interaction.options.getNumber('amount');
-  const description = interaction.options.getString('description');
-  const agent = interaction.user;
-  const file = interaction.options.getAttachment('file');
-  const vaultKey = interaction.options.getString('vault_file');
-  const linkRaw = interaction.options.getString('link');
-  const invoiceKey = `MONZO-${Math.floor(1000 + Math.random() * 9000)}`;
-
-  await interaction.deferReply();
-
-  try {
-    if ((file && vaultKey) || (file && linkRaw) || (vaultKey && linkRaw)) {
-      throw new Error('Use only one of: attached file, vault file, or download link.');
-    }
-
-    let linkUrl = null;
-    if (linkRaw) {
-      try {
-        const u = new URL(linkRaw.trim());
-        if (!/^https?:$/.test(u.protocol)) throw new Error();
-        linkUrl = u.href;
-      } catch {
-        throw new Error('That link is not valid. It must start with https://');
-      }
-    }
-
-    const mode = interaction.options.getString('delivery') ?? (BASE_URL ? 'link' : 'direct');
-    if ((file || vaultKey) && mode === 'link' && !BASE_URL) {
-      throw new Error('Hosted links are not set up yet (PUBLIC_URL is missing). Pick Direct file upload.');
-    }
-
-    let fileData = null;
-    if (file) {
-      fileData = await downloadAttachment(file, mode === 'link');
-    } else if (vaultKey) {
-      const item = vault[vaultKey];
-      if (!item || !fs.existsSync(item.path)) {
-        throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
-      }
-      fileData = {
-        buffer: fs.readFileSync(item.path),
-        name: item.originalName,
-      };
-    }
-
-    if (fileData) saveDelivery(invoiceKey, fileData, interaction, customer, 'monzo', amount);
-    else if (linkUrl) saveLinkDelivery(invoiceKey, linkUrl, interaction, customer, 'monzo', amount);
-    else {
-      deliveries[invoiceKey] = {
-        type: 'monzo',
-        amount,
-        paid: false,
-        name: 'download link',
-        description,
-        channelId: interaction.channelId,
-        customerId: customer.id,
-        agentId: agent.id,
-        savedAt: Date.now(),
-      };
-      saveDeliveries();
-    }
-
-    const monzoUrl = `https://monzo.me/${MONZO_USERNAME}/${amount.toFixed(2)}`;
-    const where = whereFrom(interaction, customer);
-
-    const embed = new EmbedBuilder()
-      .setColor(GREEN)
-      .setTitle('Monzo Invoice')
-      .setDescription('Please click the button below to pay via Monzo.me. Once paid, the file/link will unlock automatically!')
-      .addFields(
-        { name: 'Sales Agent', value: `<@${agent.id}>` },
-        { name: 'Customer', value: `<@${customer.id}>` },
-        { name: 'Amount to Pay', value: money(amount, 'gbp') },
-        { name: 'Description', value: description },
-        { name: 'Status', value: '⏳ Waiting for incoming payment match...' }
-      )
-      .setFooter({ text: `Created by ${agent.username} | Invoice Ref: ${invoiceKey}` });
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(monzoUrl)
-    );
-    if (fileData || linkUrl) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setCustomId(`getfile:${invoiceKey}`)
-          .setLabel('Get my file')
-          .setStyle(ButtonStyle.Secondary)
-      );
-    }
-
-    await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
-    
-    await logToServer({
-      embeds: [embed],
-      files: fileData ? [{ buffer: fileData.buffer, name: fileData.name }] : undefined,
-    });
-
-    liveInteractions.set(invoiceKey, { interaction, at: Date.now() });
-    setTimeout(() => liveInteractions.delete(invoiceKey), 14 * 60 * 1000);
-  } catch (err) {
-    console.error(err);
-    await interaction.editReply({ content: `Could not create Monzo invoice: ${err.message}` });
   }
 }
 
@@ -1648,10 +1566,10 @@ async function onAutocomplete(interaction) {
   try {
     if (!allowed.has(interaction.user.id)) return await interaction.respond([]);
     
-    // Vault remove/info autocomplete or bankroll file autocomplete
+    // Vault remove/info autocomplete
     if (
       (interaction.commandName === 'vault' && ['remove', 'info'].includes(interaction.options.getSubcommand())) ||
-      (interaction.commandName === 'bankroll' && interaction.options.getFocused(true).name === 'vault_file')
+      interaction.commandName === 'bankroll'
     ) {
       const typed = interaction.options.getFocused().toLowerCase();
       const entries = Object.entries(vault);
@@ -1858,35 +1776,25 @@ async function onGetFile(interaction) {
     return interaction.reply({ content: 'Only the customer can get this file.', ephemeral: true });
   }
 
-  const isMonzo = d.type === 'monzo';
-  if (!isMonzo) {
-    const session = await stripe.checkout.sessions.retrieve(key);
-    if (session.payment_status !== 'paid') {
-      return interaction.reply({
-        content: 'Payment has not been received yet.',
-        ephemeral: true,
-      });
-    }
-
-    const checkPi = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
-    if (checkPi) {
-      const pi = await stripe.paymentIntents.retrieve(checkPi, { expand: ['latest_charge'] });
-      if (pi.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.refunded) {
-        discardPending(key);
-        return interaction.reply({
-          content: 'This payment was refunded.',
-          ephemeral: true,
-        });
-      }
-    }
-  } else if (!d.paid && !allowed.has(interaction.user.id)) {
+  const session = await stripe.checkout.sessions.retrieve(key);
+  if (session.payment_status !== 'paid') {
     return interaction.reply({
-      content: 'Payment has not been verified yet.',
+      content: 'Payment has not been received yet.',
       ephemeral: true,
     });
   }
 
-  const checkPi = !isMonzo ? (typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id) : null;
+  const checkPi = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
+  if (checkPi) {
+    const pi = await stripe.paymentIntents.retrieve(checkPi, { expand: ['latest_charge'] });
+    if (pi.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.refunded) {
+      discardPending(key);
+      return interaction.reply({
+        content: 'This payment was refunded.',
+        ephemeral: true,
+      });
+    }
+  }
 
   let dlink = d.link || null;
   let hosted = false;
@@ -1931,14 +1839,12 @@ async function onGetFile(interaction) {
   saveDeliveries();
   liveInteractions.delete(key);
 
-  if (checkPi) {
-    await recordInStripe(checkPi, {
-      delivered_at: new Date().toISOString(),
-      delivered_to: 'Get my file button pressed',
-      delivered_file: d.name.slice(0, 100),
-      delivery_message: msg.url ?? '',
-    });
-  }
+  await recordInStripe(checkPi, {
+    delivered_at: new Date().toISOString(),
+    delivered_to: 'Get my file button pressed',
+    delivered_file: d.name.slice(0, 100),
+    delivery_message: msg.url ?? '',
+  });
 
   await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}>.` });
 }
@@ -2007,12 +1913,8 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     switch (interaction.commandName) {
-      case 'bankroll': {
-        const sub = interaction.options.getSubcommand();
-        if (sub === 'stripe') return await sendStripeCheckout(interaction);
-        if (sub === 'monzo') return await sendMonzoCheckout(interaction);
-        break;
-      }
+      case 'bankroll':
+        return await sendStripeCheckout(interaction);
       case 'vault':
         return await cmdVault(interaction);
       case 'cancel':
@@ -2054,20 +1956,14 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ---------- Express App & Webhooks (Stripe + Monzo) ----------
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-app.get('/', (_, res) => res.send('Bankroll bot and Webhooks are active!'));
-
-// --- Monzo Webhook Listener (Amount-Based Tracking) ---
+// ---------- Monzo Webhook Listener ----------
 app.post('/monzo-webhook', async (req, res) => {
+  console.log('Monzo webhook hit! Body:', JSON.stringify(req.body));
   try {
     const data = req.body?.data;
     if (req.body?.type === 'transaction.create' && data) {
-      const amountPaid = data.amount / 100; // Monzo amounts are in minor units (pence/cents)
-
+      const amountPaid = data.amount / 100;
+      console.log(`Monzo transaction.create received for amount: ${amountPaid}`);
       if (amountPaid > 0) {
         for (const [key, delivery] of Object.entries(deliveries)) {
           if (delivery.type === 'monzo' && !delivery.paid) {
@@ -2089,7 +1985,9 @@ app.post('/monzo-webhook', async (req, res) => {
   }
 });
 
-// --- Stripe Webhook Listener ---
+// ---------- Stripe webhook ----------
+const app = express();
+
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
   try {
@@ -2206,6 +2104,7 @@ app.get('/:name/:token', (req, res) => {
   stream.pipe(res);
 });
 
+app.get('/', (_, res) => res.send('Bankroll bot running'));
 app.listen(PORT, () => console.log(`Webhook server listening on :${PORT}`));
 
 client.on('error', (e) => console.error('Client error:', e));
@@ -2216,6 +2115,6 @@ client.on('shardReady', (id) => console.log('Shard ready', id));
 client.on('shardReconnecting', (id) => console.log('Shard reconnecting', id));
 
 client
-  .login(DISCORD_TOKEN)
+  .login(DISTOKEN)
   .then(() => console.log('login() resolved'))
   .catch((e) => console.error('Login failed:', e));
