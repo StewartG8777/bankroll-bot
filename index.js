@@ -1957,11 +1957,13 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // ---------- Monzo Webhook Listener ----------
-app.post('/monzo-webhook', async (req, res) => {
+const app = express();
+
+app.post('/monzo-webhook', express.json(), async (req, res) => {
   console.log('Monzo webhook hit! Body:', JSON.stringify(req.body));
   try {
     const data = req.body?.data;
-    if (req.body?.type === 'transaction.create' && data) {
+    if ((req.body?.type === 'transaction.created' || req.body?.type === 'transaction.create') && data) {
       const amountPaid = data.amount / 100;
       console.log(`Monzo transaction.create received for amount: ${amountPaid}`);
       if (amountPaid > 0) {
@@ -1986,7 +1988,6 @@ app.post('/monzo-webhook', async (req, res) => {
 });
 
 // ---------- Stripe webhook ----------
-const app = express();
 
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
