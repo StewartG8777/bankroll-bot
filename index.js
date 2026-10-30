@@ -491,88 +491,14 @@ let lastJsonMsg = null;
 // Every stored file (vault, files waiting for payment, hosted downloads), as paths under DATA_DIR.
 const BLOB_CHUNK = 9 * 1024 * 1024; // Discord allows about 10 MB per upload, so big files go up in 9 MB parts
 
-// Log copies too big to attach in Discord: kept on disk and served as one whole file for 7 days.
-const LOGCOPY_DIR = path.join(DATA_DIR, 'logcopies');
-fs.mkdirSync(LOGCOPY_DIR, { recursive: true });
-for (const f of fs.readdirSync(LOGCOPY_DIR)) { try { fs.unlinkSync(path.join(LOGCOPY_DIR, f)); } catch {} } // links do not survive a restart
-const logCopies = {};
-setInterval(() => {
-  for (const [t, c] of Object.entries(logCopies)) {
-    if (Date.now() > c.expiresAt) {
-      try { fs.unlinkSync(c.path); } catch {}
-      delete logCopies[t];
-    }
+// Logs an invoice embed with the whole file attached (same as the old version did).
+// If Discord refuses the file (over the server's upload limit), logToServer posts the embed alone.
+async function logInvoiceWithFile(embed, fileData, filePath) {
+  let files;
+  if (filePath && fileData && fs.existsSync(filePath)) {
+    files = [{ buffer: await fs.promises.readFile(filePath), name: fileData.name }];
   }
-}, 60 * 60 * 1000);
-
-// Logs an invoice embed plus a copy of its file (vault or uploaded) to the bankroll log channel.
-// The whole file goes up with the embed; only if Discord refuses it (too big for the server)
-// does it fall back to the embed followed by the file in 9 MB parts.
-async function logInvoiceWithFile(embed, fileData, filePath, label) {
-  const size = fileData?.size;
-  if (!filePath || !size || !fs.existsSync(filePath)) {
-    await logToServer({ embeds: [embed] });
-    return;
-  }
-  const buffer = await fs.promises.readFile(filePath);
-  if (size <= BLOB_CHUNK) {
-    await logToServer({ embeds: [embed], files: [{ buffer, name: fileData.name }] });
-    return;
-  }
-  const ch0 = await getLogChannel();
-  if (ch0) {
-    try {
-      await ch0.send({
-        embeds: [embed],
-        files: [new AttachmentBuilder(buffer, { name: fileData.name })],
-        allowedMentions: { parse: [] },
-      });
-      return;
-    } catch (e) {
-      console.error('Whole-file log post failed, sending in parts:', e.message);
-    }
-  }
-  await logToServer({ embeds: [embed] });
-  const ch = await getLogChannel();
-  if (!ch) {
-    console.error('Log copy of big file skipped: no log channel (webhook cannot take files)');
-    return;
-  }
-  if (BASE_URL) {
-    // Discord will not take it whole here: host the one whole file and put the link in the log.
-    const token = crypto.randomBytes(24).toString('hex');
-    const dest = path.join(LOGCOPY_DIR, `${token}_${String(fileData.name).replace(/[^\w.\-]/g, '_')}`);
-    try {
-      try { fs.linkSync(filePath, dest); } catch { fs.copyFileSync(filePath, dest); }
-      logCopies[token] = { path: dest, name: fileData.name, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 };
-      await ch.send({
-        content: `File copy for invoice \`${label}\`: **${fileData.name}** (${(size / (1024 * 1024)).toFixed(2)} MB, too big to attach in this server). Download the whole file (valid 7 days): ${BASE_URL}/bankroll-log-copy/${token}`,
-        allowedMentions: { parse: [] },
-      });
-      return;
-    } catch (e) {
-      console.error('Log copy link failed, sending in parts:', e.message);
-    }
-  }
-  const total = Math.ceil(size / BLOB_CHUNK);
-  let fd;
-  try {
-    fd = fs.openSync(filePath, 'r');
-    for (let i = 0; i < total; i++) {
-      const len = Math.min(BLOB_CHUNK, size - i * BLOB_CHUNK);
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, i * BLOB_CHUNK);
-      await ch.send({
-        content: `File copy for invoice \`${label}\`: **${fileData.name}** (part ${i + 1}/${total})`,
-        files: [new AttachmentBuilder(buf, { name: total === 1 ? fileData.name : `${fileData.name}.part${i + 1}of${total}` })],
-        allowedMentions: { parse: [] },
-      });
-    }
-  } finally {
-    if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch {}
-    }
-  }
+  await logToServer({ embeds: [embed], files });
 }
 const blobBackedUp = {}; // relative path -> size already in the backup channel
 function relData(p) {
@@ -3062,16 +2988,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   }
 
   res.json({ received: true });
-});
-
-app.get('/bankroll-log-copy/:token', (req, res) => {
-  const c = logCopies[req.params.token];
-  if (!c || Date.now() > c.expiresAt || !fs.existsSync(c.path)) return res.status(410).send('This link has expired.');
-  const ua = req.headers['user-agent'] || '';
-  if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) return res.status(200).send('Log copy');
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(c.name)}`);
-  fs.createReadStream(c.path).on('error', () => res.destroy()).pipe(res);
 });
 
 app.get('/:name/:token', (req, res) => {
