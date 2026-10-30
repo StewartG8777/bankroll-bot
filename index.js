@@ -1099,8 +1099,8 @@ async function sendMonzoCheckout(interaction) {
 
     const embed = new EmbedBuilder()
       .setColor(GREEN)
-      .setTitle('Monzo Bank Transfer Invoice')
-      .setDescription('Please click the button below to pay via Monzo.me. Once the exact amount debits to your account, the file/link will unlock automatically!')
+      .setTitle('Monzo Invoice')
+      .setDescription('Please click the button below to pay via Monzo.me. Once paid, the file/link will unlock automatically!')
       .addFields(
         { name: 'Sales Agent', value: `<@${agent.id}>` },
         { name: 'Customer', value: `<@${customer.id}>` },
@@ -1113,6 +1113,14 @@ async function sendMonzoCheckout(interaction) {
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(monzoUrl)
     );
+    if (fileData || linkUrl) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`getfile:${invoiceKey}`)
+          .setLabel('Get my file')
+          .setStyle(ButtonStyle.Secondary)
+      );
+    }
 
     await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
     
@@ -1850,25 +1858,35 @@ async function onGetFile(interaction) {
     return interaction.reply({ content: 'Only the customer can get this file.', ephemeral: true });
   }
 
-  const session = await stripe.checkout.sessions.retrieve(key);
-  if (session.payment_status !== 'paid') {
+  const isMonzo = d.type === 'monzo';
+  if (!isMonzo) {
+    const session = await stripe.checkout.sessions.retrieve(key);
+    if (session.payment_status !== 'paid') {
+      return interaction.reply({
+        content: 'Payment has not been received yet.',
+        ephemeral: true,
+      });
+    }
+
+    const checkPi = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
+    if (checkPi) {
+      const pi = await stripe.paymentIntents.retrieve(checkPi, { expand: ['latest_charge'] });
+      if (pi.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.refunded) {
+        discardPending(key);
+        return interaction.reply({
+          content: 'This payment was refunded.',
+          ephemeral: true,
+        });
+      }
+    }
+  } else if (!d.paid && !allowed.has(interaction.user.id)) {
     return interaction.reply({
-      content: 'Payment has not been received yet.',
+      content: 'Payment has not been verified yet.',
       ephemeral: true,
     });
   }
 
-  const checkPi = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
-  if (checkPi) {
-    const pi = await stripe.paymentIntents.retrieve(checkPi, { expand: ['latest_charge'] });
-    if (pi.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.refunded) {
-      discardPending(key);
-      return interaction.reply({
-        content: 'This payment was refunded.',
-        ephemeral: true,
-      });
-    }
-  }
+  const checkPi = !isMonzo ? (typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id) : null;
 
   let dlink = d.link || null;
   let hosted = false;
@@ -1913,12 +1931,14 @@ async function onGetFile(interaction) {
   saveDeliveries();
   liveInteractions.delete(key);
 
-  await recordInStripe(checkPi, {
-    delivered_at: new Date().toISOString(),
-    delivered_to: 'Get my file button pressed',
-    delivered_file: d.name.slice(0, 100),
-    delivery_message: msg.url ?? '',
-  });
+  if (checkPi) {
+    await recordInStripe(checkPi, {
+      delivered_at: new Date().toISOString(),
+      delivered_to: 'Get my file button pressed',
+      delivered_file: d.name.slice(0, 100),
+      delivery_message: msg.url ?? '',
+    });
+  }
 
   await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}>.` });
 }
