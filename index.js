@@ -2730,16 +2730,41 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
 
     if (matches.length === 1) {
       const [key] = matches[0];
+      const d = deliveries[key];
       markMonzoPaid(key, data.id);
-      await deliverFile(key, null);
+
+      const paidEmbed = new EmbedBuilder()
+        .setColor(GREEN)
+        .setTitle('Bankroll Monzo Payment Received')
+        .setDescription(d.description || 'No description')
+        .addFields(
+          { name: 'Customer', value: d.customerId ? `<@${d.customerId}>` : 'Unknown', inline: true },
+          { name: 'Sales Agent', value: d.agentId ? `<@${d.agentId}>` : 'Unknown', inline: true },
+          { name: 'Amount', value: money(amountPaid, 'gbp'), inline: true },
+          { name: 'Payment reference', value: d.reference ? `\`${d.reference}\`` : 'None', inline: true },
+          { name: 'Transaction ID', value: String(data.id ?? 'Unknown') }
+        );
+      await notifyOwner({ embeds: [paidEmbed] });
+
+      await deliverFile(key, null).catch((e) => alertOwner('Monzo file delivery failed', e));
       console.log(`Monzo payment delivered for invoice ${key} (${amountPaid})`);
     } else if (matches.length > 1) {
       await notifyOwner({
         content: `Monzo payment of ${money(amountPaid, 'gbp')} arrived but ${matches.length} open invoices match that amount, so nothing was sent automatically. Check which customer paid before sending anything.`,
       });
+    } else {
+      // Nothing matched: still tell the owner, so a payment is never silent.
+      const byRef = Object.entries(deliveries).find(
+        ([, d]) => d.type === 'monzo' && !d.paid && d.reference && text.includes(d.reference)
+      );
+      await notifyOwner({
+        content: byRef
+          ? `Monzo payment of ${money(amountPaid, 'gbp')} arrived with reference \`${byRef[1].reference}\` for <@${byRef[1].customerId}>, but that invoice is for ${money(byRef[1].amount, 'gbp')}, so nothing was sent automatically. Check it and use /cancel or send the file yourself.`
+          : `Monzo payment of ${money(amountPaid, 'gbp')} arrived${tx.counterparty?.name ? ` from ${tx.counterparty.name}` : ''}, but no open Monzo invoice matches it, so nothing was sent.`,
+      });
     }
   } catch (e) {
-    console.error('Monzo webhook error:', e.message);
+    alertOwner('Monzo webhook error', e);
   }
 });
 
