@@ -492,13 +492,35 @@ let lastJsonMsg = null;
 const BLOB_CHUNK = 9 * 1024 * 1024; // Discord allows about 10 MB per upload, so big files go up in 9 MB parts
 
 // Logs an invoice embed with the whole file attached (same as the old version did).
-// If Discord refuses the file (over the server's upload limit), logToServer posts the embed alone.
+// Reads the vault file straight from the vault, and if Discord refuses it, says why in the log.
 async function logInvoiceWithFile(embed, fileData, filePath) {
-  let files;
-  if (filePath && fileData && fs.existsSync(filePath)) {
-    files = [{ buffer: await fs.promises.readFile(filePath), name: fileData.name }];
+  const ch = await getLogChannel();
+  const p = [fileData?.path, filePath].find((x) => x && fs.existsSync(x));
+  if (!ch || !p) {
+    await logToServer({ embeds: [embed] });
+    return;
   }
-  await logToServer({ embeds: [embed], files });
+  const buffer = await fs.promises.readFile(p);
+  try {
+    await ch.send({
+      embeds: [embed],
+      files: [new AttachmentBuilder(buffer, { name: fileData.name })],
+      allowedMentions: { parse: [] },
+    });
+  } catch (e) {
+    console.error('Log post with file failed:', e.message);
+    await ch.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+    const limit = ch.guild?.maximumUploadLimit;
+    await ch
+      .send({
+        content:
+          `Could not attach **${fileData.name}** (${(buffer.length / (1024 * 1024)).toFixed(2)} MB) to the log. ` +
+          `Discord said: ${e.message}` +
+          (limit ? ` (this server's upload limit is ${(limit / (1024 * 1024)).toFixed(0)} MB)` : ''),
+        allowedMentions: { parse: [] },
+      })
+      .catch(() => {});
+  }
 }
 const blobBackedUp = {}; // relative path -> size already in the backup channel
 function relData(p) {
