@@ -4,8 +4,6 @@ const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const Stripe = require('stripe');
-const { pipeline } = require('stream/promises');
-const { Readable } = require('stream');
 const {
   Client,
   GatewayIntentBits,
@@ -57,6 +55,7 @@ const money = (amount, cur) =>
 const short = (text, n) => (text && text.length > n ? text.slice(0, n - 1) + '…' : text || '—');
 
 // Posts a copy of important events to a private server channel (via a channel webhook).
+// Files are never posted there, and mentions never ping.
 async function getLogChannel() {
   if (LOG_CHANNEL_ID) return client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
   for (const g of client.guilds.cache.values()) {
@@ -67,6 +66,7 @@ async function getLogChannel() {
 }
 
 async function logToServer(payload) {
+  // Preferred: the bot posts in the #bankroll-log channel itself
   try {
     const ch = await getLogChannel();
     if (ch) {
@@ -81,6 +81,7 @@ async function logToServer(payload) {
   } catch (e) {
     console.error('Log channel failed:', e.message);
   }
+  // Fallback: a channel webhook, if you set LOG_WEBHOOK_URL
   if (!LOG_WEBHOOK_URL) return;
   try {
     const body = {
@@ -100,6 +101,7 @@ async function logToServer(payload) {
   }
 }
 
+// DMs the owner and also logs it in the server
 async function notifyOwner(payload, { log = true } = {}) {
   try {
     const owner = await client.users.fetch(OWNER_ID);
@@ -110,6 +112,7 @@ async function notifyOwner(payload, { log = true } = {}) {
   if (log) await logToServer({ content: payload.content, embeds: payload.embeds });
 }
 
+// Tells the owner when something breaks (same message at most once a minute)
 const lastAlert = new Map();
 let lastWebhookAt = null;
 let lastWebhookType = '';
@@ -134,6 +137,7 @@ function whereFrom(interaction, customer) {
     : { guild: 'Direct Message', channel: `DM with ${customer.username}` };
 }
 
+// Midnight in UK time, so "today / this week / this month" match your day
 function londonParts(ms) {
   const f = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Europe/London',
@@ -157,46 +161,22 @@ function periodStart(period) {
   let d = p.d;
   if (period === 'week') {
     const dow = new Date(Date.UTC(p.y, p.m - 1, p.d)).getUTCDay();
-    d -= (dow + 6) % 7;
+    d -= (dow + 6) % 7; // Monday start
   }
   if (period === 'month') d = 1;
   const guess = Date.UTC(p.y, p.m - 1, d);
   return Math.floor((guess - londonOffset(guess)) / 1000);
 }
 
-// ---------- File / link delivery & Vault ----------
+// ---------- File / link delivery (sent after payment) ----------
+// Files are kept in ./data on the server. On Render's free plan this folder is
+// wiped on every redeploy, so don't redeploy while a paid-for file is pending.
+// Set DATA_DIR to a persistent disk folder (e.g. /var/data) so files survive redeploys
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const FILES_DIR = path.join(DATA_DIR, 'files');
 const DELIVERIES_FILE = path.join(DATA_DIR, 'deliveries.json');
-
-const VAULT_DIR = path.join(DATA_DIR, 'vault');
-const VAULT_FILE = path.join(DATA_DIR, 'vault.json');
-fs.mkdirSync(VAULT_DIR, { recursive: true });
-
-let vault = {};
-try {
-  vault = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
-  let vaultChanged = false;
-  for (const [k, item] of Object.entries(vault)) {
-    if (!item.path || !fs.existsSync(item.path)) {
-      delete vault[k];
-      vaultChanged = true;
-    }
-  }
-  if (vaultChanged) {
-    fs.writeFileSync(VAULT_FILE, JSON.stringify(vault, null, 2));
-  }
-} catch {}
-
-const saveVault = () => {
-  try {
-    fs.writeFileSync(VAULT_FILE, JSON.stringify(vault, null, 2));
-  } catch (e) {
-    console.error('Could not save vault:', e.message);
-  }
-};
-
 const BASE_URL = PUBLIC_URL.replace(/\/+$/, '');
+// With PUBLIC_URL set, files are delivered as one-time download links, so Discord's 10 MB upload cap no longer applies
 const MAX_FILE_BYTES = (BASE_URL ? 100 : 10) * 1024 * 1024;
 fs.mkdirSync(FILES_DIR, { recursive: true });
 
@@ -212,6 +192,7 @@ const saveDeliveries = () => {
   }
 };
 
+// Clean up files that were never paid for after 7 days
 for (const [k, d] of Object.entries(deliveries)) {
   if (Date.now() - d.savedAt > 7 * 24 * 60 * 60 * 1000) {
     if (d.path) {
@@ -224,6 +205,7 @@ for (const [k, d] of Object.entries(deliveries)) {
 }
 saveDeliveries();
 
+// Keeps the original /invoice interaction for 14 minutes, so the bot can reply under it
 const liveInteractions = new Map();
 
 async function downloadAttachment(att, hosted) {
@@ -263,6 +245,7 @@ function saveLinkDelivery(key, url, interaction, customer) {
   saveDeliveries();
 }
 
+// One-time download links for hosted files
 const DOWNLOADS_FILE = path.join(DATA_DIR, 'downloads.json');
 let downloads = {};
 try {
@@ -319,6 +302,7 @@ function findBackupChannel() {
   return null;
 }
 
+// Posts a copy of the records to the backup channel (only when they changed)
 let lastBackupHash = '';
 let lastBackupAt = null;
 async function backupData() {
@@ -326,9 +310,12 @@ async function backupData() {
     const ch = BACKUP_CHANNEL_ID
       ? await client.channels.fetch(BACKUP_CHANNEL_ID).catch(() => null)
       : findBackupChannel() ?? (await getLogChannel());
-    if (!ch) return;
+    if (!ch) {
+      if (BACKUP_CHANNEL_ID) alertOwner('Backup channel not found', 'Check BACKUP_CHANNEL_ID and that the bot can see that channel');
+      return;
+    }
     const files = [];
-    for (const f of [DELIVERIES_FILE, DOWNLOADS_FILE, VAULT_FILE]) {
+    for (const f of [DELIVERIES_FILE, DOWNLOADS_FILE]) {
       try {
         const buffer = fs.readFileSync(f);
         if (buffer.length > 2) files.push({ name: path.basename(f), buffer });
@@ -338,7 +325,7 @@ async function backupData() {
     const hash = crypto.createHash('sha256').update(Buffer.concat(files.map((f) => f.buffer))).digest('hex');
     if (hash === lastBackupHash) return;
     await ch.send({
-      content: 'Data backup (records of files waiting, download links, and vault index)',
+      content: 'Data backup (records of files waiting and download links)',
       files: files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })),
       allowedMentions: { parse: [] },
     });
@@ -349,6 +336,7 @@ async function backupData() {
   }
 }
 
+// Throws away a file or link that is waiting to be delivered
 function discardPending(key) {
   const d = deliveries[key];
   if (!d) return false;
@@ -385,7 +373,7 @@ async function deliverFile(key, paymentIntentId) {
     } catch {
       if (owner) {
         await owner
-          .send(`Payment received for ${key}, but the file "${d.name}" is gone. Please send it manually to <@${d.customerId}>.`)
+          .send(`Payment received for ${key}, but the file "${d.name}" is gone (the server was restarted). Please send it manually to <@${d.customerId}>.`)
           .catch(() => {});
       }
       delete deliveries[key];
@@ -407,6 +395,7 @@ async function deliverFile(key, paymentIntentId) {
   let msgUrl = null;
   let reachedCustomer = false;
 
+  // 0. Reply under the invoice message (Discord only allows this for 15 minutes after it was created)
   const live = liveInteractions.get(key);
   if (live && Date.now() - live.at < 14 * 60 * 1000) {
     try {
@@ -428,6 +417,7 @@ async function deliverFile(key, paymentIntentId) {
   }
   liveInteractions.delete(key);
 
+  // 1. Where the invoice was created (works in servers the bot is in)
   if (!sentTo) try {
     const ch = await client.channels.fetch(d.channelId);
     const msg = await ch.send(payload());
@@ -438,29 +428,31 @@ async function deliverFile(key, paymentIntentId) {
     console.log('Could not post in original channel:', e.message);
   }
 
+  // 2. The customer's DMs
   if (!sentTo) {
     try {
       const u = await client.users.fetch(d.customerId);
       const msg = await u.send(payload());
       msgUrl = msg.url;
       reachedCustomer = true;
-      sentTo = "the customer's DMs";
+      sentTo = "the customer's DMs (the bot can't post in other people's private DMs)";
     } catch (e) {
       console.log('Could not DM customer:', e.message);
     }
   }
 
+  // 3. Last resort: you
   if (!sentTo && owner) {
     try {
       await owner.send(
         dlink
-          ? { content: `Couldn't reach <@${d.customerId}>. Here is their download link:\n<${dlink}>` }
+          ? { content: `Couldn't reach <@${d.customerId}>. Here is their download link, please send it to them:\n<${dlink}>` }
           : {
-              content: `Couldn't reach <@${d.customerId}>. Here is their file.`,
+              content: `Couldn't reach <@${d.customerId}>. Here is their file, please send it to them.`,
               files: [new AttachmentBuilder(buffer, { name: d.name })],
             }
       );
-      sentTo = 'your DMs';
+      sentTo = 'your DMs, because the customer could not be reached';
       ownerGotIt = true;
     } catch (e) {
       console.error('Could not deliver file anywhere:', e.message);
@@ -505,7 +497,7 @@ const common = (b) =>
 const bankrollCmd = common(
   new SlashCommandBuilder()
     .setName('bankroll')
-    .setDescription('Create a payment link / invoice for a customer')
+    .setDescription('Create a payment link for a customer')
     .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
     .addNumberOption((o) =>
       o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true)
@@ -517,7 +509,42 @@ const bankrollCmd = common(
       o.setName('file').setDescription('File to send the customer once they have paid')
     )
     .addStringOption((o) =>
-      o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true)
+      o
+        .setName('delivery')
+        .setDescription('How to deliver the file (only used with a file)')
+        .addChoices(
+          { name: 'Hosted one-time link', value: 'link' },
+          { name: 'Direct file upload', value: 'direct' }
+        )
+    )
+    .addStringOption((o) =>
+      o
+        .setName('currency')
+        .setDescription('Currency for this invoice (default: your usual one)')
+        .addChoices(
+          { name: 'GBP £', value: 'gbp' },
+          { name: 'USD $', value: 'usd' },
+          { name: 'EUR €', value: 'eur' }
+        )
+    )
+    .addStringOption((o) =>
+      o.setName('link').setDescription('Download link to send once they have paid (for big files)')
+    )
+);
+
+const invoiceCmd = common(
+  new SlashCommandBuilder()
+    .setName('invoice')
+    .setDescription('Create a card payment link that expires, with a reminder')
+    .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
+    .addNumberOption((o) =>
+      o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true)
+    )
+    .addStringOption((o) =>
+      o.setName('description').setDescription('What the purchase is for').setRequired(true)
+    )
+    .addAttachmentOption((o) =>
+      o.setName('file').setDescription('File to send the customer once they have paid')
     )
     .addStringOption((o) =>
       o
@@ -544,46 +571,13 @@ const bankrollCmd = common(
     .addStringOption((o) =>
       o
         .setName('expires')
-        .setDescription('Expiration time, e.g. 30m, 2h, 24h, or 7d (default: no expiry)')
-    )
-);
-
-const vaultCmd = common(
-  new SlashCommandBuilder()
-    .setName('vault')
-    .setDescription('Manage your persistent file vault')
-    .addSubcommand((sub) =>
-      sub
-        .setName('add')
-        .setDescription('Upload a file to the vault')
-        .addAttachmentOption((o) => o.setName('file').setDescription('The file to store').setRequired(true))
-        .addStringOption((o) => o.setName('name').setDescription('Short key/name for autocomplete (e.g. car-pack-v2)').setRequired(true))
-    )
-    .addSubcommand((sub) => sub.setName('list').setDescription('List all files currently in your vault'))
-    .addSubcommand((sub) =>
-      sub
-        .setName('info')
-        .setDescription('View detailed info about a vault item')
-        .addStringOption((o) => o.setName('name').setDescription('The vault key').setAutocomplete(true).setRequired(true))
-    )
-    .addSubcommand((sub) =>
-      sub
-        .setName('remove')
-        .setDescription('Remove a file from the vault')
-        .addStringOption((o) => o.setName('name').setDescription('The vault key to remove').setAutocomplete(true).setRequired(true))
-    )
-);
-
-const cancelCmd = common(
-  new SlashCommandBuilder()
-    .setName('cancel')
-    .setDescription('Cancel and expire an open invoice or checkout session')
-    .addStringOption((o) =>
-      o
-        .setName('order')
-        .setDescription('Pick an open invoice/checkout, or paste a Checkout ID (cs_...)')
-        .setAutocomplete(true)
-        .setRequired(true)
+        .setDescription('How long the link works (default: 24 hours)')
+        .addChoices(
+          { name: '30 minutes', value: '30' },
+          { name: '1 hour', value: '60' },
+          { name: '6 hours', value: '360' },
+          { name: '24 hours', value: '1440' }
+        )
     )
 );
 
@@ -705,8 +699,9 @@ const setupCmd = new SlashCommandBuilder()
   .setIntegrationTypes([ApplicationIntegrationType.GuildInstall])
   .setContexts([InteractionContextType.Guild]);
 
-const commands = [bankrollCmd, vaultCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
+const commands = [bankrollCmd, invoiceCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
 
+// Works on both older ('ready') and newer ('clientReady') discord.js versions
 let started = false;
 const onReady = async () => {
   if (started) return;
@@ -728,18 +723,11 @@ client.once('ready', onReady);
 client.once('clientReady', onReady);
 
 // ---------- Reminder ----------
+// One reminder, sent at 50% of the time the invoice is valid.
+// It tries the customer's DMs. If the bot can't reach them, it tells the agent
+// to run /remind in their DM with the customer.
+// Reminders are rebuilt from Stripe when the bot starts, so restarts don't lose them.
 const reminderTimers = new Map();
-
-function parseExpiresToMinutes(input) {
-  if (!input) return null;
-  const match = input.toLowerCase().trim().match(/^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)?$/);
-  if (!match) return null;
-  const val = parseInt(match[1], 10);
-  const unit = match[2] || 'm';
-  if (unit.startsWith('h')) return val * 60;
-  if (unit.startsWith('d')) return val * 1440;
-  return val; // minutes default
-}
 
 function scheduleReminders({ customerId, agentId, sessionId, url, amount, description, expiresAt, currency = CURRENCY, fireAt = null }) {
   if (reminderTimers.has(sessionId)) return;
@@ -749,7 +737,7 @@ function scheduleReminders({ customerId, agentId, sessionId, url, amount, descri
     reminderTimers.delete(sessionId);
     try {
       const s = await stripe.checkout.sessions.retrieve(sessionId);
-      if (s.status !== 'open' || s.metadata?.reminded_at) return;
+      if (s.status !== 'open' || s.metadata?.reminded_at) return; // paid, expired or already reminded
 
       const embed = new EmbedBuilder()
         .setColor(GREEN)
@@ -786,6 +774,7 @@ function scheduleReminders({ customerId, agentId, sessionId, url, amount, descri
   reminderTimers.set(sessionId, timer);
 }
 
+// Rebuilds reminders for open invoices after a restart
 async function restoreReminders() {
   try {
     const list = await stripe.checkout.sessions.list({ limit: 100, status: 'open' });
@@ -794,10 +783,10 @@ async function restoreReminders() {
       const m = s.metadata ?? {};
       if (m.kind !== 'invoice' || m.reminded_at || !m.agent_id || !m.customer_id || !s.expires_at) continue;
       if (reminderTimers.has(s.id)) continue;
-      if (s.expires_at * 1000 - Date.now() < 5 * 60 * 1000) continue;
+      if (s.expires_at * 1000 - Date.now() < 5 * 60 * 1000) continue; // too close to expiry
       scheduleReminders({
         customerId: m.customer_id,
-        agent_id: m.agent_id,
+        agentId: m.agent_id,
         sessionId: s.id,
         url: s.url,
         amount: (s.amount_total ?? 0) / 100,
@@ -816,8 +805,8 @@ async function restoreReminders() {
   }
 }
 
-// ---------- Stripe checkout (unified /bankroll command) ----------
-async function sendStripeCheckout(interaction) {
+// ---------- Stripe checkout (used by /bankroll and /invoice) ----------
+async function sendStripeCheckout(interaction, { expiresMins = null, kind }) {
   const customer = interaction.options.getUser('customer');
   const amount = interaction.options.getNumber('amount');
   const description = interaction.options.getString('description');
@@ -828,21 +817,8 @@ async function sendStripeCheckout(interaction) {
 
   try {
     const file = interaction.options.getAttachment('file');
-    const vaultKey = interaction.options.getString('vault_file');
     const linkRaw = interaction.options.getString('link');
-    const expiresInput = interaction.options.getString('expires');
-
-    let expiresMins = null;
-    if (expiresInput) {
-      expiresMins = parseExpiresToMinutes(expiresInput);
-      if (!expiresMins || expiresMins < 1 || expiresMins > 30 * 24 * 60) {
-        throw new Error('Invalid expiration time format. Use something like `30m`, `2h`, `24h`, or `7d`.');
-      }
-    }
-    
-    if ((file && vaultKey) || (file && linkRaw) || (vaultKey && linkRaw)) {
-      throw new Error('Use only one of: attached file, vault file, or download link.');
-    }
+    if (file && linkRaw) throw new Error('Use either a file or a link, not both.');
 
     let linkUrl = null;
     if (linkRaw) {
@@ -856,24 +832,12 @@ async function sendStripeCheckout(interaction) {
     }
 
     const mode = interaction.options.getString('delivery') ?? (BASE_URL ? 'link' : 'direct');
-    if ((file || vaultKey) && mode === 'link' && !BASE_URL) {
+    if (file && mode === 'link' && !BASE_URL) {
       throw new Error('Hosted links are not set up yet (PUBLIC_URL is missing). Pick Direct file upload.');
     }
+    const fileData = file ? await downloadAttachment(file, mode === 'link') : null;
 
-    let fileData = null;
-    if (file) {
-      fileData = await downloadAttachment(file, mode === 'link');
-    } else if (vaultKey) {
-      const item = vault[vaultKey];
-      if (!item || !fs.existsSync(item.path)) {
-        throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
-      }
-      fileData = {
-        buffer: fs.readFileSync(item.path),
-        name: item.originalName,
-      };
-    }
-
+    // Evidence record, stored inside Stripe so it survives restarts and redeploys
     const record = {
       created_at: new Date().toISOString(),
       created_in: (interaction.guild
@@ -881,7 +845,7 @@ async function sendStripeCheckout(interaction) {
         : 'Direct message'
       ).slice(0, 200),
       channel_id: String(interaction.channelId),
-      kind: expiresMins ? 'invoice' : 'checkout',
+      kind,
       ...(fileData
         ? {
             file_name: fileData.name.slice(0, 100),
@@ -923,8 +887,8 @@ async function sendStripeCheckout(interaction) {
     let expiresAt = null;
     if (expiresMins) {
       let secs = expiresMins * 60;
-      if (expiresMins === 30) secs += 60;
-      if (expiresMins === 1440) secs -= 60;
+      if (expiresMins === 30) secs += 60; // Stripe needs at least 30 min
+      if (expiresMins === 1440) secs -= 60; // and at most 24 h
       expiresAt = Math.floor(Date.now() / 1000) + secs;
       params.expires_at = expiresAt;
     }
@@ -936,7 +900,7 @@ async function sendStripeCheckout(interaction) {
 
     const embed = new EmbedBuilder()
       .setColor(GREEN)
-      .setTitle(expiresAt ? 'Bankroll Invoice Created' : 'Bankroll Payment Link Created')
+      .setTitle(kind === 'invoice' ? 'Bankroll Invoice Created' : 'Bankroll Checkout Created')
       .setDescription('Please use the link below to complete your purchase.')
       .addFields(
         { name: 'Sales Agent', value: `<@${agent.id}>` },
@@ -958,7 +922,7 @@ async function sendStripeCheckout(interaction) {
         { name: 'Generated In Guild', value: where.guild },
         { name: 'Generated In Channel', value: where.channel }
       )
-      .setFooter({ text: `Created by ${agent.username} | ID: ${session.id}` });
+      .setFooter({ text: `Checkout created by ${agent.username} | Checkout ID: ${session.id}` });
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setLabel('Pay invoice').setStyle(ButtonStyle.Link).setURL(session.url)
@@ -973,13 +937,10 @@ async function sendStripeCheckout(interaction) {
     }
 
     await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
-    
-    // GUARANTEED LOGGING
     await logToServer({
       embeds: [embed],
       files: fileData ? [{ buffer: fileData.buffer, name: fileData.name }] : undefined,
     });
-
     if (fileData || linkUrl) {
       liveInteractions.set(session.id, { interaction, at: Date.now() });
       setTimeout(() => liveInteractions.delete(session.id), 14 * 60 * 1000);
@@ -999,139 +960,11 @@ async function sendStripeCheckout(interaction) {
     }
   } catch (err) {
     console.error(err);
-    await interaction.editReply({ content: `Failed to create invoice: ${err.message}` });
+    await interaction.editReply({ content: `Failed to create checkout: ${err.message}` });
   }
 }
 
-// ---------- Vault Command Handler ----------
-async function cmdVault(interaction) {
-  if (!allowed.has(interaction.user.id)) {
-    return interaction.reply({ content: 'Only authorized users can manage the vault.', ephemeral: true });
-  }
-
-  await interaction.deferReply({ ephemeral: true });
-  const sub = interaction.options.getSubcommand();
-
-  if (sub === 'add') {
-    const att = interaction.options.getAttachment('file');
-    const key = interaction.options.getString('name').toLowerCase().trim().replace(/[^a-z0-9\-_]/g, '-');
-    
-    if (vault[key]) {
-      return interaction.editReply(`A vault item with the name **${key}** already exists. Remove it first or pick a different name.`);
-    }
-
-    if (att.size > 100 * 1024 * 1024) {
-      return interaction.editReply('That file is over 100 MB.');
-    }
-
-    const filePath = path.join(VAULT_DIR, `${key}_${att.name.replace(/[^\w.\-]/g, '_')}`);
-
-    try {
-      const res = await fetch(att.url);
-      if (!res.ok || !res.body) throw new Error('Could not download the file.');
-      
-      const fileStream = fs.createWriteStream(filePath);
-      await pipeline(Readable.fromWeb(res.body), fileStream);
-    } catch (err) {
-      try { fs.unlinkSync(filePath); } catch {}
-      return interaction.editReply(`Failed to download and save file: ${err.message}`);
-    }
-
-    vault[key] = {
-      path: filePath,
-      originalName: att.name,
-      size: att.size,
-      addedAt: Date.now(),
-    };
-    saveVault();
-
-    return interaction.editReply(`Successfully added **${att.name}** to the vault as \`${key}\`!`);
-  }
-
-  if (sub === 'list') {
-    const keys = Object.keys(vault);
-    if (!keys.length) return interaction.editReply('Your vault is currently empty.');
-
-    const lines = keys.map((k) => `• \`${k}\` — **${vault[k].originalName}** (${(vault[k].size / (1024 * 1024)).toFixed(1)} MB)`);
-    const embed = new EmbedBuilder()
-      .setColor(GREEN)
-      .setTitle(`Vault Inventory (${keys.length} items)`)
-      .setDescription(lines.join('\n'));
-    return interaction.editReply({ embeds: [embed] });
-  }
-
-  if (sub === 'info') {
-    const key = interaction.options.getString('name');
-    const item = vault[key];
-    if (!item) return interaction.editReply(`Vault item \`${key}\` not found.`);
-
-    const embed = new EmbedBuilder()
-      .setColor(GREEN)
-      .setTitle(`Vault Item: ${key}`)
-      .addFields(
-        { name: 'Original Filename', value: item.originalName, inline: true },
-        { name: 'File Size', value: `${(item.size / (1024 * 1024)).toFixed(2)} MB`, inline: true },
-        { name: 'Added At', value: `<t:${Math.floor(item.addedAt / 1000)}:f>`, inline: true }
-      );
-    return interaction.editReply({ embeds: [embed] });
-  }
-
-  if (sub === 'remove') {
-    const key = interaction.options.getString('name');
-    if (!vault[key]) return interaction.editReply(`Vault item \`${key}\` not found.`);
-
-    try {
-      fs.unlinkSync(vault[key].path);
-    } catch {}
-    delete vault[key];
-    saveVault();
-
-    return interaction.editReply(`Removed \`${key}\` from the vault.`);
-  }
-}
-
-// ---------- /cancel ----------
-async function cmdCancel(interaction) {
-  if (!allowed.has(interaction.user.id)) {
-    return interaction.reply({ content: 'Only authorized users can cancel invoices.', ephemeral: true });
-  }
-  await interaction.deferReply({ ephemeral: true });
-
-  const input = interaction.options.getString('order').trim();
-  if (!input.startsWith('cs_')) {
-    return interaction.editReply('Please provide a valid Checkout ID starting with `cs_...`.');
-  }
-
-  try {
-    const session = await stripe.checkout.sessions.retrieve(input);
-    if (session.status !== 'open') {
-      return interaction.editReply(`That checkout session is already ${session.status} (cannot be cancelled).`);
-    }
-
-    await stripe.checkout.sessions.expire(input);
-    const hadPending = discardPending(input);
-
-    const embed = new EmbedBuilder()
-      .setColor(GREY)
-      .setTitle('Invoice Cancelled / Removed')
-      .addFields(
-        { name: 'Checkout ID', value: input, inline: true },
-        { name: 'Description', value: short(session.metadata?.description, 100), inline: true },
-        { name: 'Amount', value: money((session.amount_total ?? 0) / 100, session.currency), inline: true },
-        { name: 'Pending File/Link Cleaned', value: hadPending ? 'Yes' : 'None attached', inline: true },
-        { name: 'Cancelled By', value: `<@${interaction.user.id}>`, inline: true }
-      )
-      .setTimestamp();
-
-    await interaction.editReply({ embeds: [embed] });
-    await logToServer({ embeds: [embed] });
-  } catch (err) {
-    console.error('Cancel failed:', err);
-    await interaction.editReply(`Failed to cancel invoice: ${err.message}`);
-  }
-}
-
-// ---------- /remind ----------
+// ---------- /remind: resend a reminder from your DM with the customer ----------
 async function cmdRemind(interaction) {
   const user = interaction.options.getUser('customer');
   await interaction.deferReply();
@@ -1191,7 +1024,6 @@ async function cmdStatus(interaction) {
       { name: 'Open invoices', value: open, inline: true },
       { name: 'Reminders queued', value: String(reminderTimers.size), inline: true },
       { name: 'Files waiting', value: String(Object.keys(deliveries).length), inline: true },
-      { name: 'Vault items', value: String(Object.keys(vault).length), inline: true },
       { name: 'Hosted links', value: BASE_URL ? 'On' : 'Off (PUBLIC_URL not set)', inline: true },
       {
         name: 'File storage',
@@ -1204,15 +1036,15 @@ async function cmdStatus(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
-// ---------- /restore ----------
+// ---------- /restore: reload a backup file ----------
 async function cmdRestore(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the owner can run this.');
   const att = interaction.options.getAttachment('file');
   if (att.size > 5 * 1024 * 1024) return interaction.editReply('That file is too big to be a backup.');
 
   const fname = att.name.toLowerCase();
-  const target = fname.startsWith('deliveries') ? 'deliveries' : fname.startsWith('downloads') ? 'downloads' : fname.startsWith('vault') ? 'vault' : null;
-  if (!target) return interaction.editReply('Pick deliveries.json, downloads.json, or vault.json from the backup channel.');
+  const target = fname.startsWith('deliveries') ? 'deliveries' : fname.startsWith('downloads') ? 'downloads' : null;
+  if (!target) return interaction.editReply('Pick deliveries.json or downloads.json from the backup channel.');
 
   let data;
   try {
@@ -1225,8 +1057,8 @@ async function cmdRestore(interaction) {
     return interaction.editReply('That file does not look like a backup.');
   }
 
-  const store = target === 'deliveries' ? deliveries : target === 'downloads' ? downloads : vault;
-  const filesRoot = path.resolve(target === 'vault' ? VAULT_DIR : FILES_DIR) + path.sep;
+  const store = target === 'deliveries' ? deliveries : downloads;
+  const filesRoot = path.resolve(FILES_DIR) + path.sep;
   let added = 0;
   let already = 0;
   let missing = 0;
@@ -1245,6 +1077,7 @@ async function cmdRestore(interaction) {
       continue;
     }
     if (v.path) {
+      // Only files inside the bot's own files folder are accepted
       if (!path.resolve(String(v.path)).startsWith(filesRoot)) {
         skipped += 1;
         continue;
@@ -1260,7 +1093,7 @@ async function cmdRestore(interaction) {
         skipped += 1;
         continue;
       }
-    } else if (target !== 'vault') {
+    } else {
       skipped += 1;
       continue;
     }
@@ -1268,12 +1101,11 @@ async function cmdRestore(interaction) {
     added += 1;
   }
   if (target === 'deliveries') saveDeliveries();
-  else if (target === 'downloads') saveDownloads();
-  else saveVault();
+  else saveDownloads();
 
   return interaction.editReply(
     `Restored **${added}** entr${added === 1 ? 'y' : 'ies'} into ${target}.\n` +
-      `Already there: ${already}. File missing on the server: ${missing}. Skipped: ${skipped}.`
+      `Already there: ${already}. File missing on the server (can't be restored): ${missing}. Skipped (expired or invalid): ${skipped}.`
   );
 }
 
@@ -1288,21 +1120,21 @@ async function cmdCurrency(interaction) {
     `https://api.frankfurter.dev/v1/latest?amount=${amount}&base=${from}&symbols=${to}`
   ).catch(() => null);
   if (!res || !res.ok) {
-    return interaction.editReply('Could not convert that. Use 3-letter codes like USD, GBP, EUR.');
+    return interaction.editReply('Could not convert that. Use 3-letter codes like USD, GBP, EUR (crypto is not supported).');
   }
   const data = await res.json();
   const value = data.rates?.[to];
-  if (value == null) return interaction.editReply('That currency was not found.');
+  if (value == null) return interaction.editReply('That currency was not found. Use codes like USD, GBP, EUR.');
 
   const embed = new EmbedBuilder()
     .setColor(GREEN)
     .setTitle('Currency conversion')
     .setDescription(`**${amount} ${from}** = **${value.toFixed(2)} ${to}**`)
-    .setFooter({ text: `1 ${from} = ${(value / amount).toFixed(4)} ${to} | Rates from ${data.date} (ECB)` });
+    .setFooter({ text: `1 ${from} = ${(value / amount).toFixed(4)} ${to} | Rates from ${data.date} (ECB reference rates, not Stripe's)` });
   return interaction.editReply({ embeds: [embed] });
 }
 
-// ---------- Stats commands ----------
+// ---------- Stats commands (read from Stripe, so nothing is lost on restart) ----------
 async function succeededPayments(sinceUnix) {
   const params = { limit: 100, expand: ['data.latest_charge.balance_transaction'] };
   if (sinceUnix) params.created = { gte: sinceUnix };
@@ -1336,6 +1168,7 @@ async function cmdTotal(interaction) {
 
   const sum = list.reduce((a, pi) => a + pi.amount_received, 0) / 100;
 
+  // Stripe fees and refunds, so you can see what you actually keep
   let feePence = 0;
   let refundedPence = 0;
   let missingFees = 0;
@@ -1430,7 +1263,7 @@ async function cmdHistory(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
-// ---------- /setup ----------
+// ---------- /setup: creates the private log and backup channels ----------
 async function cmdSetup(interaction) {
   if (interaction.user.id !== OWNER_ID) {
     return interaction.reply({ content: 'Only the owner can run this.', ephemeral: true });
@@ -1454,6 +1287,7 @@ async function cmdSetup(interaction) {
       ],
     },
   ];
+  // You and anyone on your allowed list who is in this server can read them
   const seen = new Set();
   for (const id of allowed) {
     if (seen.has(id)) continue;
@@ -1463,8 +1297,8 @@ async function cmdSetup(interaction) {
   }
 
   const wanted = [
-    ['bankroll-log', 'Private log of Bankroll invoices, payments, refunds and disputes', 'Log channel ready.'],
-    ['bankroll-backup', 'Private data backups from the Bankroll bot', 'Backup channel ready.'],
+    ['bankroll-log', 'Private log of Bankroll invoices, payments, refunds and disputes', 'Log channel ready. Invoices, payments, refunds and disputes will appear here.'],
+    ['bankroll-backup', 'Private data backups from the Bankroll bot', 'Backup channel ready. Data backups will appear here.'],
   ];
   const results = [];
   for (const [name, topic, hello] of wanted) {
@@ -1483,14 +1317,14 @@ async function cmdSetup(interaction) {
       await ch.send({ content: hello });
       results.push(`Created <#${ch.id}>.`);
     } catch (e) {
-      results.push(`Couldn't create #${name}: ${e.message}.`);
+      results.push(`Couldn't create #${name}: ${e.message}. The bot needs the **Manage Channels** permission in this server.`);
     }
   }
   results.push('Only you and your allowed users can see them.');
   return interaction.editReply(results.join('\n'));
 }
 
-// ---------- Refunds ----------
+// ---------- Refunds (owner only, with a confirm step) ----------
 const REFUND_REASONS = {
   r: { api: 'requested_by_customer', label: 'Requested by customer' },
   d: { api: 'duplicate', label: 'Duplicate' },
@@ -1503,7 +1337,7 @@ async function resolvePaymentIntent(input) {
   if (id.startsWith('cs_')) {
     const sess = await stripe.checkout.sessions.retrieve(id);
     const piId = typeof sess.payment_intent === 'string' ? sess.payment_intent : sess.payment_intent?.id;
-    if (!piId) throw new Error('That checkout has not been paid.');
+    if (!piId) throw new Error('That checkout has not been paid, so there is nothing to refund.');
     return stripe.paymentIntents.retrieve(piId, expand);
   }
   if (id.startsWith('pi_')) return stripe.paymentIntents.retrieve(id, expand);
@@ -1512,47 +1346,6 @@ async function resolvePaymentIntent(input) {
 
 async function onAutocomplete(interaction) {
   try {
-    if (!allowed.has(interaction.user.id)) return await interaction.respond([]);
-    
-    // Vault remove/info autocomplete
-    if (
-      (interaction.commandName === 'vault' && ['remove', 'info'].includes(interaction.options.getSubcommand())) ||
-      interaction.commandName === 'bankroll'
-    ) {
-      const typed = interaction.options.getFocused().toLowerCase();
-      const entries = Object.entries(vault);
-      const filtered = entries.filter(([k, v]) => !typed || k.toLowerCase().includes(typed) || v.originalName.toLowerCase().includes(typed));
-      
-      filtered.sort((a, b) => {
-        const aStarts = a[0].toLowerCase().startsWith(typed);
-        const bStarts = b[0].toLowerCase().startsWith(typed);
-        if (aStarts && !bStarts) return -1;
-        if (!aStarts && bStarts) return 1;
-        return 0;
-      });
-
-      const choices = filtered.slice(0, 25).map(([k, v]) => ({
-        name: interaction.commandName === 'vault' ? `${k} (${v.originalName})` : `[Vault] ${k} - ${v.originalName}`,
-        value: k,
-      }));
-      return await interaction.respond(choices);
-    }
-
-    // Cancel command autocomplete for open checkout sessions / invoices
-    if (interaction.commandName === 'cancel') {
-      const typed = interaction.options.getFocused().toLowerCase();
-      const sessions = await stripe.checkout.sessions.list({ limit: 50, status: 'open' });
-      const choices = sessions.data
-        .filter((s) => s.metadata?.agent_id)
-        .filter((s) => !typed || `${s.metadata.description} ${s.id}`.toLowerCase().includes(typed))
-        .slice(0, 25)
-        .map((s) => ({
-          name: `${money((s.amount_total ?? 0) / 100, s.currency)} - ${short(s.metadata.description, 50)} - ID: ${s.id}`.slice(0, 100),
-          value: s.id,
-        }));
-      return await interaction.respond(choices);
-    }
-
     if (interaction.commandName !== 'refund' || interaction.user.id !== OWNER_ID) {
       return await interaction.respond([]);
     }
@@ -1584,10 +1377,10 @@ async function cmdRefund(interaction) {
   const pi = await resolvePaymentIntent(interaction.options.getString('order'));
   const charge = pi.latest_charge && typeof pi.latest_charge === 'object' ? pi.latest_charge : null;
   if (pi.status !== 'succeeded' || !charge) {
-    return interaction.editReply('That payment was not completed.');
+    return interaction.editReply('That payment was not completed, so there is nothing to refund.');
   }
   if (charge.disputed) {
-    return interaction.editReply('That payment is under dispute.');
+    return interaction.editReply('That payment is under dispute. Handle it from the dispute in Stripe instead of refunding.');
   }
 
   const refundable = charge.amount - charge.amount_refunded;
@@ -1596,7 +1389,7 @@ async function cmdRefund(interaction) {
   const wanted = interaction.options.getNumber('amount');
   const pence = wanted ? Math.round(wanted * 100) : refundable;
   if (pence > refundable) {
-    return interaction.editReply(`You can refund at most ${money(refundable / 100, pi.currency)}.`);
+    return interaction.editReply(`You can refund at most ${money(refundable / 100, pi.currency)} on that payment.`);
   }
 
   const code = interaction.options.getString('reason') ?? 'r';
@@ -1604,6 +1397,7 @@ async function cmdRefund(interaction) {
   const embed = new EmbedBuilder()
     .setColor(RED)
     .setTitle('Confirm refund')
+    .setDescription(pence === refundable ? 'This refunds everything left on the payment.' : 'This is a partial refund.')
     .addFields(
       { name: 'Refund amount', value: money(pence / 100, pi.currency), inline: true },
       { name: 'Originally paid', value: money(pi.amount_received / 100, pi.currency), inline: true },
@@ -1611,7 +1405,8 @@ async function cmdRefund(interaction) {
       { name: 'Customer', value: m.customer_id ? `<@${m.customer_id}>` : 'Unknown', inline: true },
       { name: 'Description', value: short(m.description, 200) },
       { name: 'Payment ID', value: pi.id }
-    );
+    )
+    .setFooter({ text: "Refunds can't be undone. Stripe keeps its processing fee. A file already sent can't be taken back." });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`refund_yes:${pi.id}:${pence}:${code}`).setLabel('Confirm refund').setStyle(ButtonStyle.Danger),
@@ -1641,7 +1436,7 @@ async function onRefundButton(interaction) {
         reason: reason.api,
         metadata: { refunded_by: interaction.user.id },
       },
-      { idempotencyKey: `refund-${interaction.message.id}` }
+      { idempotencyKey: `refund-${interaction.message.id}` } // a double click can't refund twice
     );
 
     await recordInStripe(piId, {
@@ -1650,16 +1445,23 @@ async function onRefundButton(interaction) {
       last_refund_reason: reason.api,
     });
 
+    // Look at the payment again: who paid, and was it refunded in full?
     const pi = await stripe.paymentIntents.retrieve(piId, { expand: ['latest_charge'] });
     const m = pi.metadata ?? {};
     const fullyRefunded = !!(pi.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.refunded);
 
+    // Full refund: a file or link that hasn't been handed over yet is deleted
+    let fileNote = 'No file attached';
     if (fullyRefunded) {
       const sess = await stripe.checkout.sessions.list({ payment_intent: piId, limit: 1 });
       const sid = sess.data[0]?.id;
-      if (sid) discardPending(sid);
+      fileNote = sid && discardPending(sid) ? 'Pending file/link deleted, so it will not be sent' : 'No pending file';
+    } else if (m.file_name || m.delivery_link_host) {
+      fileNote = 'Partial refund, so the file/link can still be sent';
     }
 
+    // Tell the customer
+    let customerNote = 'No customer on record';
     if (m.customer_id) {
       try {
         const u = await client.users.fetch(m.customer_id);
@@ -1668,10 +1470,16 @@ async function onRefundButton(interaction) {
             new EmbedBuilder()
               .setColor(GREEN)
               .setTitle('Refund issued')
-              .setDescription(`You've been refunded **${money(refund.amount / 100, refund.currency)}** for **${short(m.description, 100)}**.`),
+              .setDescription(
+                `You've been refunded **${money(refund.amount / 100, refund.currency)}** for **${short(m.description, 100)}**.\n` +
+                  'It usually shows in your account within 5 to 10 days.'
+              ),
           ],
         });
-      } catch {}
+        customerNote = 'Customer was told by DM';
+      } catch {
+        customerNote = "Couldn't DM the customer (their DMs may be closed). Please tell them yourself.";
+      }
     }
 
     const done = new EmbedBuilder()
@@ -1681,8 +1489,15 @@ async function onRefundButton(interaction) {
         { name: 'Amount', value: money(refund.amount / 100, refund.currency), inline: true },
         { name: 'Status', value: refund.status, inline: true },
         { name: 'Reason', value: reason.label, inline: true },
+        { name: 'Customer', value: m.customer_id ? `<@${m.customer_id}>` : 'Unknown', inline: true },
+        { name: 'Refunded by', value: `<@${interaction.user.id}>`, inline: true },
+        { name: 'Order', value: short(m.description, 200) },
+        { name: 'Customer notice', value: customerNote },
+        { name: 'File', value: fileNote },
         { name: 'Refund ID', value: refund.id }
-      );
+      )
+      .setFooter({ text: 'The customer usually sees it in 5 to 10 days.' })
+      .setTimestamp();
     await interaction.editReply({ content: '', embeds: [done], components: [] });
     await logToServer({ embeds: [done] });
   } catch (err) {
@@ -1691,6 +1506,7 @@ async function onRefundButton(interaction) {
   }
 }
 
+// ---------- Evidence record + dispute alerts ----------
 async function recordInStripe(paymentIntentId, fields) {
   if (!paymentIntentId) return;
   try {
@@ -1700,6 +1516,7 @@ async function recordInStripe(paymentIntentId, fields) {
   }
 }
 
+// Keeps the message's other buttons (like Pay invoice), removes Get my file
 function withoutGetFile(message) {
   const rows = [];
   for (const r of message.components) {
@@ -1716,7 +1533,7 @@ async function onGetFile(interaction) {
   if (!d) {
     await interaction.update({ components: withoutGetFile(interaction.message) });
     return interaction.followUp({
-      content: 'The file was already sent or is no longer available.',
+      content: 'The file was already sent, or is no longer available. Please contact the seller.',
       ephemeral: true,
     });
   }
@@ -1727,18 +1544,25 @@ async function onGetFile(interaction) {
   const session = await stripe.checkout.sessions.retrieve(key);
   if (session.payment_status !== 'paid') {
     return interaction.reply({
-      content: 'Payment has not been received yet.',
+      content:
+        session.status === 'expired'
+          ? 'This invoice has expired. Please ask the seller for a new one.'
+          : 'Payment has not been received yet. Pay first, then press this button again.',
       ephemeral: true,
     });
   }
 
+  // Never hand over the file for a payment that was fully refunded
   const checkPi = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
   if (checkPi) {
     const pi = await stripe.paymentIntents.retrieve(checkPi, { expand: ['latest_charge'] });
     if (pi.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.refunded) {
       discardPending(key);
+      await logToServer({
+        content: `Blocked "${d.name}": <@${d.customerId}> tried to get it after the payment was refunded.`,
+      });
       return interaction.reply({
-        content: 'This payment was refunded.',
+        content: 'This payment was refunded, so the file can no longer be sent.',
         ephemeral: true,
       });
     }
@@ -1755,23 +1579,29 @@ async function onGetFile(interaction) {
     try {
       buffer = fs.readFileSync(d.path);
     } catch {
+      await notifyOwner({
+        content: `<@${d.customerId}> paid but their file "${d.name}" is gone (server restarted). Please send it manually.`,
+      });
       delete deliveries[key];
       saveDeliveries();
       return interaction.reply({
-        content: 'Sorry, the file is no longer available.',
+        content: 'Sorry, the file is no longer available. The seller has been told and will send it to you.',
         ephemeral: true,
       });
     }
   }
 
+  // Turn the invoice into a PAID message with no buttons, then post the file/link under it
   const old = interaction.message.embeds[0];
   await interaction.update({
-    embeds: old ? [EmbedBuilder.from(old).setColor(GREY).setTitle(old.title.startsWith('PAID') ? old.title : `PAID - ${old.title}`)] : [],
+    embeds: old
+      ? [EmbedBuilder.from(old).setColor(GREY).setTitle(old.title.startsWith('PAID') ? old.title : `PAID - ${old.title}`)]
+      : [],
     components: [],
   });
   const msg = await interaction.followUp(
     dlink
-      ? { content: `<@${d.customerId}> here is your download link:\n<${dlink}>` }
+      ? { content: `<@${d.customerId}> here is your download link${hosted ? ' (works once, expires in 24 hours)' : ''}:\n<${dlink}>` }
       : {
           content: `<@${d.customerId}> here is the file for this purchase.`,
           files: [new AttachmentBuilder(buffer, { name: d.name })],
@@ -1787,14 +1617,15 @@ async function onGetFile(interaction) {
   saveDeliveries();
   liveInteractions.delete(key);
 
-  await recordInStripe(checkPi, {
+  const piId = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
+  await recordInStripe(piId, {
     delivered_at: new Date().toISOString(),
-    delivered_to: 'Get my file button pressed',
+    delivered_to: 'a reply under the invoice message (customer pressed Get my file)',
     delivered_file: d.name.slice(0, 100),
     delivery_message: msg.url ?? '',
   });
 
-  await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}>.` });
+  await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}> under their invoice.` });
 }
 
 async function onButton(interaction) {
@@ -1813,7 +1644,7 @@ async function onButton(interaction) {
   });
   const updated = EmbedBuilder.from(interaction.message.embeds[0]).addFields({
     name: 'Delivered',
-    value: `<t:${Math.floor(now.getTime() / 1000)}:f>`,
+    value: `<t:${Math.floor(now.getTime() / 1000)}:f> by <@${interaction.user.id}>`,
   });
   await interaction.update({ embeds: [updated], components: [] });
 }
@@ -1821,16 +1652,77 @@ async function onButton(interaction) {
 async function onDisputeCreated(d) {
   const piId = typeof d.payment_intent === 'string' ? d.payment_intent : d.payment_intent?.id;
   const pi = piId ? await stripe.paymentIntents.retrieve(piId) : null;
+  const m = pi?.metadata ?? {};
+  const dueBy = d.evidence_details?.due_by;
   const dash = `https://dashboard.stripe.com${d.livemode ? '' : '/test'}/disputes/${d.id}`;
+
+  const when = (iso) => {
+    const t = iso ? Math.floor(new Date(iso).getTime() / 1000) : null;
+    return t ? `<t:${t}:f>` : 'Not recorded';
+  };
 
   const embed = new EmbedBuilder()
     .setColor(RED)
     .setTitle('DISPUTE OPENED')
+    .setDescription(
+      `A customer disputed a payment. **Evidence is due ${dueBy ? `<t:${dueBy}:R> (<t:${dueBy}:f>)` : 'soon'}.**`
+    )
     .addFields(
       { name: 'Amount', value: money(d.amount / 100, d.currency), inline: true },
       { name: 'Reason', value: String(d.reason ?? 'unknown'), inline: true },
+      { name: 'Dispute ID', value: d.id, inline: true },
+      { name: 'Customer', value: m.customer_id ? `<@${m.customer_id}>\n(${m.customer_id})` : 'Unknown', inline: true },
+      { name: 'Sales Agent', value: m.agent_id ? `<@${m.agent_id}>` : 'Unknown', inline: true },
+      { name: 'Description', value: short(m.description, 200) },
+      { name: 'Order created', value: `${when(m.created_at)}\n${m.created_in ?? ''}`.trim() },
+      { name: 'Paid', value: when(m.paid_at), inline: true },
+      {
+        name: 'Delivered',
+        value: m.delivered_at
+          ? `${when(m.delivered_at)}\n${m.delivered_to ?? ''}${m.delivery_message ? `\n${m.delivery_message}` : ''}`.slice(0, 1000)
+          : '**Nothing recorded**',
+        inline: true,
+      },
       { name: 'Open in Stripe', value: dash }
     );
+
+  // Save a DRAFT of the evidence in Stripe (nothing is submitted)
+  let drafted = false;
+  if (pi && m.created_at) {
+    try {
+      let email = null;
+      const sessions = await stripe.checkout.sessions.list({ payment_intent: piId, limit: 1 });
+      email = sessions.data[0]?.customer_details?.email ?? null;
+
+      const log = [
+        `Order created: ${m.created_at} by sales agent (Discord ID ${m.agent_id}) in ${m.created_in}.`,
+        `Customer Discord ID: ${m.customer_id}.`,
+        `Payment completed: ${m.paid_at ?? 'not recorded'}.`,
+        m.delivered_at
+          ? `Delivered: ${m.delivered_at} (${m.delivered_to}).${m.delivered_file ? ` File: ${m.delivered_file} (SHA-256 ${m.file_sha256}).` : ''}${m.delivery_message ? ` Message: ${m.delivery_message}` : ''}`
+          : 'No delivery has been recorded by the system.',
+        ...(m.downloaded_at ? [`Download completed: ${m.downloaded_at}.`] : []),
+      ].join('\n');
+
+      await stripe.disputes.update(d.id, {
+        evidence: {
+          product_description: m.description,
+          access_activity_log: log,
+          ...(email ? { customer_email_address: email } : {}),
+        },
+      });
+      drafted = true;
+    } catch (e) {
+      console.error('Could not draft evidence:', e.message);
+    }
+  }
+
+  embed.setFooter({
+    text: drafted
+      ? 'A draft of the evidence was saved in Stripe. Review it and submit before the deadline. Nothing has been submitted.'
+      : 'Add your evidence in Stripe and submit it before the deadline.',
+  });
+
   await notifyOwner({ embeds: [embed] });
 }
 
@@ -1840,7 +1732,8 @@ async function onDisputeClosed(d) {
     .setColor(won ? GREEN : RED)
     .setTitle(`Dispute ${d.status.replace(/_/g, ' ')}`)
     .addFields(
-      { name: 'Amount', value: money(d.amount / 100, d.currency), inline: true }
+      { name: 'Amount', value: money(d.amount / 100, d.currency), inline: true },
+      { name: 'Dispute ID', value: d.id, inline: true }
     );
   await notifyOwner({ embeds: [embed] });
 }
@@ -1862,11 +1755,12 @@ client.on('interactionCreate', async (interaction) => {
 
     switch (interaction.commandName) {
       case 'bankroll':
-        return await sendStripeCheckout(interaction);
-      case 'vault':
-        return await cmdVault(interaction);
-      case 'cancel':
-        return await cmdCancel(interaction);
+        return await sendStripeCheckout(interaction, { kind: 'checkout' });
+      case 'invoice':
+        return await sendStripeCheckout(interaction, {
+          kind: 'invoice',
+          expiresMins: parseInt(interaction.options.getString('expires') ?? '1440', 10),
+        });
       case 'remind':
         return await cmdRemind(interaction);
       case 'restore':
@@ -1936,12 +1830,16 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           .setTitle('Bankroll Checkout')
           .setDescription(description || 'No description')
           .addFields(
-            { name: 'Customer', value: customer_id ? `<@${customer_id}>` : 'Unknown', inline: true },
-            { name: 'Sales Agent', value: agent_id ? `<@${agent_id}>` : 'Unknown', inline: true },
-            { name: 'Amount', value: total.toFixed(2), inline: true },
+            { name: 'Customer', value: customer_id ? `<@${customer_id}>\n(${customer_id})` : 'Unknown', inline: true },
+            { name: 'Sales Agent', value: agent_id ? `<@${agent_id}>\n(${agent_id})` : 'Unknown', inline: true },
+            { name: 'Purchase Amount', value: total.toFixed(2), inline: true },
+            { name: 'Description', value: description || 'No description' },
             { name: 'Transaction ID', value: s.id }
-          );
+          )
+          .setFooter({ text: 'Thank you for your purchase using our alternative payment method.' })
+          .setTimestamp();
 
+        // Orders with a file or link are recorded automatically; others get a button
         const components = [];
         if (!deliveries[s.id] && s.payment_intent) {
           components.push(
@@ -1965,14 +1863,19 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   if (event.type === 'checkout.session.expired') {
     const s = event.data.object;
     if (s.metadata?.agent_id) {
-      discardPending(s.id);
+      const hadFile = discardPending(s.id);
       const embed = new EmbedBuilder()
         .setColor(GREY)
         .setTitle('Invoice expired unpaid')
         .addFields(
           { name: 'Customer', value: s.metadata.customer_id ? `<@${s.metadata.customer_id}>` : 'Unknown', inline: true },
-          { name: 'Sales Agent', value: s.metadata.agent_id ? `<@${s.metadata.agent_id}>` : 'Unknown', inline: true }
-        );
+          { name: 'Sales Agent', value: `<@${s.metadata.agent_id}>`, inline: true },
+          { name: 'Amount', value: money((s.amount_total ?? 0) / 100, s.currency), inline: true },
+          { name: 'Description', value: short(s.metadata.description, 200) },
+          { name: 'Checkout ID', value: s.id }
+        )
+        .setFooter({ text: hadFile ? 'The attached file/link was deleted.' : 'No file attached.' })
+        .setTimestamp();
       await notifyOwner({ embeds: [embed] });
     }
   }
@@ -1987,6 +1890,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   res.json({ received: true });
 });
 
+// One-time download links. Link previewers (like Discord's) are ignored so they can't use the link up.
 app.get('/:name/:token', (req, res) => {
   if (!req.params.name.startsWith('bankroll-')) return res.status(404).send('Not found');
   const token = req.params.token;
@@ -2012,6 +1916,7 @@ app.get('/:name/:token', (req, res) => {
     notifyOwner({ content: `<@${t.customerId}> downloaded "${t.name}".` });
     recordInStripe(t.paymentIntentId, { downloaded_at: new Date().toISOString() });
   });
+  // If the download is cut off part-way, let them try again
   res.on('close', () => {
     if (!finished) t.used = false;
   });
@@ -2026,14 +1931,20 @@ app.get('/:name/:token', (req, res) => {
 app.get('/', (_, res) => res.send('Bankroll bot running'));
 app.listen(PORT, () => console.log(`Webhook server listening on :${PORT}`));
 
+// ---------- Discord login (with logging so failures are visible) ----------
 client.on('error', (e) => console.error('Client error:', e));
 client.on('shardError', (e) => console.error('Shard error:', e));
 client.on('shardDisconnect', (ev, id) => console.error('Shard disconnected', id, ev.code));
 client.on('warn', (m) => console.warn('Warn:', m));
 client.on('shardReady', (id) => console.log('Shard ready', id));
 client.on('shardReconnecting', (id) => console.log('Shard reconnecting', id));
+console.log('Token present:', !!DISCORD_TOKEN, 'length:', DISCORD_TOKEN?.length);
+
+setTimeout(() => {
+  if (!started) console.error('NOT logged in after 45 seconds');
+}, 45000);
 
 client
-  .login(DISTOKEN)
+  .login(DISCORD_TOKEN)
   .then(() => console.log('login() resolved'))
   .catch((e) => console.error('Login failed:', e));
