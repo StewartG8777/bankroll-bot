@@ -358,8 +358,7 @@ async function deliverFile(key, paymentIntentId) {
 
   const payload = () =>
     dlink
-      ? { content: `<@${d.customerId}> payment received. Here is your download link${hosted ? ' (works once, expires in 24 hours)' : ''}:
-<${dlink}>` }
+      ? { content: `<@${d.customerId}> payment received. Here is your download link${hosted ? ' (works once, expires in 24 hours)' : ''}:\n<${dlink}>` }
       : buffer
       ? {
           content: `<@${d.customerId}> payment received. Here is the file for this purchase.`,
@@ -419,8 +418,7 @@ async function deliverFile(key, paymentIntentId) {
     try {
       await owner.send(
         dlink
-          ? { content: `Couldn't reach <@${d.customerId}>. Here is their download link:
-<${dlink}>` }
+          ? { content: `Couldn't reach <@${d.customerId}>. Here is their download link:\n<${dlink}>` }
           : buffer
           ? {
               content: `Couldn't reach <@${d.customerId}>. Here is their file.`,
@@ -544,7 +542,7 @@ client.on('interactionCreate', async (interaction) => {
     const embed = new EmbedBuilder()
       .setColor(GREEN)
       .setTitle('Monzo Bank Transfer Invoice')
-      .setDescription(`Please click the button below to pay via Monzo.me.\n**Important:** Ensure you include reference code `${invoiceKey}` in the payment notes if prompted!`)
+      .setDescription(`Please click the button below to pay via Monzo.me.\n**Important:** Ensure you include reference code \`${invoiceKey}\` in the payment notes if prompted!`)
       .addFields(
         { name: 'Amount to Pay', value: money(amount, 'gbp') },
         { name: 'Reference Required', value: `${invoiceKey}` },
