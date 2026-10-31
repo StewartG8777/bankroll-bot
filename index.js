@@ -1437,11 +1437,9 @@ const cancelCmd = common(
 );
 
 const spamCmd = common(
-  new SlashCommandBuilder().setName('spam').setDescription('Send a timed, opt-in message sequence')
-    .addSubcommand((sub) => sub.setName('start').setDescription('Send a DM request with your chosen message')
-      .addUserOption((o) => o.setName('user').setDescription('Person receiving the messages').setRequired(true))
-      .addStringOption((o) => o.setName('message').setDescription('Text or emoji to repeat').setMaxLength(1800).setRequired(true))
-      .addIntegerOption((o) => o.setName('duration').setDescription('Duration in minutes (1–15)').setMinValue(1).setMaxValue(15).setRequired(true)))
+  new SlashCommandBuilder().setName('spam').setDescription('Post a timed repeated-message embed in this channel')
+    .addStringOption((o) => o.setName('message').setDescription('Text or emoji to repeat').setMaxLength(1800).setRequired(true))
+    .addIntegerOption((o) => o.setName('duration').setDescription('Duration in minutes (1–15)').setMinValue(1).setMaxValue(15).setRequired(true))
 );
 const stopSpamCmd = common(
   new SlashCommandBuilder().setName('stop').setDescription('Owner: stop every active spam session')
@@ -4760,51 +4758,35 @@ const spamSessions = new Map();
 const spamRequests = new Map();
 
 async function cmdSpam(interaction) {
-  const sub = interaction.options.getSubcommand();
-  if (sub === 'stop') {
-    const active = [...spamSessions.entries()].filter(([, session]) => session.ownerId === interaction.user.id);
-    if (!active.length) return interaction.reply({ content: 'You do not have an active message session.', ephemeral: true });
-    for (const [id, session] of active) {
-      clearTimeout(session.timeout);
-      spamSessions.delete(id);
-      session.target.send('The message session has been stopped.').catch(() => {});
-    }
-    return interaction.reply({ content: 'Stopped ' + active.length + ' message session(s).', ephemeral: true });
+  if (!interaction.inGuild() || !interaction.channel?.isTextBased()) {
+    return interaction.reply({ content: 'Use /spam in a server text channel.', ephemeral: true });
   }
-
-  const target = interaction.options.getUser('user', true);
   const message = interaction.options.getString('message', true);
   const durationMinutes = interaction.options.getInteger('duration', true);
-  if (target.bot || target.id === interaction.user.id) return interaction.reply({ content: 'Choose another person, not a bot or yourself.', ephemeral: true });
-
   const requestId = crypto.randomBytes(8).toString('hex');
-  const request = { ownerId: interaction.user.id, targetId: target.id, message, durationMinutes, expiresAt: Date.now() + 10 * 60 * 1000 };
-  spamRequests.set(requestId, request);
+  spamRequests.set(requestId, {
+    ownerId: interaction.user.id,
+    message,
+    durationMinutes,
+    expiresAt: Date.now() + 10 * 60 * 1000
+  });
   const expiry = setTimeout(() => spamRequests.delete(requestId), 10 * 60 * 1000);
   expiry.unref?.();
 
+  const embed = new EmbedBuilder()
+    .setColor(GREY)
+    .setTitle('Timed message ready')
+    .setDescription('Press **Start** to begin posting the message below as a reply to this embed.')
+    .addFields(
+      { name: 'Message to repeat', value: message.slice(0, 1024) },
+      { name: 'Duration', value: durationMinutes + ' minute(s)', inline: true },
+      { name: 'Interval', value: 'Every 1 second', inline: true }
+    )
+    .setFooter({ text: 'Only the person who ran /spam can start or stop this session.' });
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('spam:accept:' + requestId).setLabel('Start').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('spam:decline:' + requestId).setLabel('No thanks').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('spam:start:' + requestId).setLabel('Start').setStyle(ButtonStyle.Success)
   );
-  try {
-    await target.send({
-      embeds: [new EmbedBuilder().setColor(GREY).setTitle('Message request')
-        .setDescription('<@' + interaction.user.id + '> wants to send you a repeated message.')
-        .addFields(
-          { name: 'Message', value: message.slice(0, 1024) },
-          { name: 'Duration', value: durationMinutes + ' minute(s)', inline: true }
-        )
-        .setFooter({ text: 'Nothing will be sent unless you press Start.' })],
-      components: [row],
-      allowedMentions: { parse: [] }
-    });
-    return interaction.reply({ content: 'Start request sent to <@' + target.id + '>. They must accept it first.', ephemeral: true });
-  } catch (error) {
-    spamRequests.delete(requestId);
-    console.error('Could not send spam request DM:', error.message);
-    return interaction.reply({ content: 'I could not DM that person. They may have DMs disabled or block the bot.', ephemeral: true });
-  }
+  return interaction.reply({ embeds: [embed], components: [row], allowedMentions: { parse: [] } });
 }
 
 async function handleSpamConsent(interaction) {
@@ -4812,16 +4794,18 @@ async function handleSpamConsent(interaction) {
   const action = parts[1];
   const requestId = parts[2];
   const request = spamRequests.get(requestId);
-  if (!request || request.expiresAt < Date.now()) return interaction.reply({ content: 'This message request has expired. Run /spam start again.', ephemeral: true });
-  if (interaction.user.id !== request.targetId) return interaction.reply({ content: 'Only the recipient can respond to this request.', ephemeral: true });
+  if (!request || request.expiresAt < Date.now()) {
+    return interaction.reply({ content: 'This spam setup has expired. Run /spam again.', ephemeral: true });
+  }
+  if (interaction.user.id !== request.ownerId) {
+    return interaction.reply({ content: 'Only the person who ran /spam can start this session.', ephemeral: true });
+  }
   spamRequests.delete(requestId);
-  if (action === 'decline') return interaction.update({ content: 'Request declined.', embeds: [], components: [] });
+  if (action !== 'start') return interaction.reply({ content: 'Unknown spam action.', ephemeral: true });
 
   const sessionId = crypto.randomBytes(8).toString('hex');
-  const target = interaction.user;
   const session = {
     ownerId: request.ownerId,
-    target,
     sourceMessage: interaction.message,
     message: request.message,
     endAt: Date.now() + request.durationMinutes * 60000,
@@ -4831,11 +4815,14 @@ async function handleSpamConsent(interaction) {
   };
   spamSessions.set(sessionId, session);
   await interaction.update({
-    content: 'You started this message session. You can stop it at any time.',
-    embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Spam initiated')
-      .setDescription('The message below will be posted as replies to this embed.')
-      .addFields({ name: 'Repeated message', value: request.message.slice(0, 1024) })
-      .setFooter({ text: 'Sends once per second for the agreed duration. You can stop it at any time.' })],
+    embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Spam running')
+      .setDescription('The message below is being posted as replies to this embed.')
+      .addFields(
+        { name: 'Repeated message', value: request.message.slice(0, 1024) },
+        { name: 'Duration', value: request.durationMinutes + ' minute(s)', inline: true },
+        { name: 'Interval', value: 'Every 1 second', inline: true }
+      )
+      .setFooter({ text: 'Press Stop to end the session early.' })],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('spam:stop:' + sessionId).setLabel('Stop').setStyle(ButtonStyle.Danger)
     )]
@@ -4863,8 +4850,6 @@ async function handleSpamConsent(interaction) {
     session.timeout = setTimeout(sendNext, session.intervalMs);
     session.timeout.unref?.();
   };
-
-  // Send the first reply immediately after the recipient presses Start.
   await sendNext();
 }
 
@@ -4872,10 +4857,10 @@ async function handleSpamStopButton(interaction) {
   const id = interaction.customId.split(':')[2];
   const session = spamSessions.get(id);
   if (!session) return interaction.reply({ content: 'This message session has already ended.', ephemeral: true });
-  if (interaction.user.id !== session.target.id) return interaction.reply({ content: 'Only the recipient can stop this session.', ephemeral: true });
+  if (interaction.user.id !== session.ownerId) return interaction.reply({ content: 'Only the person who started this session can stop it.', ephemeral: true });
   clearTimeout(session.timeout);
   spamSessions.delete(id);
-  return interaction.update({ content: 'Message session stopped.', embeds: [], components: [] });
+  return interaction.update({ embeds: [new EmbedBuilder().setColor(RED).setTitle('Spam stopped').setDescription('The repeated messages have stopped.')], components: [] });
 }
 // ---------- Interaction router ----------
 client.on('interactionCreate', async (interaction) => {
