@@ -508,7 +508,8 @@ try {
 } catch {}
 const saveDownloads = () => {
   try {
-    atomicWrite(DOWNLOADS_FILE, JSON.stringify(downloads));
+    const durableDownloads = Object.fromEntries(Object.entries(downloads).filter(([, item]) => !item?.backupDownload));
+    atomicWrite(DOWNLOADS_FILE, JSON.stringify(durableDownloads));
   } catch (e) {
     console.error('Could not save downloads:', e.message);
   }
@@ -529,26 +530,50 @@ cleanDownloads();
 setInterval(cleanDownloads, 60 * 60 * 1000);
 
 function makeDownloadLink(d, paymentIntentId) {
+  if (!d?.path || !fs.existsSync(d.path)) throw new Error('The source file is no longer available.');
   const token = crypto.randomBytes(24).toString('hex');
+  const safeName = path.basename(String(d.name || 'download.zip')).replace(/[^\w.\-]/g, '_');
+  const downloadPath = path.join(FILES_DIR, `download_${token}_${safeName}`);
+  fs.copyFileSync(d.path, downloadPath);
   downloads[token] = {
-    path: d.path,
-    name: d.name,
-    customerId: d.customerId,
-    agentId: d.agentId,
+    path: downloadPath,
+    name: safeName,
+    customerId: d.customerId || OWNER_ID,
+    agentId: d.agentId || OWNER_ID,
     vaultKey: d.vaultKey ?? null,
     paymentIntentId: paymentIntentId ?? null,
     expiresAt: Date.now() + 24 * 60 * 60 * 1000,
     used: false,
   };
   saveDownloads();
-  const slug =
-    (d.description || '')
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 40)
-      .replace(/-+$/, '') || 'order';
+  const slug = (d.description || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '') || 'order';
   return `${BASE_URL}/bankroll-${slug}-download/${token}`;
+}
+
+function makeBackupDownloadLink(buffer, name) {
+  if (!BASE_URL) return null;
+  const token = crypto.randomBytes(24).toString('hex');
+  const safeName = path.basename(String(name || 'bankroll-backup.zip')).replace(/[^\w.\-]/g, '_');
+  const downloadPath = path.join(FILES_DIR, `backup_download_${token}_${safeName}`);
+  fs.writeFileSync(downloadPath, buffer);
+  downloads[token] = {
+    path: downloadPath,
+    name: safeName,
+    customerId: OWNER_ID,
+    agentId: OWNER_ID,
+    vaultKey: null,
+    paymentIntentId: null,
+    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    used: false,
+    backupDownload: true,
+  };
+  return `${BASE_URL}/bankroll-backup-download/${token}`;
+}
+
+function downloadLinkRow(url, label = 'Download ZIP') {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(url)
+  );
 }
 
 function findBackupChannel() {
@@ -636,7 +661,7 @@ function dataFilePaths() {
   const set = new Set();
   for (const v of Object.values(vault)) if (v?.path) set.add(v.path);
   for (const d of [...Object.values(deliveries), ...Object.values(downloads)]) {
-    if (!d?.path) continue;
+    if (!d?.path || d.backupDownload) continue;
     if (d.vaultKey && vault[d.vaultKey]) continue; // a link to a vault file: backed up once, re-linked on restore
     set.add(d.path);
   }
@@ -702,23 +727,28 @@ async function backupDataOnce() {
           createdAt: new Date().toISOString(),
           files: files.map((f) => ({ name: f.name, size: f.buffer.length, sha256: crypto.createHash('sha256').update(f.buffer).digest('hex') })),
         };
+        const manifestBuffer = Buffer.from(JSON.stringify(manifest, null, 2));
+        const backupZip = new AdmZip();
+        for (const f of files) backupZip.addFile(f.name, f.buffer);
+        backupZip.addFile('bankroll-backup-manifest.json', manifestBuffer);
+        const backupZipBuffer = backupZip.toBuffer();
+        const backupLink = makeBackupDownloadLink(backupZipBuffer, 'bankroll-database-backup.zip');
         const attachments = [
           ...files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })),
-          new AttachmentBuilder(Buffer.from(JSON.stringify(manifest, null, 2)), { name: 'bankroll-backup-manifest.json' }),
+          new AttachmentBuilder(manifestBuffer, { name: 'bankroll-backup-manifest.json' }),
+          new AttachmentBuilder(backupZipBuffer, { name: 'bankroll-database-backup.zip' }),
         ];
         await ch.send({
-          content: `BANKROLL_BACKUP_SNAPSHOT v2 | ${new Date().toISOString()} | ${files.length} database files`,
+          content: `BANKROLL_BACKUP_SNAPSHOT v2 | ${new Date().toISOString()} | ${files.length} database files | complete ZIP archive attached`,
           files: attachments,
+          ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
           allowedMentions: { parse: [] },
         });
-        // Keep older snapshots in the channel. Startup recovery selects the newest valid copy.
         lastBackupHash = hash;
         lastBackupAt = Date.now();
       }
     }
 
-    // Back up each physical file as ONE ZIP attachment. If Discord rejects it,
-    // use the configured hosted-file route; never split a file into multipart messages.
     for (const fp of dataFilePaths()) {
       const rel = safeBackupRel(relData(fp));
       if (!rel) continue;
@@ -729,20 +759,18 @@ async function backupDataOnce() {
       const signature = `${st.size}:${sha256}`;
       if (blobBackedUp[rel] === signature) continue;
 
+      let zipBuffer = null;
+      let backupLink = null;
+      const marker = { rel, size: st.size, sha256, entryName: path.basename(fp), originalName: path.basename(fp) };
       try {
         const zip = new AdmZip();
         zip.addFile(path.basename(fp), fs.readFileSync(fp));
-        const zipBuffer = zip.toBuffer();
-        const marker = {
-          rel,
-          size: st.size,
-          sha256,
-          entryName: path.basename(fp),
-          originalName: path.basename(fp),
-        };
+        zipBuffer = zip.toBuffer();
+        backupLink = makeBackupDownloadLink(zipBuffer, `${path.basename(fp)}.backup.zip`);
         await ch.send({
           content: `datafilezip-v1:${JSON.stringify(marker)}`,
           files: [new AttachmentBuilder(zipBuffer, { name: `${path.basename(fp)}.backup.zip` })],
+          ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
           allowedMentions: { parse: [] },
         });
         blobBackedUp[rel] = signature;
@@ -754,14 +782,16 @@ async function backupDataOnce() {
 
       if (BASE_URL) {
         try {
-          const url = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
+          const recoveryUrl = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
+          backupLink = backupLink || (zipBuffer ? makeBackupDownloadLink(zipBuffer, `${path.basename(fp)}.backup.zip`) : null);
           await ch.send({
-            content: `datafilelink:${rel}|${st.size}|${url}`,
+            content: `datafilelink:${rel}|${st.size}|${recoveryUrl}`,
+            ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
             allowedMentions: { parse: [] },
           });
           blobBackedUp[rel] = signature;
           lastBackupAt = Date.now();
-          console.warn(`Stored hosted-link backup fallback for ${rel}. A link hosted on ephemeral storage is not durable across instance loss.`);
+          console.warn(`Stored hosted recovery fallback for ${rel}. The Download ZIP button is a separate one-time convenience link.`);
           continue;
         } catch (linkError) {
           console.error(`Hosted-link backup failed for ${rel}:`, linkError.message);
@@ -770,7 +800,6 @@ async function backupDataOnce() {
       scheduleBackup();
       break;
     }
-
   } catch (e) {
     console.error('Backup failed:', e.message);
   }
@@ -839,16 +868,13 @@ async function deliverFile(key, paymentIntentId) {
   if (!d) return;
 
   let owner = null;
-  try {
-    owner = await client.users.fetch(OWNER_ID);
-  } catch {}
+  try { owner = await client.users.fetch(OWNER_ID); } catch {}
 
   const noFile = !d.link && !d.path;
   let dlink = d.link || null;
   let hosted = false;
-  // ZIP files are delivered as real ZIP attachments (split into several ZIPs if big); a link is only a fallback.
-  const wantZip = !d.link && d.path && /\.zip$/i.test(d.name || '');
-  if (d.fallbackLink && !wantZip) {
+
+  if (d.fallbackLink) {
     const token = d.fallbackLink.split('/').pop();
     const savedLink = downloads[token];
     if (savedLink && !savedLink.used && Date.now() < savedLink.expiresAt && fs.existsSync(savedLink.path)) {
@@ -859,78 +885,59 @@ async function deliverFile(key, paymentIntentId) {
       saveDeliveries();
     }
   }
-  if (!dlink && !wantZip && !d.vaultKey && BASE_URL && d.mode !== 'direct' && d.path && fs.existsSync(d.path)) {
-    dlink = makeDownloadLink(d, paymentIntentId);
-    hosted = true;
-  }
-  const zipParts = !dlink && !noFile ? zipPartsFor(d) : null;
-  let buffer = null;
-  if (!dlink && !noFile && !zipParts) {
-    try {
-      buffer = fs.readFileSync(d.path);
-    } catch {
-      if (owner) {
-        await owner
-          .send(`Payment received for ${key}, but the file "${d.name}" is gone. Please send it manually to <@${d.customerId}>.`)
-          .catch(() => {});
-      }
-      delete deliveries[key];
+
+  if (!dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
+    const size = fs.statSync(d.path).size;
+    if (d.mode === 'link' || size > MAX_FILE_BYTES) {
+      dlink = makeDownloadLink(d, paymentIntentId);
+      hosted = true;
+      d.fallbackLink = dlink;
       saveDeliveries();
-      return;
     }
   }
 
-  const payload = () =>
-    noFile
-      ? { content: `<@${d.customerId}> payment received. Thank you!` }
-      : dlink
-      ? { content: `<@${d.customerId}> payment received. Here is your download link${hosted ? ' (works once, expires in 24 hours)' : ''}:\n<${dlink}>` }
-      : zipParts
-      ? {
-          content: `<@${d.customerId}> payment received. Your file is sent as ${zipParts.length} ZIP files: download all of them and extract them into the same folder.${zipParts.needsJoin ? ' Then double-click JOIN_FILES.bat (it rebuilds the big files).' : ''} Part 1 of ${zipParts.length}:`,
-          files: [new AttachmentBuilder(zipParts[0].buf, { name: zipPartName(d, 0, zipParts.length) })],
-        }
-      : {
-          content: `<@${d.customerId}> payment received. Here is the file for this purchase.`,
-          files: [new AttachmentBuilder(buffer, { name: d.name })],
-        };
+  if (!noFile && !dlink && (!d.path || !fs.existsSync(d.path))) {
+    if (owner) await owner.send(`Payment received for ${key}, but the file "${d.name}" is gone. Please send it manually to <@${d.customerId}>.`).catch(() => {});
+    delete deliveries[key];
+    saveDeliveries();
+    return;
+  }
 
-  // Try the ZIP first. If Discord rejects the attachment (for example, the
-  // guild upload limit is smaller than the file), create a one-time hosted link
-  // and retry the same destination with that link instead.
+  const isZip = /\.zip$/i.test(String(d.name || ''));
+  const payload = () => {
+    if (noFile) return { content: `<@${d.customerId}> payment received. Thank you!` };
+    if (dlink) {
+      return {
+        content: `<@${d.customerId}> payment received. Your complete ${isZip ? 'ZIP' : 'file'} is ready. The secure download link works once and expires in 24 hours.`,
+        embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Your download is ready').setDescription(`Download the complete **${d.name}** using the button below. This is one original file — no split archives or joining steps.`)],
+        components: [downloadLinkRow(dlink, isZip ? 'Download ZIP' : 'Download File')],
+        allowedMentions: { parse: [] },
+      };
+    }
+    return {
+      content: `<@${d.customerId}> payment received. Here is your complete file.`,
+      files: [new AttachmentBuilder(d.path, { name: path.basename(d.name || 'download.zip') })],
+      allowedMentions: { parse: [] },
+    };
+  };
+
   const sendWithFallback = async (send) => {
     try {
-      const first = await send(payload());
-      if (zipParts && !dlink) {
-        for (let i = 1; i < zipParts.length; i++) {
-          await send({
-            content: `Part ${i + 1} of ${zipParts.length}`,
-            files: [new AttachmentBuilder(zipParts[i].buf, { name: zipPartName(d, i, zipParts.length) })],
-          });
-        }
-      }
-      return first;
+      return await send(payload());
     } catch (attachmentError) {
       if (noFile || dlink || !BASE_URL || !d.path || !fs.existsSync(d.path)) throw attachmentError;
-      try {
-        dlink = makeDownloadLink(d, paymentIntentId);
-        hosted = true;
-        d.fallbackLink = dlink;
-        saveDeliveries();
-        console.warn(`Discord attachment failed for ${d.name}; retrying invoice delivery with hosted link: ${attachmentError.message}`);
-        return await send(payload());
-      } catch (linkError) {
-        console.error(`Invoice link fallback failed for ${d.name}:`, linkError.message);
-        throw new Error(`ZIP attachment failed (${attachmentError.message}); download-link fallback failed (${linkError.message})`);
-      }
+      dlink = makeDownloadLink(d, paymentIntentId);
+      hosted = true;
+      d.fallbackLink = dlink;
+      saveDeliveries();
+      console.warn(`Discord attachment failed for ${d.name}; retrying with one hosted ZIP/file link: ${attachmentError.message}`);
+      return send(payload());
     }
   };
 
   let sentTo = null;
-  let ownerGotIt = false;
   let msgUrl = null;
   let reachedCustomer = false;
-
   const live = liveInteractions.get(key);
   if (live && Date.now() - live.at < 14 * 60 * 1000) {
     try {
@@ -945,13 +952,10 @@ async function deliverFile(key, paymentIntentId) {
         if (d.type === 'monzo') paidEmbed.setDescription('Payment received. Thank you!');
         await live.interaction.editReply({ embeds: [paidEmbed], components: [] });
       }
-    } catch (e) {
-      console.log('Could not reply under invoice:', e.message);
-    }
+    } catch (e) { console.log('Could not reply under invoice:', e.message); }
   }
   liveInteractions.delete(key);
 
-  // After a restart the live interaction is gone, so find the invoice message itself and reply to it.
   if (!sentTo) {
     try {
       const im = await getInvoiceMessage(d, key);
@@ -962,76 +966,54 @@ async function deliverFile(key, paymentIntentId) {
         sentTo = 'a reply under the invoice message';
         const old = im.embeds[0];
         if (old) {
-          const paidEmbed = EmbedBuilder.from(old)
-            .setColor(GREY)
-            .setTitle(String(old.title || '').startsWith('PAID') ? old.title : `PAID - ${old.title}`);
+          const paidEmbed = EmbedBuilder.from(old).setColor(GREY).setTitle(String(old.title || '').startsWith('PAID') ? old.title : `PAID - ${old.title}`);
           if (d.type === 'monzo') paidEmbed.setDescription('Payment received. Thank you!');
           await im.edit({ embeds: [paidEmbed], components: [] });
         }
       }
-    } catch (e) {
-      console.log('Could not reply to the stored invoice message:', e.message);
-    }
+    } catch (e) { console.log('Could not reply to the stored invoice message:', e.message); }
   }
 
-  if (!sentTo) try {
-    const ch = await client.channels.fetch(d.channelId);
-    const msg = await sendWithFallback((p) => ch.send(p));
-    msgUrl = msg.url;
-    reachedCustomer = true;
-    sentTo = 'the channel where the invoice was created';
-  } catch (e) {
-    console.log('Could not post in original channel:', e.message);
+  if (!sentTo) {
+    try {
+      const ch = await client.channels.fetch(d.channelId);
+      const msg = await sendWithFallback((p) => ch.send(p));
+      msgUrl = msg.url;
+      reachedCustomer = true;
+      sentTo = 'the channel where the invoice was created';
+    } catch (e) { console.log('Could not post in original channel:', e.message); }
   }
 
-  // The customer is never DMed. If neither of the above worked, only the owner gets the link/file,
-  // and the customer can still press "Get my file" on the invoice message.
   if (!sentTo && owner) {
     try {
-      await sendWithFallback((p) => owner.send(
-        dlink
-          ? { content: `Couldn't reach <@${d.customerId}>. Here is their download link:\n<${dlink}>` }
-          : {
-              content: `Couldn't reach <@${d.customerId}>. Here is their file${zipParts ? ` (part 1 of ${zipParts.length})` : ''}.`,
-              files: [new AttachmentBuilder(zipParts ? zipParts[0].buf : buffer, { name: zipParts ? zipPartName(d, 0, zipParts.length) : d.name })],
-            }
-      ));
+      await sendWithFallback((p) => owner.send(p));
       sentTo = 'your DMs';
-      ownerGotIt = true;
-    } catch (e) {
-      console.error('Could not deliver file anywhere:', e.message);
-    }
+    } catch (e) { console.error('Could not deliver file anywhere:', e.message); }
   }
 
   if (sentTo) {
     if (!reachedCustomer) {
-      // Only the owner got it: keep the delivery so the customer can still press "Get my file".
       d.paid = true;
       saveDeliveries();
     } else {
-      if (d.path && !hosted) {
-        try {
-          fs.unlinkSync(d.path);
-        } catch {}
-      }
+      if (d.path && !d.vaultKey) { try { fs.unlinkSync(d.path); } catch {} }
       delete deliveries[key];
       saveDeliveries();
-      if (paymentIntentId) {
-        await recordInStripe(paymentIntentId, {
-          delivered_at: new Date().toISOString(),
-          delivered_to: sentTo.slice(0, 200),
-          delivered_file: d.name.slice(0, 100),
-          delivery_message: msgUrl ?? '',
-        });
-      }
-      if (owner) {
-        await notifyOwner({
-          content: noFile
-            ? `Payment confirmed for "${d.description || 'invoice'}" and <@${d.customerId}> was told (${sentTo}).`
-            : `"${d.name}" was sent to ${sentTo}.`,
-        });
-      }
     }
+  }
+
+  if (reachedCustomer) {
+    if (paymentIntentId) {
+      await recordInStripe(paymentIntentId, {
+        delivered_at: new Date().toISOString(),
+        delivered_to: sentTo.slice(0, 200),
+        delivered_file: String(d.name || '').slice(0, 100),
+        delivery_message: msgUrl || '',
+      });
+    }
+    await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}>.` });
+  } else if (!sentTo && owner) {
+    await owner.send(`I could not deliver "${d.name}" to <@${d.customerId}>. The paid delivery is still saved; they can use the Download ZIP button on their invoice.`).catch(() => {});
   }
 }
 
@@ -2128,7 +2110,7 @@ async function sendStripeCheckout(interaction) {
       row.addComponents(
         new ButtonBuilder()
           .setCustomId(`getfile:${session.id}`)
-          .setLabel('Get my file')
+          .setLabel('Download ZIP')
           .setStyle(ButtonStyle.Secondary)
       );
     }
@@ -2297,7 +2279,7 @@ async function sendMonzoInvoice(interaction) {
     }
     if (fileData || linkUrl) {
       row.addComponents(
-        new ButtonBuilder().setCustomId(`getfile:${key}`).setLabel('Get my file').setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`getfile:${key}`).setLabel('Download ZIP').setStyle(ButtonStyle.Secondary)
       );
     }
 
@@ -3486,10 +3468,7 @@ async function onGetFile(interaction) {
   const d = deliveries[key];
   if (!d) {
     await interaction.update({ components: withoutGetFile(interaction.message) });
-    return interaction.followUp({
-      content: 'The file was already sent or is no longer available.',
-      ephemeral: true,
-    });
+    return interaction.followUp({ content: 'The file was already sent or is no longer available.', ephemeral: true });
   }
   if (interaction.user.id !== d.customerId && !allowed.has(interaction.user.id)) {
     return interaction.reply({ content: 'Only the customer can get this file.', ephemeral: true });
@@ -3497,14 +3476,10 @@ async function onGetFile(interaction) {
 
   let checkPi = null;
   if (d.type === 'monzo') {
-    if (!d.paid) {
-      return interaction.reply({ content: 'Payment has not been received yet.', ephemeral: true });
-    }
+    if (!d.paid) return interaction.reply({ content: 'Payment has not been received yet.', ephemeral: true });
   } else {
     const session = await stripe.checkout.sessions.retrieve(key);
-    if (session.payment_status !== 'paid') {
-      return interaction.reply({ content: 'Payment has not been received yet.', ephemeral: true });
-    }
+    if (session.payment_status !== 'paid') return interaction.reply({ content: 'Payment has not been received yet.', ephemeral: true });
     checkPi = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
     if (checkPi) {
       const pi = await stripe.paymentIntents.retrieve(checkPi, { expand: ['latest_charge'] });
@@ -3517,9 +3492,7 @@ async function onGetFile(interaction) {
 
   let dlink = d.link || null;
   let hosted = false;
-  // ZIP files are delivered as real ZIP attachments (split into several ZIPs if big); a link is only a fallback.
-  const wantZip = !d.link && d.path && /\.zip$/i.test(d.name || '');
-  if (d.fallbackLink && !wantZip) {
+  if (d.fallbackLink) {
     const token = d.fallbackLink.split('/').pop();
     const savedLink = downloads[token];
     if (savedLink && !savedLink.used && Date.now() < savedLink.expiresAt && fs.existsSync(savedLink.path)) {
@@ -3530,98 +3503,75 @@ async function onGetFile(interaction) {
       saveDeliveries();
     }
   }
-  if (!dlink && !wantZip && !d.vaultKey && BASE_URL && d.mode !== 'direct' && d.path && fs.existsSync(d.path)) {
-    dlink = makeDownloadLink(d, checkPi);
-    hosted = true;
-  }
-  const zipParts = !dlink ? zipPartsFor(d) : null;
-  let buffer = null;
-  if (!dlink && !zipParts) {
-    try {
-      buffer = fs.readFileSync(d.path);
-    } catch {
-      delete deliveries[key];
+  if (!dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
+    const size = fs.statSync(d.path).size;
+    if (d.mode === 'link' || size > MAX_FILE_BYTES) {
+      dlink = makeDownloadLink(d, checkPi);
+      hosted = true;
+      d.fallbackLink = dlink;
       saveDeliveries();
-      return interaction.reply({
-        content: 'Sorry, the file is no longer available.',
-        ephemeral: true,
-      });
     }
+  }
+  if (!dlink && (!d.path || !fs.existsSync(d.path))) {
+    delete deliveries[key];
+    saveDeliveries();
+    return interaction.reply({ content: 'Sorry, the file is no longer available.', ephemeral: true });
   }
 
   await interaction.deferUpdate();
-  let msg;
-  const sendGetFilePayload = () => dlink
-    ? { content: `<@${d.customerId}> here is your download link${hosted ? ' (valid for 24 hours and one download)' : ''}:\n<${dlink}>` }
-    : zipParts
+  const isZip = /\.zip$/i.test(String(d.name || ''));
+  const getPayload = () => dlink
     ? {
-        content: `<@${d.customerId}> here is the file for this purchase. It is sent as ${zipParts.length} ZIP files: download all of them and extract them into the same folder.${zipParts.needsJoin ? ' Then double-click JOIN_FILES.bat (it rebuilds the big files).' : ''} Part 1 of ${zipParts.length}:`,
-        files: [new AttachmentBuilder(zipParts[0].buf, { name: zipPartName(d, 0, zipParts.length) })],
+        content: `<@${d.customerId}> here is your secure download. The link works once and expires in 24 hours.`,
+        embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Your download is ready').setDescription(`Download the complete **${d.name}** using the button below. No split ZIPs or joining steps.`)],
+        components: [downloadLinkRow(dlink, isZip ? 'Download ZIP' : 'Download File')],
+        allowedMentions: { parse: [] },
       }
     : {
-        content: `<@${d.customerId}> here is the file for this purchase.`,
-        files: [new AttachmentBuilder(buffer, { name: d.name })],
+        content: `<@${d.customerId}> here is your complete file.`,
+        files: [new AttachmentBuilder(d.path, { name: path.basename(d.name || 'download.zip') })],
+        allowedMentions: { parse: [] },
       };
+
+  let msg;
   try {
-    msg = await interaction.followUp(sendGetFilePayload());
-    if (zipParts && !dlink) {
-      for (let i = 1; i < zipParts.length; i++) {
-        await interaction.followUp({
-          content: `Part ${i + 1} of ${zipParts.length}`,
-          files: [new AttachmentBuilder(zipParts[i].buf, { name: zipPartName(d, i, zipParts.length) })],
-        });
-      }
-    }
+    msg = await interaction.followUp(getPayload());
   } catch (attachmentError) {
-    console.error('Get my file attachment failed:', attachmentError.message);
-    if (!dlink && BASE_URL && d.path && fs.existsSync(d.path)) {
-      try {
-        dlink = makeDownloadLink(d, checkPi);
-        hosted = true;
-        d.fallbackLink = dlink;
-        saveDeliveries();
-        msg = await interaction.followUp(sendGetFilePayload());
-      } catch (linkError) {
-        console.error('Get my file link fallback failed:', linkError.message);
-        return interaction.followUp({
-          content: `Discord rejected the ZIP and the download link could not be sent. Your paid file is still saved. Please contact the seller. Error: ${short(linkError.message, 180)}`,
-          ephemeral: true,
-        });
-      }
-    } else {
-      return interaction.followUp({
-        content: `Discord rejected the ZIP (${short(attachmentError.message, 180)}). ${BASE_URL ? 'The download link could not be created; your paid file is still saved. Please contact the seller.' : 'The seller needs to set PUBLIC_URL in Render to enable the download-link fallback.'}`,
-        ephemeral: true,
-      });
+    console.error('Single-file attachment failed:', attachmentError.message);
+    if (dlink || !BASE_URL || !d.path || !fs.existsSync(d.path)) {
+      return interaction.followUp({ content: `Discord could not send the file (${short(attachmentError.message, 180)}). Your paid file is still saved; please contact the seller.`, ephemeral: true });
+    }
+    try {
+      dlink = makeDownloadLink(d, checkPi);
+      hosted = true;
+      d.fallbackLink = dlink;
+      saveDeliveries();
+      msg = await interaction.followUp(getPayload());
+    } catch (linkError) {
+      console.error('One-time download link fallback failed:', linkError.message);
+      return interaction.followUp({ content: 'Discord rejected the ZIP and the one-time download link could not be created. Your paid file is still saved; please contact the seller.', ephemeral: true });
     }
   }
+
   const old = interaction.message.embeds[0];
   await interaction.message.edit({
     embeds: old ? [EmbedBuilder.from(old).setColor(GREY).setTitle(String(old.title || '').startsWith('PAID') ? old.title : `PAID - ${old.title}`)] : [],
     components: [],
   }).catch(() => {});
 
-  if (d.path && !hosted) {
-    try {
-      fs.unlinkSync(d.path);
-    } catch {}
-  }
+  if (d.path && !d.vaultKey) { try { fs.unlinkSync(d.path); } catch {} }
   delete deliveries[key];
   saveDeliveries();
   liveInteractions.delete(key);
-
   await recordInStripe(checkPi, {
     delivered_at: new Date().toISOString(),
-    delivered_to: 'Get my file button pressed',
-    delivered_file: d.name.slice(0, 100),
+    delivered_to: 'Download ZIP button pressed',
+    delivered_file: String(d.name || '').slice(0, 100),
     delivery_message: msg.url ?? '',
   });
-
-  await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}>.` });
+  await notifyOwner({ content: `"${d.name}" was downloaded by <@${d.customerId}>.` });
 }
 
-// Random but natural-looking "disk size" for a scheduled send: roughly scales with the wait time,
-// with some noise so it gives numbers like 162 or 201 GB. It is picked once per job, so it stays the same on refresh.
 function randomSearchGb(durationMinutes) {
   const center = Math.max(2, 2 + ((durationMinutes - 2) * 198) / 118);
   const jitter = 0.82 + Math.random() * 0.36;
@@ -3699,105 +3649,8 @@ async function startScheduledSend(interaction) {
     saveSendJobs();
   } catch (e) { console.error('Could not save /sendfile message ID:', e.message); }
 }
-// Discord allows about 10 MB per message, so a bigger ZIP is cut into several normal ZIPs.
-// Every part is a complete, openable .zip holding some of the files (stream files, metas, etc.) with their
-// folder paths kept, so extracting all of them into the same folder rebuilds the original resource.
-const ZIP_PART_MAX = 9 * 1024 * 1024;
-
-const ZIP_CHUNK = 8 * 1024 * 1024;
-
-function buildZipParts(zipPath, maxBytes = ZIP_PART_MAX) {
-  let entries = new AdmZip(zipPath)
-    .getEntries()
-    .filter((e) => !e.isDirectory)
-    .map((e) => ({ name: e.entryName, data: e.getData(), size: e.header.compressedSize || 0 }));
-
-  // A single file bigger than one message can't sit in a normal ZIP, so it is cut into pieces
-  // (file.yft.part001, .part002 ...) spread over the ZIPs, and a JOIN_FILES.bat in part 1 glues them back.
-  const joins = [];
-  const out = [];
-  for (const f of entries) {
-    if (f.size <= maxBytes - 1024 * 1024 && f.data.length <= maxBytes * 4) {
-      out.push(f);
-      continue;
-    }
-    const n = Math.ceil(f.data.length / ZIP_CHUNK);
-    const names = [];
-    for (let i = 0; i < n; i++) {
-      const pn = `${f.name}.part${String(i + 1).padStart(3, '0')}`;
-      names.push(pn);
-      const data = f.data.subarray(i * ZIP_CHUNK, (i + 1) * ZIP_CHUNK);
-      out.push({ name: pn, data, size: data.length });
-    }
-    joins.push({ name: f.name, pieces: names });
-  }
-  if (joins.length) {
-    const win = (p) => p.replace(/\//g, '\\');
-    const lines = ['@echo off', 'cd /d "%~dp0"', 'echo Putting the big files back together...'];
-    for (const j of joins) {
-      const src = j.pieces.map((p) => `"${win(p)}"`).join('+');
-      const dels = j.pieces.map((p) => `"${win(p)}"`).join(' ');
-      lines.push(`copy /b /y ${src} "${win(j.name)}" >nul && del ${dels}`);
-    }
-    lines.push('echo Done. You can delete this file now.', 'pause');
-    out.push({ name: 'JOIN_FILES.bat', data: Buffer.from(lines.join('\r\n') + '\r\n'), size: 0 });
-  }
-  entries = out.sort((a, b) => a.size - b.size); // small files (metas, manifest, join.bat) land in part 1
-
-  const make = (group) => {
-    const z = new AdmZip();
-    for (const f of group) z.addFile(f.name, f.data);
-    return z.toBuffer();
-  };
-
-  const parts = [];
-  let current = [];
-  let estimate = 0;
-  const flush = () => {
-    if (!current.length) return;
-    const buf = make(current);
-    // The estimate can be off, so split a part that came out too big.
-    const stack = [{ group: current, buf }];
-    while (stack.length) {
-      const { group, buf: b } = stack.pop();
-      if (b.length <= maxBytes || group.length === 1) {
-        parts.push({ buf: b, names: group.map((f) => f.name), tooBig: b.length > maxBytes });
-        continue;
-      }
-      const mid = Math.ceil(group.length / 2);
-      const second = group.slice(mid);
-      const first = group.slice(0, mid);
-      stack.push({ group: second, buf: make(second) });
-      stack.push({ group: first, buf: make(first) });
-    }
-    current = [];
-    estimate = 0;
-  };
-  for (const f of entries) {
-    if (current.length && estimate + f.size + 300 > maxBytes) flush();
-    current.push(f);
-    estimate += f.size + 300;
-  }
-  flush();
-  parts.needsJoin = joins.length > 0;
-  return parts;
-}
-
-// For a pending invoice delivery: the ZIP parts to send, or null when it fits in one message / is not a ZIP.
-function zipPartsFor(d) {
-  try {
-    if (d.link || !d.path || !/\.zip$/i.test(d.name || '') || !fs.existsSync(d.path)) return null;
-    if (fs.statSync(d.path).size <= ZIP_PART_MAX) return null;
-    const parts = buildZipParts(d.path);
-    return parts.length > 1 && !parts.some((p) => p.tooBig) ? parts : null;
-  } catch (e) {
-    console.error(`Could not split ${d.name} into ZIP parts:`, e.message);
-    return null;
-  }
-}
-function zipPartName(d, i, n) {
-  return `${path.basename(d.name).replace(/\.zip$/i, '')}_part${i + 1}of${n}.zip`;
-}
+// Large archives are never split. If a complete ZIP exceeds Discord's upload limit,
+// the bot serves the original ZIP through a secure one-time download link.
 
 async function onScheduledSendButton(interaction) {
   const jobId = interaction.customId.slice('sendfile:'.length);
@@ -3806,11 +3659,9 @@ async function onScheduledSendButton(interaction) {
     return interaction.reply({ content: 'This scheduled file request could not be found in this DM.', ephemeral: true });
   }
   if (job.status === 'sent' || job.status === 'link_sent') {
-    return interaction.reply({ content: job.status === 'sent' ? 'This ZIP has already been sent.' : 'The download link has already been sent.', ephemeral: true });
+    return interaction.reply({ content: job.status === 'sent' ? 'This ZIP has already been sent.' : 'The one-time download link has already been sent.', ephemeral: true });
   }
-  if (job.status === 'sending') {
-    return interaction.reply({ content: 'Your file is being sent right now, one moment.', ephemeral: true });
-  }
+  if (job.status === 'sending') return interaction.reply({ content: 'Your file is being prepared right now, one moment.', ephemeral: true });
   if (Date.now() < job.dueAt) {
     return interaction.update({ content: sendfileProgress(job), components: [sendfileButton(jobId)], allowedMentions: { parse: [] } });
   }
@@ -3820,14 +3671,8 @@ async function onScheduledSendButton(interaction) {
     return interaction.update({ content: `The scheduled time has arrived, but vault file \`${job.vaultKey}\` is missing. Re-add it, then contact the bot owner.`, components: [sendfileButton(jobId)] });
   }
 
-  // Answer Discord within 3 seconds (this is what used to make the button "fail" and send nothing),
-  // then upload the file as a follow-up, which is allowed to take much longer.
   job.status = 'sending';
-  await interaction.update({
-    content: `${sendfileProgress(job)}\n\nSending your file now...`,
-    components: [],
-    allowedMentions: { parse: [] },
-  });
+  await interaction.update({ content: `${sendfileProgress(job)}\n\nPreparing your complete ZIP now...`, components: [], allowedMentions: { parse: [] } });
 
   const finish = async (status, note) => {
     job.status = status;
@@ -3836,67 +3681,49 @@ async function onScheduledSendButton(interaction) {
     await interaction.editReply({ content: `${sendfileProgress(job)}\n\n${note}`, components: [], allowedMentions: { parse: [] } }).catch(() => {});
   };
 
+  const sendHostedLink = async () => {
+    const link = makeDownloadLink({
+      path: item.path,
+      name: path.basename(job.originalName || item.originalName || item.path),
+      customerId: interaction.user.id,
+      agentId: OWNER_ID,
+      vaultKey: job.vaultKey,
+      description: 'scheduled-vault-file',
+    }, null);
+    await interaction.followUp({
+      content: `**${job.originalName}** is ready. This is the original complete ZIP; the secure link works once and expires in 24 hours.`,
+      embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Your ZIP is ready').setDescription('Use the button below to download the complete original archive.')],
+      components: [downloadLinkRow(link, 'Download ZIP')],
+      allowedMentions: { parse: [] },
+    });
+    await finish('link_sent', 'One-time Download ZIP button sent below.');
+  };
+
   try {
     const fileSize = fs.statSync(item.path).size;
-    if (fileSize <= ZIP_PART_MAX) {
+    if (fileSize > MAX_FILE_BYTES) {
+      if (!BASE_URL) throw new Error('The ZIP exceeds Discord upload limits and PUBLIC_URL is not configured.');
+      return await sendHostedLink();
+    }
+    try {
       await interaction.followUp({
-        content: `**${job.originalName}** - scheduled delivery complete.`,
+        content: `**${job.originalName}** - scheduled delivery complete. The original ZIP is attached below.`,
         files: [new AttachmentBuilder(item.path, { name: path.basename(job.originalName) })],
         allowedMentions: { parse: [] },
       });
-      return await finish('sent', 'File sent below.');
+      return await finish('sent', 'Complete ZIP sent below.');
+    } catch (uploadError) {
+      console.error('Scheduled ZIP attachment failed:', uploadError.message);
+      if (!BASE_URL) throw uploadError;
+      return await sendHostedLink();
     }
-
-    // Too big for one message: send several normal ZIPs instead of one split archive.
-    const parts = buildZipParts(item.path);
-    if (parts.some((p) => p.tooBig)) throw new Error('A single file inside the ZIP is over the upload limit.');
-    const base = path.basename(job.originalName).replace(/\.zip$/i, '');
-    if (parts.length === 1) {
-      await interaction.followUp({
-        content: `**${job.originalName}** - scheduled delivery complete.`,
-        files: [new AttachmentBuilder(parts[0].buf, { name: `${base}.zip` })],
-        allowedMentions: { parse: [] },
-      });
-      return await finish('sent', 'File sent below.');
-    }
-    await interaction.followUp({
-      content: `**${job.originalName}** is sent as ${parts.length} ZIP files. Download all of them and extract them into the same folder.${parts.needsJoin ? ' Then double-click JOIN_FILES.bat (it rebuilds the big files).' : ''}`,
-      allowedMentions: { parse: [] },
-    });
-    for (let i = 0; i < parts.length; i++) {
-      await interaction.followUp({
-        content: `Part ${i + 1} of ${parts.length}`,
-        files: [new AttachmentBuilder(parts[i].buf, { name: `${base}_part${i + 1}of${parts.length}.zip` })],
-        allowedMentions: { parse: [] },
-      });
-    }
-    return await finish('sent', `All ${parts.length} ZIP files sent below.`);
-  } catch (uploadError) {
-    console.error('Scheduled ZIP upload failed; trying link fallback:', uploadError.message);
+  } catch (error) {
+    console.error('Scheduled ZIP delivery failed:', error.message);
+    job.status = 'waiting';
+    saveSendJobs();
+    const failure = `I couldn't deliver **${job.originalName}**. ${error.message} Press **Check progress / Get File** to retry.`;
+    await interaction.editReply({ content: `${sendfileProgress(job)}\n\n${failure}`, components: [sendfileButton(jobId)], allowedMentions: { parse: [] } }).catch(() => {});
   }
-
-  if (BASE_URL) {
-    try {
-      const rel = relData(item.path);
-      if (!rel) throw new Error('Vault file is outside the configured data directory.');
-      const link = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
-      await interaction.followUp({
-        content: `Discord could not attach **${job.originalName}**. Here is the download link instead:\n${link}`,
-        allowedMentions: { parse: [] },
-      });
-      return await finish('link_sent', 'Download link sent below.');
-    } catch (linkError) {
-      console.error('Scheduled file link fallback failed:', linkError.message);
-    }
-  }
-
-  // Both failed: put the button back so it can be retried.
-  job.status = 'waiting';
-  saveSendJobs();
-  const failure = `I couldn't send **${job.originalName}** as a ZIP${BASE_URL ? ' or create its download link' : '. No PUBLIC_URL is configured, so a link cannot be created (the file is probably over Discord\'s upload limit)'}. Press **Check progress / Get File** to retry.`;
-  await interaction.editReply({ content: `${sendfileProgress(job)}\n\n${failure}`, components: [sendfileButton(jobId)], allowedMentions: { parse: [] } }).catch((e) =>
-    console.error('Could not report scheduled send failure:', e.message)
-  );
 }
 
 async function onButton(interaction) {
