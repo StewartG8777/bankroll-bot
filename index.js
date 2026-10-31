@@ -3177,13 +3177,11 @@ async function cmdPaymentTest(interaction) {
     await owner.send({ embeds: [paidEmbed] });
     recordNotification('test.payment_paid', paidEmbed.data.title, 'Simulated ' + method + ' payment ' + reference, 'success');
 
-    const readyPayload = {
+    await owner.send({
       content: '[TEST] Payment received. The ZIP was delivered successfully. This is a simulation; no payment was taken.',
-      components: [downloadLinkRow(testUrl, 'Download Test ZIP')],
       allowedMentions: { parse: [] },
-    };
-    await owner.send(readyPayload);
-    recordNotification('test.delivery_ready', 'Test ZIP ready', fileName + ' is ready; the one-time hosted link is waiting for a download.', 'success');
+    });
+    recordNotification('test.delivery_ready', 'Test delivery confirmation sent', fileName + ' seller confirmation sent without a download button.', 'success');
     recordDownloadEvent('test_payment_simulated', {
       file: fileName,
       customerId: OWNER_ID,
@@ -3193,7 +3191,7 @@ async function cmdPaymentTest(interaction) {
     });
 
     return interaction.editReply(
-      'Test started for **' + (method === 'monzo' ? 'Monzo' : 'Bankroll') + '**. I sent you the fake **PAID** embed and a short **Payment received / ZIP delivered successfully** DM. Click **Download Test ZIP** in that DM to trigger the final download-completed notification. No real payment was taken and no live invoice or vault data was changed.'
+      'Test started for **' + (method === 'monzo' ? 'Monzo' : 'Bankroll') + '**. I sent you the fake **PAID** embed and a short **Payment received / ZIP delivered successfully** DM. The seller DM contains no download button. No real payment was taken and no live invoice or vault data was changed.'
     );
   } catch (err) {
     if (token && downloads[token]) {
