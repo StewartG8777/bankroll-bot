@@ -4,7 +4,8 @@ const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const Stripe = require('stripe');
-const AdmZip = require('adm-zip'); // npm install adm-zip (used by /vault edit)
+const AdmZip = require('adm-zip'); // Used for archive editing and small archive inspection.
+const yauzl = require('yauzl'); // Streaming ZIP reader for large archives.
 const { pipeline } = require('stream/promises');
 const { Readable, Transform } = require('stream');
 const { monitorEventLoopDelay } = require('perf_hooks');
@@ -615,13 +616,65 @@ function cleanDownloads() {
 cleanDownloads();
 setInterval(cleanDownloads, 60 * 60 * 1000);
 
-function verifyZipIntegrity(filePath) {
+// CRC-32 table used while reading ZIP entries sequentially from disk.
+const ZIP_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+// Validate ZIP structure, entry sizes and CRCs using streams. Large archives are
+// processed one entry at a time without loading the archive or entry into RAM.
+async function verifyZipIntegrity(filePath) {
   if (!/\.zip$/i.test(String(filePath || ''))) return { isZip: false, entries: 0 };
   if (!filePath || !fs.existsSync(filePath)) throw new Error('ZIP file is missing.');
-  const zip = new AdmZip(filePath); const entries = zip.getEntries();
-  if (!entries.length) throw new Error('The ZIP archive is empty or invalid.');
-  if (typeof zip.test === 'function' && zip.test() === false) throw new Error('ZIP integrity check failed (CRC/checksum error).');
-  return { isZip: true, entries: entries.length };
+  return new Promise((resolve, reject) => {
+    yauzl.open(filePath, { lazyEntries: true, autoClose: true, decodeStrings: true }, (openError, zip) => {
+      if (openError) return reject(openError);
+      let entries = 0;
+      let settled = false;
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        try { zip.close(); } catch {}
+        reject(error);
+      };
+      zip.on('error', fail);
+      zip.on('end', () => {
+        if (settled) return;
+        settled = true;
+        if (!entries) return reject(new Error('The ZIP archive is empty or invalid.'));
+        resolve({ isZip: true, entries, streamed: true });
+      });
+      zip.on('entry', (entry) => {
+        const entryName = String(entry.fileName || '').replace(/\\/g, '/');
+        if (entryName.startsWith('/') || entryName.split('/').includes('..')) return fail(new Error('The ZIP contains an unsafe file path.'));
+        if (entryName.endsWith('/')) return zip.readEntry();
+        entries++;
+        zip.openReadStream(entry, (streamError, stream) => {
+          if (streamError) return fail(streamError);
+          let crc = 0xffffffff;
+          let size = 0;
+          stream.on('data', (chunk) => {
+            size += chunk.length;
+            for (let i = 0; i < chunk.length; i++) crc = ZIP_CRC_TABLE[(crc ^ chunk[i]) & 0xff] ^ (crc >>> 8);
+          });
+          stream.on('error', fail);
+          stream.on('end', () => {
+            const actualCrc = (crc ^ 0xffffffff) >>> 0;
+            if (size !== Number(entry.uncompressedSize)) return fail(new Error(`ZIP entry size mismatch: ${entry.fileName}`));
+            if (actualCrc !== (Number(entry.crc32) >>> 0)) return fail(new Error(`ZIP CRC/checksum error: ${entry.fileName}`));
+            zip.readEntry();
+          });
+        });
+      });
+      zip.readEntry();
+    });
+  });
 }
 function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download is ready') {
   const isZip = /\.zip$/i.test(String(name || ''));
@@ -2725,13 +2778,13 @@ async function cmdDownloads(interaction) {
   const key = interaction.options.getString('vault_key').trim(); const item = vault[key];
   if (!item?.path || !fs.existsSync(item.path)) return interaction.editReply(`Vault file \`${key}\` is missing.`);
   if (sub === 'verify') {
-    try { const actualHash=await sha256File(item.path); const size=fs.statSync(item.path).size; const zipInfo=verifyZipIntegrity(item.path); const hashMatches=!item.sha256||item.sha256===actualHash; if(!item.sha256){item.sha256=actualHash;saveVault();}
+    try { const actualHash=await sha256File(item.path); const size=fs.statSync(item.path).size; const zipInfo=await verifyZipIntegrity(item.path); const hashMatches=!item.sha256||item.sha256===actualHash; if(!item.sha256){item.sha256=actualHash;saveVault();}
       return interaction.editReply({ embeds:[new EmbedBuilder().setColor(hashMatches?GREEN:RED).setTitle(`Download integrity: ${key}`).setDescription(hashMatches?'File exists and the SHA-256 checksum matches.':'Checksum mismatch: do not send this file until checked.').addFields({name:'File',value:short(item.originalName||key,100),inline:true},{name:'Size',value:`${(size/(1024*1024)).toFixed(2)} MB`,inline:true},{name:'ZIP entries',value:zipInfo.isZip?String(zipInfo.entries):'Not a ZIP',inline:true},{name:'SHA-256',value:actualHash}).setTimestamp()] });
     } catch(e) { recordDownloadEvent('verification_failed',{file:item.originalName||key,detail:e.message}); return interaction.editReply(`ZIP/file verification failed: ${e.message}`); }
   }
   if (sub === 'regenerate') {
     if(!BASE_URL) return interaction.editReply('PUBLIC_URL is not configured, so Bankroll cannot create hosted download links.');
-    try { const zipInfo=verifyZipIntegrity(item.path); const size=fs.statSync(item.path).size; const url=await makeDownloadLink({path:item.path,name:item.originalName||path.basename(item.path),customerId:interaction.user.id,agentId:interaction.user.id,vaultKey:key,description:'admin-regenerated-download'},null); const token=url.split('/').pop(); const expiresAt=downloads[token]?.expiresAt;
+    try { const zipInfo=await verifyZipIntegrity(item.path); const size=fs.statSync(item.path).size; const url=await makeDownloadLink({path:item.path,name:item.originalName||path.basename(item.path),customerId:interaction.user.id,agentId:interaction.user.id,vaultKey:key,description:'admin-regenerated-download'},null); const token=url.split('/').pop(); const expiresAt=downloads[token]?.expiresAt;
       recordDownloadEvent('link_regenerated',{file:item.originalName||key,customerId:interaction.user.id,agentId:interaction.user.id,token,detail:`Admin regenerated a link for vault key ${key}; ZIP entries ${zipInfo.entries||0}.`});
       return interaction.editReply({embeds:[buildDownloadEmbed(item.originalName||key,expiresAt,size,'Fresh download link generated')],components:[downloadLinkRow(url,/\.zip$/i.test(item.originalName||'')?'Download ZIP':'Download File')]});
     } catch(e) { recordDownloadEvent('link_regeneration_failed',{file:item.originalName||key,customerId:interaction.user.id,detail:e.message}); return interaction.editReply(`Could not regenerate the link: ${e.message}`); }
@@ -2772,7 +2825,7 @@ async function cmdVault(interaction) {
       );
     }
 
-    if (/\.zip$/i.test(att.name)) { try { verifyZipIntegrity(filePath); } catch (zipError) { try { fs.unlinkSync(filePath); } catch {} return interaction.editReply(`That ZIP failed its integrity check and was not added: ${short(zipError.message, 220)}`); } }
+    if (/\.zip$/i.test(att.name)) { try { await verifyZipIntegrity(filePath); } catch (zipError) { try { fs.unlinkSync(filePath); } catch {} return interaction.editReply(`That ZIP failed its integrity check and was not added: ${short(zipError.message, 220)}`); } }
     vault[key] = {
       path: filePath,
       originalName: att.name,
@@ -2785,7 +2838,7 @@ async function cmdVault(interaction) {
     recordNotification('vault.add', 'Vault file added', `${key}: ${att.name}`, 'success');
 
     let codeNote = '';
-    if (/\.zip$/i.test(att.name)) {
+    if (/\.zip$/i.test(att.name) && info.size <= 50 * 1024 * 1024) {
       try {
         const codes = zipSpawnCodes(new AdmZip(filePath));
         if (codes.length) {
@@ -2952,6 +3005,9 @@ async function cmdVault(interaction) {
     const item = vault[key];
     if (!item || !fs.existsSync(item.path)) return interaction.editReply(`Vault item \`${key}\` was not found.`);
     if (!/\.zip$/i.test(item.originalName)) return interaction.editReply('Only .zip vault files can be edited.');
+
+    const archiveSize = fs.statSync(item.path).size;
+    if (archiveSize > 50 * 1024 * 1024) return interaction.editReply('This ZIP is larger than 50 MB. Bankroll can stream-verify and deliver it safely, but the current spawn-code editor rewrites archives in memory. Edit this archive locally to avoid a high-memory operation.');
 
     const newCode = interaction.options.getString('spawncode').trim().toLowerCase();
     if (!/^[a-z0-9_]{1,32}$/.test(newCode)) {
@@ -4353,7 +4409,7 @@ async function onScheduledSendButton(interaction) {
   if (!item?.path || !fs.existsSync(item.path)) {
     return interaction.update({ content: `The scheduled time has arrived, but vault file \`${job.vaultKey}\` is missing. Re-add it, then contact the bot owner.`, components: [sendfileButton(jobId)] });
   }
-  try{verifyZipIntegrity(item.path);}catch(e){recordDownloadEvent('verification_failed',{file:job.originalName,customerId:interaction.user.id,detail:e.message});return interaction.update({content:`I stopped this delivery because the ZIP failed its integrity check: ${short(e.message,180)}. Please contact the bot owner.`,components:[]});}
+  try{await verifyZipIntegrity(item.path);}catch(e){recordDownloadEvent('verification_failed',{file:job.originalName,customerId:interaction.user.id,detail:e.message});return interaction.update({content:`I stopped this delivery because the ZIP failed its integrity check: ${short(e.message,180)}. Please contact the bot owner.`,components:[]});}
 
   job.status = 'sending';
   await interaction.update({ content: `${sendfileProgress(job)}\n\nPreparing your complete ZIP now...`, components: [], allowedMentions: { parse: [] } });
@@ -4844,7 +4900,8 @@ app.listen(PORT, () => console.log(`Webhook server listening on :${PORT}`));
 // Monitor process memory and event-loop stalls. Configure MEMORY_WARN_MB in Render if needed.
 const eventLoopMonitor = monitorEventLoopDelay({ resolution: 20000 });
 eventLoopMonitor.enable();
-const MEMORY_WARN_MB = Math.max(128, Number(process.env.MEMORY_WARN_MB || 384));
+const configuredMemoryWarnMb = Number(process.env.MEMORY_WARN_MB || 384);
+const MEMORY_WARN_MB = Number.isFinite(configuredMemoryWarnMb) ? Math.max(128, configuredMemoryWarnMb) : 384;
 let memoryWarningActive = false;
 let lastMemorySampleAt = 0;
 function sampleRuntimeHealth() {
