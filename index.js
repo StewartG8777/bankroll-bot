@@ -1061,7 +1061,7 @@ async function deliverFile(key, paymentIntentId) {
 
   if (!dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
     const size = fs.statSync(d.path).size;
-    if (d.mode === 'link' || size > MAX_FILE_BYTES) {
+    if (size > MAX_FILE_BYTES) {
       dlink = makeDownloadLink(d, paymentIntentId);
       hosted = true;
       d.fallbackLink = dlink;
@@ -4138,7 +4138,7 @@ async function onGetFile(interaction) {
   }
   if (!dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
     const size = fs.statSync(d.path).size;
-    if (d.mode === 'link' || size > MAX_FILE_BYTES) {
+    if (size > MAX_FILE_BYTES) {
       dlink = makeDownloadLink(d, checkPi);
       hosted = true;
       d.fallbackLink = dlink;
