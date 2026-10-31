@@ -3732,7 +3732,7 @@ async function cmdBotAdmin(interaction) {
         guildNote = '\\nRemoved old server-only command copies.';
       }
     }
-    return interaction.editReply(`Slash commands refreshed successfully: **${commands.length}** command(s) registered globally. Discord should show the latest commands without restarting your client.${guildNote}`);
+    return interaction.editReply(`**Slash commands refreshed successfully**\n\n**What changed:**\n• **/spam** now takes a message and duration only — the user/recipient option has been removed.\n• Running /spam posts a Start embed in the channel where you used the command.\n• Clicking **Start** sends your chosen message as a reply to that embed every second, for the selected 1–15 minutes.\n• The session can be stopped with the embed's **Stop** button; the bot owner can use **/stop** to stop all active sessions.\n\n**${commands.length}** command(s) registered globally. Discord should show the latest commands without restarting your client.${guildNote}`);
   }
 
   if (sub === 'export-index') {
