@@ -1173,7 +1173,7 @@ const sendfileCmd = new SlashCommandBuilder()
   .addStringOption((o) => o.setName('file').setDescription('Choose a file from your vault').setAutocomplete(true).setRequired(true))
   .addIntegerOption((o) => o.setName('size').setDescription('How long to wait before sending').setMinValue(1).setMaxValue(720).setRequired(true))
   .addStringOption((o) => o.setName('disk').setDescription('M = minutes, H = hours').setRequired(true)
-    .addChoices({ name: 'M (minutes)', value: 'm' }, { name: 'H (hours)', value: 'h' }));
+    .addChoices({ name: 'M', value: 'm' }, { name: 'H', value: 'h' }));
 
 const cancelCmd = common(
   new SlashCommandBuilder()
