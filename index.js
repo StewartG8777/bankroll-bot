@@ -403,6 +403,9 @@ function markMonzoPaid(key, txId, manual = false) {
   saveMonzo();
   if (d) {
     d.paid = true;
+    d.paymentConfirmed = true;
+    d.paymentConfirmedAt = e.paidAt;
+    if (txId) d.txId = txId;
     saveDeliveries();
   }
 }
@@ -1867,8 +1870,10 @@ const onReady = async () => {
       fs.accessSync(DATA_DIR, fs.constants.W_OK);
       if (restoreDone && lastBackupAt && Date.now() - lastBackupAt > 18*60*60*1000) await alertOwner('Backup health warning', new Error('No successful backup has been recorded in over 18 hours.'));
       for (const [key,d] of Object.entries(deliveries)) {
-        if ((d?.paymentConfirmed || d?.paid) && !deliveryRetryTimers.has(key) && !d.deliveryComplete)
-          scheduleDeliveryRetry(key,d.paymentIntentId || null,Math.max(1000,Number(d.nextDeliveryRetryAt || Date.now())-Date.now()));
+        if ((d?.paymentConfirmed || d?.paid) && !deliveryRetryTimers.has(key) && !d.deliveryComplete && Number(d.deliveryAttempts || 0) < 8) {
+          if (d.deliveryError && d.deliveryError.includes('missing from storage') && d.path && fs.existsSync(d.path)) delete d.deliveryError;
+          if (!d.deliveryError) scheduleDeliveryRetry(key,d.paymentIntentId || null,Math.max(1000,Number(d.nextDeliveryRetryAt || Date.now())-Date.now()));
+        }
       }
     } catch (e) { await alertOwner('Bankroll storage health check failed',e); }
   },5*60*1000);
@@ -4061,8 +4066,6 @@ client.on('interactionCreate', async (interaction) => {
 // ---------- Monzo Webhook Listener ----------
 const app = express();
 
-const processedMonzoTx = new Set();
-
 app.post('/monzo-webhook', express.json(), async (req, res) => {
   if (MONZO_WEBHOOK_TOKEN && req.query.token !== MONZO_WEBHOOK_TOKEN) {
     console.error('Monzo webhook rejected: bad or missing token');
@@ -4073,11 +4076,7 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
     const data = req.body?.data;
     if (req.body?.type !== 'transaction.created' || !data) return res.status(200).send('Ignored');
     if (data.id && hasProcessedWebhook(`monzo:${data.id}`)) return res.status(200).send('Duplicate');
-    if (MONZO_ACCOUNT_ID && data.account_id && data.account_id !== MONZO_ACCOUNT_ID) return;
-    if (data.id) {
-      if (processedMonzoTx.has(data.id)) return;
-      processedMonzoTx.add(data.id);
-    }
+    if (MONZO_ACCOUNT_ID && data.account_id && data.account_id !== MONZO_ACCOUNT_ID) return res.status(200).send('Other account');
 
     // If an access token is set, double-check the transaction with Monzo's API (best effort:
     // Monzo tokens expire, so on any failure we fall back to the webhook data).
@@ -4096,7 +4095,7 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
     if (tx.decline_reason) return res.status(200).send('Declined');
 
     const amountPaid = Math.round(Number(tx.amount)) / 100;
-    if (!(amountPaid > 0)) return;
+    if (!(amountPaid > 0)) return res.status(200).send('No incoming amount');
     console.log(`Monzo incoming payment: ${amountPaid}`);
     lastMonzoAt = Date.now();
 
