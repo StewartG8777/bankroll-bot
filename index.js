@@ -980,8 +980,10 @@ async function updateInvoicePaidMessage(d, key, paymentIntentId = null) {
   }
   try {
     const payload = { embeds: [paidEmbed], components: rows };
-    if (live?.interaction && Date.now() - live.at < 24*60*60*1000) await live.interaction.editReply(payload);
-    else await invoice.edit(payload);
+    if (live?.interaction && Date.now() - live.at < 14*60*1000) {
+      try { await live.interaction.editReply(payload); return true; } catch {}
+    }
+    await invoice.edit(payload);
     return true;
   } catch (e) { console.log('Could not update paid invoice embed:', e.message); return false; }
 }
@@ -2183,6 +2185,7 @@ async function sendStripeCheckout(interaction) {
       fileData = { path: item.path, temp: false, name: item.originalName, size: item.size, sha256: item.sha256 };
     }
     const fileSha = fileData ? fileData.sha256 ?? (await sha256File(fileData.path)) : null;
+    if (fileData && fileSha) fileData.sha256 = fileSha;
     if (vaultKey && fileSha && vault[vaultKey] && !vault[vaultKey].sha256) vault[vaultKey].sha256 = fileSha;
 
     const record = {
@@ -2377,6 +2380,11 @@ async function sendMonzoInvoice(interaction) {
         throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
       }
       fileData = { path: item.path, temp: false, name: item.originalName, size: item.size, sha256: item.sha256 };
+    }
+
+    if (fileData) {
+      fileData.sha256 = fileData.sha256 || await sha256File(fileData.path);
+      fileData.size = fileData.size || fs.statSync(fileData.path).size;
     }
 
     const reference = 'BR' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
