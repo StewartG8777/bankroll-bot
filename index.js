@@ -807,6 +807,33 @@ async function sendZipParts(send, filePath, name, limitBytes, intro) {
   }
   return msgs;
 }
+
+// Last resort for a ZIP with one file bigger than the limit: plain byte pieces (name.zip.001, .002 ...)
+// that 7-Zip joins back into the exact original file.
+async function sendRawParts(send, filePath, name, limitBytes, intro) {
+  const size = fs.statSync(filePath).size;
+  const pieceSize = Math.max(1024 * 1024, limitBytes - 64 * 1024);
+  const total = Math.ceil(size / pieceSize);
+  if (total < 2 || total > 30) return null;
+  const msgs = [];
+  for (let i = 0; i < total; i++) {
+    const start = i * pieceSize;
+    const buf = await readChunk(filePath, start, Math.min(pieceSize, size - start));
+    msgs.push(
+      await send(
+        {
+          content:
+            i === 0
+              ? `${intro} It is too big for one Discord upload and one file inside is too big to split, so it comes as ${total} pieces. Put them in one folder, open the .001 piece with 7-Zip and it joins them back into the original file.`
+              : `Piece ${i + 1} of ${total}`,
+          files: [new AttachmentBuilder(buf, { name: `${path.basename(String(name))}.${String(i + 1).padStart(3, '0')}` })],
+        },
+        true
+      )
+    );
+  }
+  return msgs;
+}
 // END backup helpers
 
 // A download link next to the backup parts. It only works while this server instance is running,
@@ -1230,11 +1257,26 @@ async function deliverFile(key, paymentIntentId) {
       return await send(payload());
     } catch (attachmentError) {
       // Same idea as /sendfile: if one big ZIP is refused here, send it as several smaller valid ZIPs.
-      if (!noFile && !dlink && d.path && fs.existsSync(d.path) && isTooBigUpload(attachmentError)) {
+      if (!noFile && !dlink && d.path && fs.existsSync(d.path)) {
         try {
           const limitChannel = await client.channels.fetch(d.channelId).catch(() => null);
-          const parts = await sendZipParts(send, d.path, d.name, uploadLimitBytes(limitChannel), `<@${d.customerId}> payment received. Here is the file for this purchase.`);
-          if (parts) return parts[0];
+          const limit = uploadLimitBytes(limitChannel);
+          const intro = `<@${d.customerId}> payment received. Here is the file for this purchase.`;
+          const parts = (await sendZipParts(send, d.path, d.name, limit, intro)) || (await sendRawParts(send, d.path, d.name, limit, intro));
+          if (parts) {
+            if (BASE_URL) {
+              try {
+                dlink = makeDownloadLink(d, paymentIntentId);
+                hosted = true;
+                d.fallbackLink = dlink;
+                saveDeliveries();
+                await send({ content: `Or get the whole file in one go (works once, expires in 24 hours):\n<${dlink}>` }, true);
+              } catch (linkError) {
+                console.error('Could not add the download link after the parts:', linkError.message);
+              }
+            }
+            return parts[0];
+          }
         } catch (splitError) {
           console.error(`Sending ${d.name} as ZIP parts failed:`, splitError.message);
         }
@@ -4033,10 +4075,27 @@ async function onGetFile(interaction) {
     msg = await interaction.followUp(sendGetFilePayload());
   } catch (attachmentError) {
     console.error('Get my file attachment failed:', attachmentError.message);
-    if (!dlink && d.path && fs.existsSync(d.path) && isTooBigUpload(attachmentError)) {
+    if (!dlink && d.path && fs.existsSync(d.path)) {
       try {
-        const parts = await sendZipParts((p) => interaction.followUp(p), d.path, d.name, uploadLimitBytes(interaction.channel), `<@${d.customerId}> here is the file for this purchase.`);
-        if (parts) { msg = parts[0]; splitDone = true; }
+        const limit = uploadLimitBytes(interaction.channel);
+        const intro = `<@${d.customerId}> here is the file for this purchase.`;
+        const sendP = (p) => interaction.followUp(p);
+        const parts = (await sendZipParts(sendP, d.path, d.name, limit, intro)) || (await sendRawParts(sendP, d.path, d.name, limit, intro));
+        if (parts) {
+          msg = parts[0];
+          splitDone = true;
+          if (BASE_URL) {
+            try {
+              dlink = makeDownloadLink(d, checkPi);
+              hosted = true;
+              d.fallbackLink = dlink;
+              saveDeliveries();
+              await interaction.followUp({ content: `Or get the whole file in one go (valid for 24 hours and one download):\n<${dlink}>` });
+            } catch (linkError) {
+              console.error('Could not add the download link after the parts:', linkError.message);
+            }
+          }
+        }
       } catch (splitError) {
         console.error('Get my file ZIP parts failed:', splitError.message);
       }
@@ -4214,13 +4273,36 @@ async function onScheduledSendButton(interaction) {
     return await finish('sent', 'File sent below.');
   } catch (uploadError) {
     console.error('Scheduled ZIP upload failed; trying link fallback:', uploadError.message);
-    if (isTooBigUpload(uploadError)) {
-      try {
-        const parts = await sendZipParts((p) => interaction.followUp({ ...p, allowedMentions: { parse: [] } }), item.path, job.originalName, uploadLimitBytes(interaction.channel), `**${job.originalName}** - scheduled delivery complete.`);
-        if (parts) return await finish('sent', `File sent below as ${parts.length} ZIP parts.`);
-      } catch (splitError) {
-        console.error('Scheduled ZIP parts failed:', splitError.message);
+    const limit = uploadLimitBytes(interaction.channel);
+    const sendP = (p) => interaction.followUp({ ...p, allowedMentions: { parse: [] } });
+    const intro = `**${job.originalName}** - scheduled delivery complete.`;
+    let kind = '';
+    try {
+      const zp = await sendZipParts(sendP, item.path, job.originalName, limit, intro);
+      if (zp) {
+        kind = `${zp.length} ZIP parts`;
+      } else {
+        const rp = await sendRawParts(sendP, item.path, job.originalName, limit, intro);
+        if (rp) kind = `${rp.length} pieces (.001, .002...)`;
       }
+    } catch (splitError) {
+      console.error('Scheduled split delivery failed:', splitError.message);
+    }
+    if (kind) {
+      let linkNote = '';
+      const rel = relData(item.path);
+      if (BASE_URL && rel) {
+        try {
+          await interaction.followUp({
+            content: `Or download the whole file in one go: ${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`,
+            allowedMentions: { parse: [] },
+          });
+          linkNote = ' The full download link is below too.';
+        } catch (linkError) {
+          console.error('Could not send the download link after the parts:', linkError.message);
+        }
+      }
+      return await finish('sent', `File sent below as ${kind}.${linkNote}`);
     }
   }
 
