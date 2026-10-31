@@ -1441,9 +1441,10 @@ const spamCmd = common(
     .addSubcommand((sub) => sub.setName('start').setDescription('Send a DM request with your chosen message')
       .addUserOption((o) => o.setName('user').setDescription('Person receiving the messages').setRequired(true))
       .addStringOption((o) => o.setName('message').setDescription('Text or emoji to repeat').setMaxLength(1800).setRequired(true))
-      .addIntegerOption((o) => o.setName('interval').setDescription('Seconds between messages (minimum 60)').setMinValue(60).setMaxValue(3600).setRequired(true))
-      .addIntegerOption((o) => o.setName('duration').setDescription('Duration in minutes (maximum 15)').setMinValue(1).setMaxValue(15).setRequired(true)))
-    .addSubcommand((sub) => sub.setName('stop').setDescription('Stop your active message sessions'))
+      .addIntegerOption((o) => o.setName('duration').setDescription('Duration in minutes (1–15)').setMinValue(1).setMaxValue(15).setRequired(true)))
+);
+const stopSpamCmd = common(
+  new SlashCommandBuilder().setName('stop').setDescription('Owner: stop every active spam session')
 );
 const remindCmd = common(
   new SlashCommandBuilder()
@@ -1618,7 +1619,7 @@ const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription(
   .addUserOption((o) => o.setName('user').setDescription('Customer whose Bankroll records should be wiped').setRequired(true))
   .addStringOption((o) => o.setName('confirm').setDescription('Type WIPE to confirm this permanent action').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' })));
 
-const commands = [spamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
+const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -4773,12 +4774,11 @@ async function cmdSpam(interaction) {
 
   const target = interaction.options.getUser('user', true);
   const message = interaction.options.getString('message', true);
-  const intervalSeconds = interaction.options.getInteger('interval', true);
   const durationMinutes = interaction.options.getInteger('duration', true);
   if (target.bot || target.id === interaction.user.id) return interaction.reply({ content: 'Choose another person, not a bot or yourself.', ephemeral: true });
 
   const requestId = crypto.randomBytes(8).toString('hex');
-  const request = { ownerId: interaction.user.id, targetId: target.id, message, intervalSeconds, durationMinutes, expiresAt: Date.now() + 10 * 60 * 1000 };
+  const request = { ownerId: interaction.user.id, targetId: target.id, message, durationMinutes, expiresAt: Date.now() + 10 * 60 * 1000 };
   spamRequests.set(requestId, request);
   const expiry = setTimeout(() => spamRequests.delete(requestId), 10 * 60 * 1000);
   expiry.unref?.();
@@ -4793,7 +4793,6 @@ async function cmdSpam(interaction) {
         .setDescription('<@' + interaction.user.id + '> wants to send you a repeated message.')
         .addFields(
           { name: 'Message', value: message.slice(0, 1024) },
-          { name: 'Interval', value: intervalSeconds + ' seconds', inline: true },
           { name: 'Duration', value: durationMinutes + ' minute(s)', inline: true }
         )
         .setFooter({ text: 'Nothing will be sent unless you press Start.' })],
@@ -4826,7 +4825,7 @@ async function handleSpamConsent(interaction) {
     sourceMessage: interaction.message,
     message: request.message,
     endAt: Date.now() + request.durationMinutes * 60000,
-    intervalMs: request.intervalSeconds * 1000,
+    intervalMs: 1000,
     sent: 0,
     timeout: null
   };
@@ -4836,7 +4835,7 @@ async function handleSpamConsent(interaction) {
     embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Spam initiated')
       .setDescription('The message below will be posted as replies to this embed.')
       .addFields({ name: 'Repeated message', value: request.message.slice(0, 1024) })
-      .setFooter({ text: 'Maximum 15 messages; press Stop reminders to end early.' })],
+      .setFooter({ text: 'Sends once per second for the agreed duration. You can stop it at any time.' })],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('spam:stop:' + sessionId).setLabel('Stop').setStyle(ButtonStyle.Danger)
     )]
@@ -4844,7 +4843,7 @@ async function handleSpamConsent(interaction) {
 
   const sendNext = async () => {
     if (!spamSessions.has(sessionId)) return;
-    if (Date.now() >= session.endAt || session.sent >= 15) {
+    if (Date.now() >= session.endAt) {
       spamSessions.delete(sessionId);
       await session.sourceMessage.reply({ content: 'Message session finished.', allowedMentions: { parse: [] } }).catch(() => {});
       return;
@@ -4857,7 +4856,7 @@ async function handleSpamConsent(interaction) {
       console.error('Timed message reply failed:', error.message);
       return;
     }
-    if (session.sent >= 15 || Date.now() >= session.endAt) {
+    if (Date.now() >= session.endAt) {
       spamSessions.delete(sessionId);
       return;
     }
@@ -4938,6 +4937,20 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdRemind(interaction);
       case 'spam':
         return await cmdSpam(interaction);
+      case 'stop':
+        if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'Only the bot owner can stop all spam sessions.', ephemeral: true });
+        {
+          const active = [...spamSessions.entries()];
+          for (const [id, session] of active) {
+            clearTimeout(session.timeout);
+            spamSessions.delete(id);
+            await session.sourceMessage.reply({ content: 'The owner stopped this message session.', allowedMentions: { parse: [] } }).catch(() => {});
+          }
+          for (const [id, request] of spamRequests.entries()) {
+            spamRequests.delete(id);
+          }
+          return interaction.reply({ content: 'Stopped ' + active.length + ' active spam session(s) and cleared pending requests.', ephemeral: true });
+        }
       case 'restore':
         await interaction.deferReply({ ephemeral: true });
         return await cmdRestore(interaction);
