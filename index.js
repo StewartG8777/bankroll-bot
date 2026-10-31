@@ -1399,13 +1399,19 @@ const sendfileCmd = new SlashCommandBuilder()
 const cancelCmd = common(
   new SlashCommandBuilder()
     .setName('cancel')
-    .setDescription('Cancel and expire an open invoice or checkout session')
+    .setDescription('Cancel an unpaid invoice or inspect a recent purchase')
     .addStringOption((o) =>
       o
         .setName('order')
-        .setDescription('Pick an open invoice/checkout, or paste a Checkout ID (cs_...)')
+        .setDescription('Choose from the 50 most recent purchases or paste an order/reference ID')
         .setAutocomplete(true)
         .setRequired(true)
+    )
+    .addIntegerOption((o) =>
+      o
+        .setName('page')
+        .setDescription('Browse the newest 25 (page 1) or previous 25 (page 2)')
+        .addChoices({ name: '1 - Newest 25', value: 1 }, { name: '2 - Previous 25', value: 2 })
     )
 );
 
@@ -3117,23 +3123,63 @@ async function cmdCancel(interaction) {
   if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ flags: 64 });
   const input = String(interaction.options.getString('order') || '').trim();
 
-  if (input.startsWith('monzo_')) {
-    const ledgerEntry = Object.entries(monzoLedger).find(([key, entry]) => key === input || entry.key === input);
-    const ledgerKey = ledgerEntry?.[0] || input;
-    const e = ledgerEntry?.[1] || monzoLedger[input];
-    if (!e) return interaction.editReply('I could not find that Monzo invoice.');
-    if (e.status !== 'open') return interaction.editReply(`That Monzo invoice is already ${e.status} (cannot be cancelled).`);
+  // Accept internal Monzo IDs and the human-readable payment reference (e.g. MONZO-6825).
+  const monzoMatch = Object.entries(monzoLedger).find(([key, entry]) =>
+    String(key).toLowerCase() === input.toLowerCase() ||
+    String(entry?.key || '').toLowerCase() === input.toLowerCase() ||
+    String(entry?.reference || '').toLowerCase() === input.toLowerCase()
+  );
+
+  if (monzoMatch) {
+    const [ledgerKey, e] = monzoMatch;
+    const delivery = deliveries[ledgerKey];
+    const currentStatus = String(e.status || (delivery?.paid ? 'paid' : 'open')).toLowerCase();
+    if (currentStatus === 'paid' || delivery?.paid || delivery?.paymentConfirmed) {
+      return interaction.editReply('This Monzo purchase is already PAID. It cannot be cancelled; Monzo payments must be refunded through Monzo.');
+    }
+    if (currentStatus !== 'open') {
+      return interaction.editReply(`This Monzo invoice is already ${currentStatus.toUpperCase()} and cannot be cancelled.`);
+    }
+
     e.status = 'cancelled';
     e.cancelledAt = Date.now();
     e.cancelledBy = interaction.user.id;
     saveMonzo();
+
+    // Update the original invoice and remove its old payment/download buttons.
+    try {
+      const invoice = delivery
+        ? await getInvoiceMessage(delivery, ledgerKey)
+        : await findInvoiceMessage(e.channelId, ledgerKey);
+      if (invoice?.embeds?.[0]) {
+        const previous = invoice.embeds[0];
+        const fields = (previous.fields || []).filter((field) =>
+          !['payment status', 'cancelled at', 'cancelled by'].includes(String(field.name || '').toLowerCase())
+        );
+        const oldTitle = String(previous.title || 'Monzo Invoice').replace(/^(?:PAID|CANCELLED|EXPIRED)\s*[|:-]\s*/i, '');
+        const cancelledEmbed = EmbedBuilder.from(previous)
+          .setColor(GREY)
+          .setTitle(`CANCELLED | ${oldTitle}`)
+          .setDescription('This invoice has been cancelled. It is no longer payable through this Bankroll invoice.')
+          .setFields(fields)
+          .addFields(
+            { name: 'Payment Status', value: 'CANCELLED', inline: true },
+            { name: 'Cancelled At', value: `<t:${tsec(e.cancelledAt)}:F>`, inline: true },
+            { name: 'Cancelled By', value: `<@${interaction.user.id}>`, inline: true }
+          );
+        await invoice.edit({ embeds: [cancelledEmbed], components: [] });
+      }
+    } catch (updateError) {
+      console.error('Could not update cancelled Monzo invoice message:', updateError);
+    }
+
     const hadPending = discardPending(ledgerKey);
     const embed = new EmbedBuilder()
       .setColor(GREY)
-      .setTitle('Monzo Invoice Cancelled / Removed')
+      .setTitle('Monzo Invoice Cancelled')
       .addFields(
         { name: 'Reference', value: String(e.reference || ledgerKey || 'Not recorded'), inline: true },
-        { name: 'Description', value: short(e.description || 'Monzo invoice', 100), inline: true },
+        { name: 'Description', value: short(String(e.description || 'Monzo invoice'), 100), inline: true },
         { name: 'Amount', value: money(Number(e.amount || 0), e.currency || 'gbp'), inline: true },
         { name: 'Pending File/Link Cleaned', value: hadPending ? 'Yes' : 'None attached', inline: true },
         { name: 'Cancelled By', value: `<@${interaction.user.id}>`, inline: true }
@@ -3145,30 +3191,34 @@ async function cmdCancel(interaction) {
   }
 
   if (!input.startsWith('cs_')) {
-    return interaction.editReply('Please pick an invoice from the list, or paste a Checkout ID starting with `cs_...`.');
+    return interaction.editReply('Choose a purchase from autocomplete, or paste a Monzo reference (e.g. MONZO-6825) or Stripe Checkout ID (cs_...).');
   }
 
   try {
     const session = await stripe.checkout.sessions.retrieve(input);
+    if (session.status === 'complete' || session.payment_status === 'paid') {
+      return interaction.editReply('This Stripe purchase is already PAID. It cannot be cancelled. Use /refund to issue an eligible refund.');
+    }
+    if (session.status === 'expired') {
+      return interaction.editReply('This Stripe checkout has already EXPIRED; there is nothing left to cancel.');
+    }
     if (session.status !== 'open') {
-      return interaction.editReply(`That checkout session is already ${session.status} (cannot be cancelled).`);
+      return interaction.editReply(`This checkout is ${String(session.status || 'not open').toUpperCase()} and cannot be cancelled.`);
     }
 
     await stripe.checkout.sessions.expire(input);
     const hadPending = discardPending(input);
-
     const embed = new EmbedBuilder()
       .setColor(GREY)
-      .setTitle('Invoice Cancelled / Removed')
+      .setTitle('Invoice Cancelled')
       .addFields(
         { name: 'Checkout ID', value: input, inline: true },
-        { name: 'Description', value: short(session.metadata?.description, 100), inline: true },
-        { name: 'Amount', value: money((session.amount_total ?? 0) / 100, session.currency), inline: true },
+        { name: 'Description', value: short(String(session.metadata?.description || 'Stripe checkout'), 100), inline: true },
+        { name: 'Amount', value: money((session.amount_total ?? 0) / 100, session.currency || CURRENCY), inline: true },
         { name: 'Pending File/Link Cleaned', value: hadPending ? 'Yes' : 'None attached', inline: true },
         { name: 'Cancelled By', value: `<@${interaction.user.id}>`, inline: true }
       )
       .setTimestamp();
-
     await interaction.editReply({ embeds: [embed] });
     await logToServer({ embeds: [embed] });
   } catch (err) {
@@ -4125,30 +4175,61 @@ async function onAutocomplete(interaction) {
       return await interaction.respond(choices);
     }
 
-    // Cancel command autocomplete for open checkout sessions / invoices
+    // /cancel: browse the 50 most recent purchases (25 per page), including paid and unpaid.
     if (interaction.commandName === 'cancel') {
-      const typed = interaction.options.getFocused().toLowerCase();
-      let sessions = { data: [] };
-      try {
-        sessions = await stripe.checkout.sessions.list({ limit: 50, status: 'open' });
-      } catch (e) {
-        console.error('Stripe cancel autocomplete failed:', e.message);
+      const typed = String(interaction.options.getFocused() || '').toLowerCase();
+      const page = interaction.options.getInteger('page') || 1;
+      const [openResult, completeResult, expiredResult] = await Promise.allSettled([
+        stripe.checkout.sessions.list({ limit: 100, status: 'open' }),
+        stripe.checkout.sessions.list({ limit: 100, status: 'complete' }),
+        stripe.checkout.sessions.list({ limit: 100, status: 'expired' }),
+      ]);
+      const sessions = [];
+      for (const [label, result] of [['open', openResult], ['complete', completeResult], ['expired', expiredResult]]) {
+        if (result.status === 'fulfilled') {
+          sessions.push(...result.value.data.map((session) => ({ ...session, _listStatus: label })));
+        } else {
+          console.error(`Stripe /cancel ${label} purchase lookup failed:`, result.reason?.message || result.reason);
+        }
       }
-      const card = sessions.data
-        .filter((s) => s.metadata?.agent_id)
-        .filter((s) => !typed || `${s.metadata.description} ${s.id}`.toLowerCase().includes(typed))
-        .map((s) => ({
-          name: `[Card] ${money((s.amount_total ?? 0) / 100, s.currency)} - ${short(s.metadata.description, 50)} - ID: ${s.id}`.slice(0, 100),
-          value: s.id,
-        }));
-      const monzo = Object.entries(monzoLedger)
-        .filter(([key, m]) => m.status === 'open' && Date.now() < (m.expiresAt ?? m.createdAt + MONZO_OPEN_MS))
-        .filter(([key, m]) => !typed || `${m.description ?? ''} ${m.reference ?? ''} ${key}`.toLowerCase().includes(typed))
-        .map(([key, m]) => ({
-          name: `[Monzo] ${money(m.amount ?? 0, m.currency || 'gbp')} - ${short(m.description || m.reference || 'Monzo invoice', 50)} - ${m.reference || key}`.slice(0, 100),
+
+      const card = sessions
+        .filter((session) => session.metadata?.agent_id)
+        .map((session) => {
+          const status = session._listStatus === 'open'
+            ? 'UNPAID'
+            : session._listStatus === 'expired'
+              ? 'EXPIRED'
+              : session.payment_status === 'paid' || session.payment_status === 'no_payment_required'
+                ? 'PAID'
+                : 'UNPAID';
+          return {
+            at: Number(session.created || 0) * 1000,
+            value: session.id,
+            search: `${session.metadata?.description || ''} ${session.id} ${session.metadata?.customer_id || ''}`.toLowerCase(),
+            name: `[Card] [${status}] ${money((session.amount_total ?? 0) / 100, session.currency || CURRENCY)} - ${short(String(session.metadata?.description || 'Purchase'), 32)} - ${session.id}`.slice(0, 100),
+          };
+        });
+
+      const monzo = Object.entries(monzoLedger).map(([key, entry]) => {
+        const delivery = deliveries[key];
+        let status = String(entry.status || (delivery?.paid ? 'paid' : 'open')).toLowerCase();
+        if (status === 'open' && Date.now() >= (entry.expiresAt ?? (entry.createdAt || Date.now()) + MONZO_OPEN_MS)) status = 'expired';
+        const displayStatus = status === 'paid' ? 'PAID' : status === 'open' ? 'UNPAID' : status.toUpperCase();
+        return {
+          at: Number(entry.paidAt || entry.cancelledAt || entry.createdAt || delivery?.savedAt || 0),
           value: key,
-        }));
-      return await interaction.respond([...monzo, ...card].slice(0, 25));
+          search: `${entry.description || ''} ${entry.reference || ''} ${key} ${entry.customerId || ''}`.toLowerCase(),
+          name: `[Monzo] [${displayStatus}] ${money(Number(entry.amount || 0), entry.currency || 'gbp')} - ${short(String(entry.description || 'Purchase'), 24)} - ${entry.reference || key}`.slice(0, 100),
+        };
+      });
+
+      const purchases = [...monzo, ...card]
+        .filter((purchase) => !typed || purchase.search.includes(typed) || purchase.name.toLowerCase().includes(typed))
+        .sort((a, b) => b.at - a.at)
+        .slice(0, 50);
+      const pageItems = purchases.slice((page - 1) * 25, page * 25);
+      return await interaction.respond(pageItems.map(({ name, value }) => ({ name, value })));
     }
 
     if (interaction.commandName !== 'refund' || interaction.user.id !== OWNER_ID) {
