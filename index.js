@@ -285,8 +285,10 @@ const FILES_DIR = path.join(DATA_DIR, 'files');
 const DELIVERIES_FILE = path.join(DATA_DIR, 'deliveries.json');
 const MONZO_FILE = path.join(DATA_DIR, 'monzo_payments.json');
 const WEBHOOK_EVENTS_FILE = path.join(DATA_DIR, 'webhook_events.json');
+const WIPED_CUSTOMERS_FILE = path.join(DATA_DIR, 'wiped_customers.json');
 let processedWebhookEvents = {};
 try { processedWebhookEvents = JSON.parse(fs.readFileSync(WEBHOOK_EVENTS_FILE, 'utf8')); } catch {}
+    try { const ids = JSON.parse(fs.readFileSync(WIPED_CUSTOMERS_FILE, 'utf8')); if (Array.isArray(ids)) wipedCustomers = new Set(ids.map(String)); } catch {}
 function hasProcessedWebhook(id) { return !!(id && processedWebhookEvents[id]); }
 function markWebhookProcessed(id, type) {
   if (!id) return;
@@ -389,9 +391,10 @@ function scheduleBackup() {
 
 // Monzo ledger: every Monzo invoice (open / paid / cancelled / expired) so history and totals survive.
 let monzoLedger = {};
-try {
-  monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8'));
-} catch {}
+try { monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8')); } catch {}
+let wipedCustomers = new Set();
+try { const ids = JSON.parse(fs.readFileSync(WIPED_CUSTOMERS_FILE, 'utf8')); if (Array.isArray(ids)) wipedCustomers = new Set(ids.map(String)); } catch {}
+function saveWipedCustomers() { atomicWrite(WIPED_CUSTOMERS_FILE, JSON.stringify([...wipedCustomers], null, 2)); }
 const saveMonzo = () => {
   try {
     atomicWrite(MONZO_FILE, JSON.stringify(monzoLedger));
@@ -867,7 +870,7 @@ async function backupDataOnce() {
   }
 
   try {
-    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json'];
+    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json'];
     const files = [];
     for (const name of jsonNames) {
       const fp = path.join(DATA_DIR, name);
@@ -1584,7 +1587,11 @@ const deliveryCmd = common(new SlashCommandBuilder().setName('delivery').setDesc
   .addSubcommand((sub) => sub.setName('status').setDescription('Check a payment order delivery status').addStringOption((o) => o.setName('order').setDescription('Checkout session ID or Monzo invoice ID').setRequired(true)))
   .addSubcommand((sub) => sub.setName('resend').setDescription('Resend a paid customer file without charging again').addStringOption((o) => o.setName('order').setDescription('Checkout session ID or Monzo invoice ID').setRequired(true))));
 
-const commands = [spamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd];
+const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription('Remove a customer from Bankroll transaction records and logs (owner only)')
+  .addUserOption((o) => o.setName('user').setDescription('Customer whose Bankroll records should be wiped').setRequired(true))
+  .addStringOption((o) => o.setName('confirm').setDescription('Type WIPE to confirm this permanent action').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' })));
+
+const commands = [spamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -1633,9 +1640,10 @@ async function autoRestoreOnStartup() {
       'scheduled_sends.json': SEND_JOBS_FILE,
       'webhook_events.json': WEBHOOK_EVENTS_FILE,
       'presence.json': PRESENCE_FILE,
+      'wiped_customers.json': WIPED_CUSTOMERS_FILE,
     };
     const isValidJsonFor = (name, value) => {
-      if (name === 'notifications.json' || name === 'download_history.json') return Array.isArray(value);
+      if (name === 'notifications.json' || name === 'download_history.json' || name === 'wiped_customers.json') return Array.isArray(value);
       return !!value && typeof value === 'object' && !Array.isArray(value);
     };
     const localNeedsRestore = (name, fp) => {
@@ -3105,12 +3113,9 @@ async function cmdVault(interaction) {
 
 // ---------- /cancel ----------
 async function cmdCancel(interaction) {
-  if (!allowed.has(interaction.user.id)) {
-    return interaction.reply({ content: 'Only authorized users can cancel invoices.', ephemeral: true });
-  }
-  await interaction.deferReply({ ephemeral: true });
-
-  const input = interaction.options.getString('order').trim();
+  if (!allowed.has(interaction.user.id)) return interaction.reply({ content: 'Only authorized users can cancel invoices.', flags: 64 });
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ flags: 64 });
+  const input = String(interaction.options.getString('order') || '').trim();
 
   if (input.startsWith('monzo_')) {
     const ledgerEntry = Object.entries(monzoLedger).find(([key, entry]) => key === input || entry.key === input);
@@ -3127,9 +3132,9 @@ async function cmdCancel(interaction) {
       .setColor(GREY)
       .setTitle('Monzo Invoice Cancelled / Removed')
       .addFields(
-        { name: 'Reference', value: e.reference, inline: true },
-        { name: 'Description', value: short(e.description, 100), inline: true },
-        { name: 'Amount', value: money(e.amount, e.currency), inline: true },
+        { name: 'Reference', value: String(e.reference || ledgerKey || 'Not recorded'), inline: true },
+        { name: 'Description', value: short(e.description || 'Monzo invoice', 100), inline: true },
+        { name: 'Amount', value: money(Number(e.amount || 0), e.currency || 'gbp'), inline: true },
         { name: 'Pending File/Link Cleaned', value: hadPending ? 'Yes' : 'None attached', inline: true },
         { name: 'Cancelled By', value: `<@${interaction.user.id}>`, inline: true }
       )
@@ -3168,7 +3173,8 @@ async function cmdCancel(interaction) {
     await logToServer({ embeds: [embed] });
   } catch (err) {
     console.error('Cancel failed:', err);
-    await interaction.editReply(`Failed to cancel invoice: ${err.message}`);
+    if (interaction.deferred || interaction.replied) await interaction.editReply({ content: `Failed to cancel invoice: ${err.message}`, embeds: [] }).catch(() => {});
+    else await interaction.reply({ content: `Failed to cancel invoice: ${err.message}`, flags: 64 }).catch(() => {});
   }
 }
 
@@ -3540,7 +3546,7 @@ async function succeededPayments(sinceUnix) {
   const params = { limit: 100, expand: ['data.latest_charge.balance_transaction'] };
   if (sinceUnix) params.created = { gte: sinceUnix };
   const all = await stripe.paymentIntents.list(params).autoPagingToArray({ limit: 2000 });
-  return all.filter((pi) => pi.status === 'succeeded' && pi.metadata?.agent_id);
+  return all.filter((pi) => pi.status === 'succeeded' && pi.metadata?.agent_id && !wipedCustomers.has(String(pi.metadata?.customer_id || '')));
 }
 
 async function cmdPayments(interaction) {
@@ -3771,7 +3777,7 @@ async function onCustomerPreviewSelect(interaction) {
   let sessions = [];
   try {
     sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 });
-    sessions = sessions.filter((x) => String(x.metadata?.customer_id || '') === customerId);
+    sessions = sessions.filter((x) => String(x.metadata?.customer_id || '') === customerId && !wipedCustomers.has(String(x.metadata?.customer_id || '')));
   } catch (e) { console.error('Customer preview session lookup failed:', e.message); }
   const localOrders = Object.entries(deliveries).filter(([, d]) => String(d?.customerId || '') === customerId);
   const monzo = Object.entries(monzoLedger).filter(([, m]) => String(m?.customerId || '') === customerId);
@@ -3840,6 +3846,102 @@ async function cmdDelivery(interaction) {
     : 'The resend attempt did not complete. The paid order remains saved for recovery.');
 }
 
+async function cmdWipe(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can wipe customer records.');
+  const user = interaction.options.getUser('user', true);
+  if (user.bot) return interaction.editReply('Choose a real customer account, not a bot.');
+  if (interaction.options.getString('confirm') !== 'WIPE') return interaction.editReply('Wipe cancelled. Choose WIPE to confirm.');
+
+  const id = String(user.id);
+  let monzoCount = 0, deliveryCount = 0, downloadCount = 0, historyCount = 0, logCount = 0;
+  const removedDeliveryKeys = Object.entries(deliveries).filter(([, d]) => String(d?.customerId || '') === id).map(([key]) => key);
+  const removedDownloadTokens = Object.entries(downloads).filter(([, d]) => !d?.backupDownload && String(d?.customerId || '') === id).map(([token]) => token);
+  const removedDownloadPaths = removedDownloadTokens.map((token) => downloads[token]?.path).filter(Boolean);
+
+  for (const key of removedDeliveryKeys) {
+    const timer = deliveryRetryTimers.get(key);
+    if (timer) clearTimeout(timer);
+    deliveryRetryTimers.delete(key);
+    liveInteractions.delete(key);
+    delete deliveries[key];
+    deliveryCount++;
+  }
+  for (const key of Object.keys(monzoLedger)) {
+    if (String(monzoLedger[key]?.customerId || '') !== id) continue;
+    for (const pct of CHECKIN_PCTS) {
+      const timerKey = key + ':' + pct;
+      const timer = monzoReminderTimers.get(timerKey);
+      if (timer) clearTimeout(timer);
+      monzoReminderTimers.delete(timerKey);
+    }
+    delete monzoLedger[key];
+    monzoCount++;
+  }
+  for (const token of removedDownloadTokens) { delete downloads[token]; downloadCount++; }
+  const oldHistoryLength = downloadHistory.length;
+  downloadHistory = downloadHistory.filter((entry) => String(entry?.customerId || '') !== id);
+  historyCount = oldHistoryLength - downloadHistory.length;
+
+  const referencedPaths = new Set([
+    ...Object.values(vault).map((v) => path.resolve(String(v?.path || ''))),
+    ...Object.values(deliveries).map((d) => path.resolve(String(d?.path || ''))),
+    ...Object.values(downloads).map((d) => path.resolve(String(d?.path || ''))),
+  ]);
+  for (const oldPath of removedDownloadPaths) {
+    const resolved = path.resolve(String(oldPath));
+    if (resolved.startsWith(path.resolve(FILES_DIR) + path.sep) && !referencedPaths.has(resolved)) {
+      try { await fs.promises.unlink(resolved); } catch {}
+    }
+  }
+
+  wipedCustomers.add(id);
+  saveWipedCustomers();
+  saveMonzo();
+  saveDeliveries();
+  saveDownloads();
+  atomicWrite(DOWNLOAD_HISTORY_FILE, JSON.stringify(downloadHistory, null, 2));
+
+  // Remove only Bankroll-authored log messages that contain the selected customer's ID.
+  try {
+    const channel = await getLogChannel();
+    if (channel?.messages?.fetch) {
+      let before;
+      for (let page = 0; page < 10; page++) {
+        const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+        if (!batch.size) break;
+        for (const message of batch.values()) {
+          if (message.author?.id !== client.user.id) continue;
+          const parts = [message.content || '', ...message.embeds.flatMap((e) => [
+            e.title || '', e.description || '', e.footer?.text || '',
+            ...(e.fields || []).flatMap((field) => [field.name || '', field.value || '']),
+          ])];
+          const body = parts.join(' ');
+          if (body.includes(id) || body.includes('<@' + id + '>') || body.includes('<@!' + id + '>')) {
+            if (await message.delete().then(() => true).catch(() => false)) logCount++;
+          }
+        }
+        before = batch.last()?.id;
+        if (batch.size < 100) break;
+      }
+    }
+  } catch (error) { console.error('Customer log cleanup failed:', error.message); }
+
+  recordNotification('customer.wipe', 'Customer records wiped',
+    'Removed Bankroll-local Monzo, delivery, download and audit records for customer ' + id + '. Provider-side payment records are not deleted.', 'warning');
+  await backupData();
+  return interaction.editReply([
+    '**Customer records wiped**',
+    'Customer: <@' + id + '> (' + id + ')',
+    'Monzo records removed: **' + monzoCount + '**',
+    'Delivery/order records removed: **' + deliveryCount + '**',
+    'Download links removed: **' + downloadCount + '**',
+    'Download history entries removed: **' + historyCount + '**',
+    'Bot-authored log messages deleted: **' + logCount + '**',
+    '',
+    'Their card payments are now hidden from Bankroll reports. Actual Stripe payments and Monzo bank statements remain unchanged.',
+  ].join('\n'), { allowedMentions: { users: [id] } });
+}
+
 async function cmdCustomer(interaction) {
   const user = interaction.options.getUser('user');
   let card = [];
@@ -3848,11 +3950,11 @@ async function cmdCustomer(interaction) {
       query: `status:'succeeded' AND metadata['customer_id']:'${user.id}'`,
       limit: 100,
     });
-    card = res.data;
+    card = res.data.filter((pi) => !wipedCustomers.has(String(pi.metadata?.customer_id || '')));
   } catch (e) {
     console.error('Stripe customer lookup failed:', e.message);
   }
-  const monzo = monzoPaid().filter((m) => m.customerId === user.id);
+  const monzo = monzoPaid().filter((m) => m.customerId === user.id && !wipedCustomers.has(String(m.customerId || '')));
   const deliveryState = (d) => !d ? 'delivery record unavailable' : d.deliveryComplete ? 'delivered' : d.deliveryError ? 'delivery needs attention' : 'delivery pending';
   const all = [
     ...card.map((pi) => {
@@ -3883,7 +3985,7 @@ async function cmdHistory(interaction) {
   let card = [];
   try {
     const sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 });
-    card = sessions.filter((s) => s.metadata?.customer_id === user.id);
+    card = sessions.filter((s) => s.metadata?.customer_id === user.id && !wipedCustomers.has(String(s.metadata?.customer_id || '')));
   } catch (e) {
     console.error('Stripe history lookup failed:', e.message);
   }
@@ -4061,10 +4163,12 @@ async function onAutocomplete(interaction) {
       }));
     await interaction.respond(choices);
   } catch (e) {
-    console.error('Autocomplete failed:', e.message);
-    try {
-      await interaction.respond([]);
-    } catch {}
+    if (!interaction.responded) {
+      console.error('Autocomplete failed:', e.message);
+      try { await interaction.respond([]); } catch (responseError) {
+        if (!/already been acknowledged|already responded/i.test(responseError.message)) console.error('Autocomplete fallback response failed:', responseError.message);
+      }
+    }
   }
 }
 
@@ -4707,6 +4811,9 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdDelivery(interaction);
       case 'cancel':
         return await cmdCancel(interaction);
+      case 'wipe':
+        await interaction.deferReply({ flags: 64 });
+        return await cmdWipe(interaction);
       case 'remind':
         return await cmdRemind(interaction);
       case 'spam':
@@ -4742,12 +4849,12 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.commandName === 'preview') return await cmdCustomerPreview(interaction);
     }
   } catch (err) {
-    alertOwner(`/${interaction.commandName ?? interaction.customId?.split(':')[0]} failed`, err);
+    void alertOwner(`/${interaction.commandName ?? interaction.customId?.split(':')[0]} failed`, err);
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content: `Something went wrong: ${err.message}` });
       } else {
-        await interaction.reply({ content: `Something went wrong: ${err.message}`, ephemeral: true });
+        await interaction.reply({ content: `Something went wrong: ${err.message}`, flags: 64 });
       }
     } catch {}
   }
@@ -4797,7 +4904,7 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
     }
     if (tx.decline_reason) return res.status(200).send('Declined');
 
-    const amountPaid = Math.round(Number(tx.amount)) / 100;
+    const amountPaid = Math.round(Number(tx.amount ?? data.amount ?? 0)) / 100;
     if (!(amountPaid > 0)) return res.status(200).send('No incoming amount');
     console.log(`Monzo incoming payment: ${amountPaid}`);
     lastMonzoAt = Date.now();
@@ -4828,8 +4935,8 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
           { name: 'Amount Paid', value: money(amountPaid, 'gbp'), inline: true },
           { name: 'Payment Status', value: 'PAID', inline: true },
           { name: 'Paid At', value: `<t:${Math.floor(Date.now()/1000)}:F>`, inline: true },
-          { name: 'Payment reference', value: d.reference ? `\`${d.reference}\`` : 'None', inline: true },
-          { name: 'Transaction ID', value: String(data.id ?? 'Unknown') }
+          { name: 'Payment reference', value: String(d.reference || key || 'Not recorded'), inline: true },
+          { name: 'Transaction ID', value: String(tx.id || data.id || key || 'Not supplied by Monzo') }
         );
       await notifyOwner({ embeds: [paidEmbed] });
 
