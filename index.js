@@ -1457,6 +1457,7 @@ const botAdminCmd = common(
     .setName('bot')
     .setDescription('Owner controls for the Bankroll bot')
     .addSubcommand((sub) => sub.setName('export-index').setDescription('Send the currently running index.js file privately'))
+    .addSubcommand((sub) => sub.setName('refresh-commands').setDescription('Refresh all Discord slash commands immediately'))
     .addSubcommand((sub) => sub.setName('redeploy').setDescription('Trigger a new deployment from the latest GitHub commit on Render'))
     .addSubcommand((sub) => sub.setName('restart').setDescription('Restart the running Render service'))
     .addSubcommand((sub) => sub.setName('avatar').setDescription('Change the bot profile picture').addAttachmentOption((o) => o.setName('image').setDescription('PNG, JPG or GIF image').setRequired(true)))
@@ -3501,6 +3502,19 @@ async function cmdTotal(interaction) {
 async function cmdBotAdmin(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can use these controls.');
   const sub = interaction.options.getSubcommand();
+
+  if (sub === 'refresh-commands') {
+    await client.application.commands.set(commands.map((c) => c.toJSON()));
+    let guildNote = '';
+    if (DISCORD_GUILD_ID) {
+      const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
+      if (guild) {
+        await guild.commands.set([]);
+        guildNote = '\\nRemoved old server-only command copies.';
+      }
+    }
+    return interaction.editReply(`Slash commands refreshed successfully: **${commands.length}** command(s) registered globally. Discord should show the latest commands without restarting your client.${guildNote}`);
+  }
 
   if (sub === 'export-index') {
     const indexPath = path.join(__dirname, 'index.js');
