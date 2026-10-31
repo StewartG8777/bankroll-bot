@@ -3578,6 +3578,13 @@ async function onGetFile(interaction) {
     }
   }
 
+  if (d.path && fs.existsSync(d.path)) {
+    try { verifyZipIntegrity(d.path); }
+    catch (e) {
+      recordDownloadEvent('verification_failed', { file: d.name, customerId: d.customerId, agentId: d.agentId, detail: e.message });
+      return interaction.reply({ content: `I stopped this delivery because the file failed its integrity check: ${short(e.message, 180)}. Please contact the seller.`, ephemeral: true });
+    }
+  }
   let dlink = d.link || null;
   let hosted = false;
   if (d.fallbackLink) {
