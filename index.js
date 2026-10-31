@@ -767,6 +767,8 @@ function dataFilePaths() {
   for (const v of Object.values(vault)) if (v?.path) set.add(v.path);
   for (const d of [...Object.values(deliveries), ...Object.values(downloads)]) {
     if (!d?.path || d.backupDownload) continue;
+    // Download-link copies are disposable derivatives; the original vault/order file is backed up instead.
+    if (path.basename(String(d.path)).startsWith('download_')) continue;
     if (d.vaultKey && vault[d.vaultKey]) continue; // a link to a vault file: backed up once, re-linked on restore
     set.add(d.path);
   }
@@ -1089,7 +1091,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     if (noFile) return { content: `<@${d.customerId}> payment received. Thank you!` };
     if (dlink) {
       return {
-        content: `<@${d.customerId}> payment received. Your complete ${isZip ? 'ZIP' : 'file'} is ready. The secure download link works once and expires in 24 hours.`,
+        content: `<@${d.customerId}> payment received. Your complete ${isZip ? 'ZIP' : 'file'} is ready. The secure download link works once and has no time expiry.`,
         embeds: [buildDownloadEmbed(d.name, downloads[dlink.split('/').pop()]?.expiresAt, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined)],
         components: [downloadLinkRow(dlink, isZip ? 'Download ZIP' : 'Download File')],
         allowedMentions: { parse: [] },
@@ -1953,11 +1955,12 @@ const onReady = async () => {
   const monzoRebuilt = restoreMonzoReminders();
   restoreReminders().then((n) => {
     const total = n + monzoRebuilt;
-    return notifyOwner(
-      { content: `Bot is back online with auto-data recovery enabled.${total ? ` Reminders rebuilt: ${total}.` : ''}${recoveryNote}` },
-      { log: false }
-    );
-  });
+    console.log(`Startup recovery complete. Reminders rebuilt: ${total}.${recoveryNote}`);
+    // Avoid a routine owner DM on every restart. Only DM when a real recovery problem needs attention.
+    if (recoveryInfo?.lost?.length || /Backup restore failed/i.test(recoveryNote)) {
+      return notifyOwner({ content: `Bankroll startup recovery needs attention. Reminders rebuilt: ${total}.${recoveryNote}` }, { log: false });
+    }
+  }).catch((error) => console.error('Could not restore reminders:', error.message));
   setTimeout(backupData, 2 * 60 * 1000);
   setInterval(backupData, 6 * 60 * 60 * 1000);
   setInterval(async () => {
@@ -4199,7 +4202,7 @@ async function onGetFile(interaction) {
   const isZip = /\.zip$/i.test(String(d.name || ''));
   const getPayload = () => dlink
     ? {
-        content: `<@${d.customerId}> here is your secure download. The link works once and expires in 24 hours.`,
+        content: `<@${d.customerId}> here is your secure download. The link works once and has no time expiry.`,
         embeds: [buildDownloadEmbed(d.name, downloads[dlink.split('/').pop()]?.expiresAt, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined)],
         components: [downloadLinkRow(dlink, isZip ? 'Download ZIP' : 'Download File')],
         allowedMentions: { parse: [] },
@@ -4371,7 +4374,7 @@ async function onScheduledSendButton(interaction) {
       description: 'scheduled-vault-file',
     }, null);
     await interaction.followUp({
-      content: `**${job.originalName}** is ready. This is the original complete ZIP; the secure link works once and expires in 24 hours.`,
+      content: `**${job.originalName}** is ready. This is the original complete ZIP; the secure link works once and has no time expiry.`,
       embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Your ZIP is ready').setDescription('Use the button below to download the complete original archive.')],
       components: [downloadLinkRow(link, 'Download ZIP')],
       allowedMentions: { parse: [] },
