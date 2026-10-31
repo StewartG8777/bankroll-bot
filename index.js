@@ -2018,7 +2018,8 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
   });
 }
 
-client.once('ready', onReady);
+// clientReady is the supported ready event in current discord.js versions.
+// Register only once so startup recovery and scheduled jobs cannot run twice.
 client.once('clientReady', onReady);
 
 // ---------- Reminder ----------
