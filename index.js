@@ -508,8 +508,7 @@ try {
 } catch {}
 const saveDownloads = () => {
   try {
-    const durableDownloads = Object.fromEntries(Object.entries(downloads).filter(([, item]) => !item?.backupDownload));
-    atomicWrite(DOWNLOADS_FILE, JSON.stringify(durableDownloads));
+    atomicWrite(DOWNLOADS_FILE, JSON.stringify(downloads));
   } catch (e) {
     console.error('Could not save downloads:', e.message);
   }
@@ -517,7 +516,7 @@ const saveDownloads = () => {
 };
 function cleanDownloads() {
   for (const [t, dl] of Object.entries(downloads)) {
-    if (Date.now() > dl.expiresAt) {
+    if (Date.now() > dl.expiresAt || !dl?.path || !fs.existsSync(dl.path)) {
       try {
         fs.unlinkSync(dl.path);
       } catch {}
@@ -567,6 +566,7 @@ function makeBackupDownloadLink(buffer, name) {
     used: false,
     backupDownload: true,
   };
+  saveDownloads();
   return `${BASE_URL}/bankroll-backup-download/${token}`;
 }
 
@@ -714,7 +714,16 @@ async function backupDataOnce() {
     for (const name of jsonNames) {
       const fp = path.join(DATA_DIR, name);
       try {
-        const buffer = fs.readFileSync(fp);
+        let buffer = fs.readFileSync(fp);
+        // Temporary one-time backup-download tokens are persisted for live links,
+        // but excluded from snapshots so every backup does not trigger another backup.
+        if (name === 'downloads.json') {
+          try {
+            const saved = JSON.parse(buffer.toString('utf8'));
+            for (const [token, item] of Object.entries(saved)) if (item?.backupDownload) delete saved[token];
+            buffer = Buffer.from(JSON.stringify(saved));
+          } catch {}
+        }
         if (buffer.length) files.push({ name, buffer });
       } catch {}
     }
