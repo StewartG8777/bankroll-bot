@@ -1255,7 +1255,7 @@ const restoreCmd = common(
     .addAttachmentOption((o) =>
       o
         .setName('file')
-        .setDescription('deliveries.json, downloads.json, vault.json, monzo_payments.json or notifications.json')
+        .setDescription('deliveries.json, downloads.json, download_history.json, vault.json, monzo_payments.json or notifications.json')
         .setRequired(true)
     )
 );
@@ -2981,8 +2981,8 @@ async function cmdRestore(interaction) {
   if (att.size > 5 * 1024 * 1024) return interaction.editReply('That file is too big to be a backup.');
 
   const fname = att.name.toLowerCase();
-  const target = fname.startsWith('deliveries') ? 'deliveries' : fname.startsWith('downloads') ? 'downloads' : fname.startsWith('vault') ? 'vault' : fname.startsWith('monzo') ? 'monzo' : fname.startsWith('notifications') ? 'notifications' : null;
-  if (!target) return interaction.editReply('Pick deliveries.json, downloads.json, vault.json, monzo_payments.json or notifications.json from the backup channel.');
+  const target = fname.startsWith('deliveries') ? 'deliveries' : fname.startsWith('downloads') ? 'downloads' : fname.startsWith('download_history') ? 'download_history' : fname.startsWith('vault') ? 'vault' : fname.startsWith('monzo') ? 'monzo' : fname.startsWith('notifications') ? 'notifications' : null;
+  if (!target) return interaction.editReply('Pick deliveries.json, downloads.json, download_history.json, vault.json, monzo_payments.json or notifications.json from the backup channel.');
 
   let data;
   try {
@@ -2991,13 +2991,18 @@ async function cmdRestore(interaction) {
   } catch {
     return interaction.editReply('That file could not be read as a backup.');
   }
-  if (!data || typeof data !== 'object' || (Array.isArray(data) && target !== 'notifications')) {
+  if (!data || typeof data !== 'object' || (Array.isArray(data) && target !== 'notifications' && target !== 'download_history')) {
     return interaction.editReply('That file does not look like a backup.');
   }
   if (target === 'notifications') {
     notificationHistory = Array.isArray(data) ? data.filter((n) => n && typeof n === 'object').slice(-100) : [];
     saveNotifications();
     return interaction.editReply(`Restored ${notificationHistory.length} notification record(s).`);
+  }
+  if (target === 'download_history') {
+    downloadHistory = Array.isArray(data) ? data.filter((n) => n && typeof n === 'object').slice(-500) : [];
+    try { atomicWrite(DOWNLOAD_HISTORY_FILE, JSON.stringify(downloadHistory, null, 2)); } catch (e) { return interaction.editReply(`Could not save download history: ${e.message}`); }
+    return interaction.editReply(`Restored ${downloadHistory.length} download history record(s).`);
   }
 
   const store = target === 'deliveries' ? deliveries : target === 'downloads' ? downloads : target === 'monzo' ? monzoLedger : vault;
