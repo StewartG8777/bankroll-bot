@@ -3904,7 +3904,21 @@ async function cmdDelivery(interaction) {
     return interaction.editReply({ embeds: [new EmbedBuilder().setColor(!paid ? GREY : d.deliveryComplete ? GREEN : RED).setTitle('Delivery status • ' + short(d.name || key, 150)).setDescription(lines.join('\n')).setTimestamp()] });
   }
   if (!paid) return interaction.editReply('This order is not marked as paid. Bankroll will not resend unpaid orders.');
-  if (!d.path || !fs.existsSync(d.path)) return interaction.editReply('The original file is no longer available in storage. Restore it before resending.');
+  // If this delivery originally used a vault item, reconnect it to the current
+  // vault path before refusing a resend. This helps after a vault file is re-added.
+  if ((!d.path || !fs.existsSync(d.path)) && d.vaultKey && vault[d.vaultKey]?.path && fs.existsSync(vault[d.vaultKey].path)) {
+    try {
+      fs.mkdirSync(path.dirname(d.path || path.join(FILES_DIR, path.basename(vault[d.vaultKey].path))), { recursive: true });
+      const restoredPath = d.path || path.join(FILES_DIR, path.basename(vault[d.vaultKey].path));
+      try { fs.linkSync(vault[d.vaultKey].path, restoredPath); } catch { fs.copyFileSync(vault[d.vaultKey].path, restoredPath); }
+      d.path = restoredPath;
+      delete d.deliveryError;
+      saveDeliveries();
+    } catch (restoreError) {
+      console.error('Could not relink vault file for paid delivery:', restoreError);
+    }
+  }
+  if (!d.path || !fs.existsSync(d.path)) return interaction.editReply('The original file is still missing. Re-add it to the vault with /vault add, then retry /delivery resend.');
   if (activeDeliveryJobs.has(key)) return interaction.editReply('This order is already being delivered. Wait for the current attempt to finish.');
   d.deliveryComplete = false;
   d.deliveryAttempts = 0;
@@ -4236,7 +4250,7 @@ async function onAutocomplete(interaction) {
         const expired = rawStatus === 'open' &&
           Date.now() >= (entry.expiresAt ?? (entry.createdAt || Date.now()) + MONZO_OPEN_MS);
         const paid = rawStatus === 'paid' || !!delivery?.paid || !!delivery?.paymentConfirmed;
-        if (expired || (!paid && rawStatus !== 'open')) return null;
+        if (!paid && (expired || rawStatus !== 'open')) return null;
         const status = paid ? 'PAID' : 'UNPAID';
         return {
           at: Number(entry.paidAt || entry.createdAt || delivery?.savedAt || 0),
