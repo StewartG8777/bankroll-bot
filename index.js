@@ -895,20 +895,16 @@ async function backupDataOnce() {
           files: files.map((f) => ({ name: f.name, size: f.buffer.length, sha256: crypto.createHash('sha256').update(f.buffer).digest('hex') })),
         };
         const manifestBuffer = Buffer.from(JSON.stringify(manifest, null, 2));
-        const backupZip = new AdmZip();
-        for (const f of files) backupZip.addFile(f.name, f.buffer);
-        backupZip.addFile('bankroll-backup-manifest.json', manifestBuffer);
-        const backupZipBuffer = backupZip.toBuffer();
-        const backupLink = makeBackupDownloadLink(backupZipBuffer, 'bankroll-database-backup.zip');
+        // Keep each database file and its manifest as separate Discord attachments.
+        // Building a combined ZIP with AdmZip is synchronous and can stall the
+        // Discord gateway/event loop when the backup grows.
         const attachments = [
           ...files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })),
           new AttachmentBuilder(manifestBuffer, { name: 'bankroll-backup-manifest.json' }),
-          new AttachmentBuilder(backupZipBuffer, { name: 'bankroll-database-backup.zip' }),
         ];
         await ch.send({
-          content: `BANKROLL_BACKUP_SNAPSHOT v2 | ${new Date().toISOString()} | ${files.length} database files | complete ZIP archive attached`,
+          content: `BANKROLL_BACKUP_SNAPSHOT v2 | ${new Date().toISOString()} | ${files.length} database files | individual files and manifest attached`,
           files: attachments,
-          ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
           allowedMentions: { parse: [] },
         });
         lastBackupHash = hash;
