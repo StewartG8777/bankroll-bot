@@ -42,7 +42,7 @@ const {
   MONZO_USERNAME = '',
   MONZO_ACCOUNT_ID = '',
   MONZO_ACCESS_TOKEN = '',
-  DISCORD_GUILD_ID = '', // Optional: set this for instant guild slash-command updates during setup
+  DISCORD_GUILD_ID = '',
 } = process.env;
 
 const MONZO_LINK = (MONZO_ME_URL || (MONZO_USERNAME ? `https://monzo.me/${MONZO_USERNAME.replace(/^\/+|\/+$/g, '')}` : '')).replace(/\/+$/, '');
@@ -58,6 +58,63 @@ const allowed = new Set(
   [OWNER_ID, ...ALLOWED_USER_IDS.split(',').map((s) => s.trim())].filter(Boolean)
 );
 
+// Select a writable data directory before any vault/database folders are created.
+// Render Free does not provide persistent disks; if DATA_DIR points at an unavailable
+// mount (for example /var/data), fall back to ephemeral local storage and log a warning.
+const requestedDataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
+let DATA_DIR_STATUS = 'configured';
+function selectWritableDataDir() {
+  const candidates = [...new Set([requestedDataDir, path.join(__dirname, 'data'), path.join('/tmp', 'bankroll-data')].map((p) => path.resolve(p)))];
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      fs.mkdirSync(candidate, { recursive: true });
+      const probe = path.join(candidate, `.bankroll-write-test-${process.pid}`);
+      fs.writeFileSync(probe, 'ok');
+      fs.unlinkSync(probe);
+      if (candidate !== requestedDataDir) {
+        DATA_DIR_STATUS = `fallback storage in use (${candidate}); requested ${requestedDataDir} was not writable`;
+        console.warn(`DATA_DIR ${requestedDataDir} is not writable; using ${candidate}. Files may not persist across redeploys.`);
+      } else {
+        DATA_DIR_STATUS = `using ${candidate}`;
+      }
+      return candidate;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw new Error(`No writable data directory found: ${lastError?.message || 'unknown error'}`);
+}
+const DATA_DIR = selectWritableDataDir();
+const NOTIFICATIONS_FILE = path.join(DATA_DIR, 'notifications.json');
+let notificationHistory = [];
+try {
+  const savedNotifications = JSON.parse(fs.readFileSync(NOTIFICATIONS_FILE, 'utf8'));
+  notificationHistory = Array.isArray(savedNotifications) ? savedNotifications.slice(-100) : [];
+} catch {}
+let restoreDone = false;
+let backupTimer = null;
+function saveNotifications() {
+  try {
+    atomicWrite(NOTIFICATIONS_FILE, JSON.stringify(notificationHistory.slice(-100), null, 2));
+  } catch (e) {
+    console.error('Could not save notification history:', e.message);
+  }
+  scheduleBackup();
+}
+function recordNotification(type, title, detail, status = 'info') {
+  notificationHistory.push({
+    id: crypto.randomUUID(),
+    type,
+    title: short(String(title || 'Notification'), 100),
+    detail: short(String(detail || ''), 800),
+    status,
+    at: Date.now(),
+  });
+  if (notificationHistory.length > 100) notificationHistory = notificationHistory.slice(-100);
+  saveNotifications();
+}
+
 const GREEN = 0x2ecc40;
 const GREY = 0x95a5a6;
 const RED = 0xe74c3c;
@@ -65,10 +122,6 @@ const symbols = { gbp: '£', usd: '$', eur: '€' };
 const money = (amount, cur) =>
   `${symbols[cur.toLowerCase()] ?? cur.toUpperCase() + ' '}${amount.toFixed(2)}`;
 const short = (text, n) => (text && text.length > n ? text.slice(0, n - 1) + '…' : text || '—');
-
-// Initialise notification state before registering process error handlers.
-// Early rejected promises can otherwise trigger alertOwner during module startup.
-let notificationHistory = [];
 
 // Posts a copy of important events to a private server channel (via a channel webhook).
 async function getLogChannel() {
@@ -127,9 +180,12 @@ async function logToServer(payload) {
 
 async function notifyOwner(payload, { log = true, notificationType = 'owner.notification', notificationStatus = 'info' } = {}) {
   const firstEmbed = payload.embeds?.[0];
-  const notificationTitle = firstEmbed?.title || payload.content || 'Bot notification';
-  const notificationDetail = firstEmbed?.description || payload.content || '';
-  recordNotification(notificationType, notificationTitle, notificationDetail, notificationStatus);
+  recordNotification(
+    notificationType,
+    firstEmbed?.title || payload.content || 'Bot notification',
+    firstEmbed?.description || payload.content || '',
+    notificationStatus
+  );
   try {
     const owner = await client.users.fetch(OWNER_ID);
     await owner.send(payload);
@@ -149,13 +205,7 @@ let recoveryInfo = null;
 async function alertOwner(where, err) {
   const msg = `${where}: ${err?.message ?? err}`.slice(0, 500);
   console.error(msg);
-  try {
-    if (typeof recordNotification === 'function') {
-      recordNotification('system.error', where, msg, 'error');
-    }
-  } catch (notificationError) {
-    console.error('Could not record error notification:', notificationError?.message ?? notificationError);
-  }
+  recordNotification('system.error', where, msg, 'error');
   if (Date.now() - (lastAlert.get(msg) ?? 0) < 60 * 1000) return;
   lastAlert.set(msg, Date.now());
   try {
@@ -205,7 +255,6 @@ function periodStart(period) {
 }
 
 // ---------- File / link delivery & Vault ----------
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const FILES_DIR = path.join(DATA_DIR, 'files');
 const DELIVERIES_FILE = path.join(DATA_DIR, 'deliveries.json');
 const MONZO_FILE = path.join(DATA_DIR, 'monzo_payments.json');
@@ -217,6 +266,7 @@ function atomicWrite(file, data) {
   fs.renameSync(tmp, file);
 }
 
+fs.mkdirSync(DATA_DIR, { recursive: true });
 const VAULT_DIR = path.join(DATA_DIR, 'vault');
 const VAULT_FILE = path.join(DATA_DIR, 'vault.json');
 fs.mkdirSync(VAULT_DIR, { recursive: true });
@@ -235,26 +285,13 @@ const saveVault = () => {
   scheduleBackup();
 };
 
-// Persistent notification/audit history. Kept in JSON to match the existing deployment.
-const NOTIFICATIONS_FILE = path.join(DATA_DIR, 'notifications.json');
-try {
-  const saved = JSON.parse(fs.readFileSync(NOTIFICATIONS_FILE, 'utf8'));
-  notificationHistory = Array.isArray(saved) ? saved.slice(-100) : [];
-} catch {}
-function saveNotifications() {
-  try { atomicWrite(NOTIFICATIONS_FILE, JSON.stringify(notificationHistory.slice(-100), null, 2)); }
-  catch (e) { console.error('Could not save notification history:', e.message); }
+const SEND_JOBS_FILE = path.join(DATA_DIR, 'scheduled_sends.json');
+let sendJobs = {};
+try { sendJobs = JSON.parse(fs.readFileSync(SEND_JOBS_FILE, 'utf8')); } catch {}
+function saveSendJobs() {
+  try { atomicWrite(SEND_JOBS_FILE, JSON.stringify(sendJobs, null, 2)); }
+  catch (e) { console.error('Could not save scheduled sends:', e.message); }
   scheduleBackup();
-}
-function recordNotification(type, title, detail, status = 'info') {
-  notificationHistory.push({ id: crypto.randomUUID(), type, title: short(String(title || 'Notification'), 100), detail: short(String(detail || ''), 800), status, at: Date.now() });
-  if (notificationHistory.length > 100) notificationHistory = notificationHistory.slice(-100);
-  saveNotifications();
-}
-async function notifyEvent(type, title, detail, status = 'info', { log = true } = {}) {
-  const color = status === 'error' ? RED : status === 'success' ? GREEN : GREY;
-  const embed = new EmbedBuilder().setColor(color).setTitle(short(title, 256)).setDescription(short(detail, 4000)).setTimestamp();
-  await notifyOwner({ embeds: [embed] }, { log, notificationType: type, notificationStatus: status });
 }
 
 const BASE_URL = PUBLIC_URL.replace(/\/+$/, '');
@@ -277,8 +314,6 @@ const saveDeliveries = () => {
 };
 
 // Backups are sent a few seconds after any change, but never before the startup restore has finished.
-let restoreDone = false;
-let backupTimer = null;
 function scheduleBackup() {
   if (!restoreDone) return;
   clearTimeout(backupTimer);
@@ -529,7 +564,6 @@ let lastBackupAt = null;
 let lastJsonMsg = null;
 
 // Every stored file (vault, files waiting for payment, hosted downloads), as paths under DATA_DIR.
-const BLOB_CHUNK = 9 * 1024 * 1024; // Discord allows about 10 MB per upload, so big files go up in 9 MB parts
 
 // Files too big for Discord are hosted here as one whole file (7 days) and linked from the log.
 const LOGCOPY_DIR = path.join(DATA_DIR, 'logcopies');
@@ -614,82 +648,129 @@ function backupData() {
   backupChain = backupChain.then(() => backupDataOnce()).catch((e) => console.error('Backup failed:', e.message));
   return backupChain;
 }
+async function resolveBackupChannel() {
+  if (BACKUP_CHANNEL_ID) {
+    const byId = await client.channels.fetch(BACKUP_CHANNEL_ID).catch((e) => {
+      console.error('Could not fetch BACKUP_CHANNEL_ID:', e.message);
+      return null;
+    });
+    if (byId?.isTextBased?.() && byId.messages?.fetch) return byId;
+  }
+  for (const guild of client.guilds.cache.values()) {
+    let found = guild.channels.cache.find((c) => c.name?.toLowerCase() === 'bankroll-backup' && c.isTextBased?.() && c.messages?.fetch);
+    if (!found) {
+      const fetched = await guild.channels.fetch().catch(() => null);
+      found = fetched?.find((c) => c?.name?.toLowerCase() === 'bankroll-backup' && c.isTextBased?.() && c.messages?.fetch);
+    }
+    if (found) return found;
+  }
+  return null;
+}
+
+function safeBackupRel(rel) {
+  if (typeof rel !== 'string' || !rel.trim()) return null;
+  const clean = rel.replace(/\\/g, '/').replace(/^\/+/, '');
+  const resolved = path.resolve(DATA_DIR, clean);
+  const root = path.resolve(DATA_DIR) + path.sep;
+  return resolved.startsWith(root) ? clean : null;
+}
+
 async function backupDataOnce() {
   if (!restoreDone) return;
-  try {
-    const ch = BACKUP_CHANNEL_ID
-      ? await client.channels.fetch(BACKUP_CHANNEL_ID).catch(() => null)
-      : findBackupChannel() ?? (await getLogChannel());
-    if (!ch) return;
+  const ch = await resolveBackupChannel();
+  if (!ch) {
+    console.error('Backup channel not found. Set BACKUP_CHANNEL_ID or create #bankroll-backup.');
+    return;
+  }
 
+  try {
+    const jsonNames = ['deliveries.json', 'downloads.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json'];
     const files = [];
-    for (const f of [DELIVERIES_FILE, DOWNLOADS_FILE, VAULT_FILE, MONZO_FILE, NOTIFICATIONS_FILE]) {
+    for (const name of jsonNames) {
+      const fp = path.join(DATA_DIR, name);
       try {
-        const buffer = fs.readFileSync(f);
-        if (buffer.length > 2) files.push({ name: path.basename(f), buffer });
+        const buffer = fs.readFileSync(fp);
+        if (buffer.length) files.push({ name, buffer });
       } catch {}
     }
+
     if (files.length) {
       const hash = crypto.createHash('sha256').update(Buffer.concat(files.map((f) => f.buffer))).digest('hex');
       if (hash !== lastBackupHash) {
-        const sentMsg = await ch.send({
-          content: 'Data backup (waiting files, download links, vault index and Monzo payment records)',
-          files: files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })),
+        const manifest = {
+          format: 'bankroll-backup-v2',
+          createdAt: new Date().toISOString(),
+          files: files.map((f) => ({ name: f.name, size: f.buffer.length, sha256: crypto.createHash('sha256').update(f.buffer).digest('hex') })),
+        };
+        const attachments = [
+          ...files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })),
+          new AttachmentBuilder(Buffer.from(JSON.stringify(manifest, null, 2)), { name: 'bankroll-backup-manifest.json' }),
+        ];
+        await ch.send({
+          content: `BANKROLL_BACKUP_SNAPSHOT v2 | ${new Date().toISOString()} | ${files.length} database files`,
+          files: attachments,
           allowedMentions: { parse: [] },
         });
-        const prevMsg = lastJsonMsg;
-        lastJsonMsg = sentMsg;
-        if (prevMsg) prevMsg.delete().catch(() => {});
+        // Keep older snapshots in the channel. Startup recovery selects the newest valid copy.
         lastBackupHash = hash;
         lastBackupAt = Date.now();
       }
     }
 
-    // The files themselves, so everything comes back after a redeploy (any size: big files go up in parts).
-    let sentParts = 0;
+    // Back up each physical file as ONE ZIP attachment. If Discord rejects it,
+    // use the configured hosted-file route; never split a file into multipart messages.
     for (const fp of dataFilePaths()) {
-      const rel = relData(fp);
+      const rel = safeBackupRel(relData(fp));
+      if (!rel) continue;
       let st;
+      try { st = fs.statSync(fp); } catch { continue; }
+      if (!st.isFile() || !st.size) continue;
+      const sha256 = await sha256File(fp);
+      const signature = `${st.size}:${sha256}`;
+      if (blobBackedUp[rel] === signature) continue;
+
       try {
-        st = fs.statSync(fp);
-      } catch {
+        const zip = new AdmZip();
+        zip.addFile(path.basename(fp), fs.readFileSync(fp));
+        const zipBuffer = zip.toBuffer();
+        const marker = {
+          rel,
+          size: st.size,
+          sha256,
+          entryName: path.basename(fp),
+          originalName: path.basename(fp),
+        };
+        await ch.send({
+          content: `datafilezip-v1:${JSON.stringify(marker)}`,
+          files: [new AttachmentBuilder(zipBuffer, { name: `${path.basename(fp)}.backup.zip` })],
+          allowedMentions: { parse: [] },
+        });
+        blobBackedUp[rel] = signature;
+        lastBackupAt = Date.now();
         continue;
+      } catch (zipError) {
+        console.error(`ZIP backup upload failed for ${rel}:`, zipError.message);
       }
-      if (!st.size || blobBackedUp[rel] === st.size) continue;
-      const total = Math.ceil(st.size / BLOB_CHUNK);
-      if (sentParts > 0 && sentParts + total > 15) {
-        scheduleBackup(); // carry on with the rest in a moment
-        break;
-      }
-      // Always split large files into Discord attachments. A hosted link is not a backup:
-      // it cannot restore the file after a redeploy or when the old host is gone.
-      let fd;
-      try {
-        fd = fs.openSync(fp, 'r');
-        for (let i = 0; i < total; i++) {
-          const len = Math.min(BLOB_CHUNK, st.size - i * BLOB_CHUNK);
-          const buf = Buffer.alloc(len);
-          fs.readSync(fd, buf, 0, len, i * BLOB_CHUNK);
+
+      if (BASE_URL) {
+        try {
+          const url = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
           await ch.send({
-            content: `datafile:${rel}|${st.size}|${i + 1}/${total}`,
-            files: [new AttachmentBuilder(buf, { name: total === 1 ? path.basename(fp) : `${path.basename(fp)}.part${i + 1}of${total}` })],
+            content: `datafilelink:${rel}|${st.size}|${url}`,
             allowedMentions: { parse: [] },
           });
-          sentParts += 1;
-        }
-        blobBackedUp[rel] = st.size;
-        lastBackupAt = Date.now();
-      } catch (e) {
-        console.error(`File backup failed for ${rel}:`, e.message);
-        scheduleBackup();
-      } finally {
-        if (fd !== undefined) {
-          try {
-            fs.closeSync(fd);
-          } catch {}
+          blobBackedUp[rel] = signature;
+          lastBackupAt = Date.now();
+          console.warn(`Stored hosted-link backup fallback for ${rel}. A link hosted on ephemeral storage is not durable across instance loss.`);
+          continue;
+        } catch (linkError) {
+          console.error(`Hosted-link backup failed for ${rel}:`, linkError.message);
         }
       }
+      scheduleBackup();
+      break;
     }
+
   } catch (e) {
     console.error('Backup failed:', e.message);
   }
@@ -762,32 +843,21 @@ async function deliverFile(key, paymentIntentId) {
     owner = await client.users.fetch(OWNER_ID);
   } catch {}
 
-  // Vault items stay in the vault. Once paid, keep the invoice button active so the
-  // customer can request the original ZIP as a Discord attachment (never a hosted link).
-  if (d.vaultKey && vault[d.vaultKey]) {
-    d.paid = true;
-    d.mode = 'direct';
-    saveDeliveries();
-    try {
-      const invoice = await getInvoiceMessage(d, key);
-      if (invoice?.embeds?.[0]) {
-        const paidEmbed = EmbedBuilder.from(invoice.embeds[0])
-          .setColor(GREY)
-          .setTitle(String(invoice.embeds[0].title || '').startsWith('PAID') ? invoice.embeds[0].title : `PAID - ${invoice.embeds[0].title}`)
-          .setDescription('Payment received. Click **Get my file** below and I will send your ZIP file here.');
-        await invoice.edit({ embeds: [paidEmbed] });
-      }
-    } catch (e) {
-      console.log('Could not update paid vault invoice:', e.message);
-    }
-    if (owner) await notifyOwner({ content: `Payment confirmed for vault item **${d.name}**. <@${d.customerId}> can now use Get my file.` });
-    return;
-  }
-
   const noFile = !d.link && !d.path;
   let dlink = d.link || null;
   let hosted = false;
-  if (!d.vaultKey && !dlink && BASE_URL && d.mode !== 'direct' && d.path && fs.existsSync(d.path)) {
+  if (d.fallbackLink) {
+    const token = d.fallbackLink.split('/').pop();
+    const savedLink = downloads[token];
+    if (savedLink && !savedLink.used && Date.now() < savedLink.expiresAt && fs.existsSync(savedLink.path)) {
+      dlink = d.fallbackLink;
+      hosted = true;
+    } else {
+      delete d.fallbackLink;
+      saveDeliveries();
+    }
+  }
+  if (!dlink && !d.vaultKey && BASE_URL && d.mode !== 'direct' && d.path && fs.existsSync(d.path)) {
     dlink = makeDownloadLink(d, paymentIntentId);
     hosted = true;
   }
@@ -817,6 +887,28 @@ async function deliverFile(key, paymentIntentId) {
           files: [new AttachmentBuilder(buffer, { name: d.name })],
         };
 
+  // Try the ZIP first. If Discord rejects the attachment (for example, the
+  // guild upload limit is smaller than the file), create a one-time hosted link
+  // and retry the same destination with that link instead.
+  const sendWithFallback = async (send) => {
+    try {
+      return await send(payload());
+    } catch (attachmentError) {
+      if (noFile || dlink || !BASE_URL || !d.path || !fs.existsSync(d.path)) throw attachmentError;
+      try {
+        dlink = makeDownloadLink(d, paymentIntentId);
+        hosted = true;
+        d.fallbackLink = dlink;
+        saveDeliveries();
+        console.warn(`Discord attachment failed for ${d.name}; retrying invoice delivery with hosted link: ${attachmentError.message}`);
+        return await send(payload());
+      } catch (linkError) {
+        console.error(`Invoice link fallback failed for ${d.name}:`, linkError.message);
+        throw new Error(`ZIP attachment failed (${attachmentError.message}); download-link fallback failed (${linkError.message})`);
+      }
+    }
+  };
+
   let sentTo = null;
   let ownerGotIt = false;
   let msgUrl = null;
@@ -826,19 +918,16 @@ async function deliverFile(key, paymentIntentId) {
   if (live && Date.now() - live.at < 14 * 60 * 1000) {
     try {
       const original = await live.interaction.fetchReply();
-      const old = original.embeds[0];
-      if (old) {
-        const paidEmbed = EmbedBuilder.from(old).setColor(GREY).setTitle(`PAID - ${old.title}`);
-        if (d.type === 'monzo') paidEmbed.setDescription('Payment received. Thank you!');
-        await live.interaction.editReply({
-          embeds: [paidEmbed],
-          components: [],
-        });
-      }
-      const msg = await live.interaction.followUp(payload());
+      const msg = await sendWithFallback((p) => live.interaction.followUp(p));
       msgUrl = msg.url;
       reachedCustomer = true;
       sentTo = 'a reply under the invoice message';
+      const old = original.embeds[0];
+      if (old) {
+        const paidEmbed = EmbedBuilder.from(old).setColor(GREY).setTitle(String(old.title || '').startsWith('PAID') ? old.title : `PAID - ${old.title}`);
+        if (d.type === 'monzo') paidEmbed.setDescription('Payment received. Thank you!');
+        await live.interaction.editReply({ embeds: [paidEmbed], components: [] });
+      }
     } catch (e) {
       console.log('Could not reply under invoice:', e.message);
     }
@@ -850,6 +939,10 @@ async function deliverFile(key, paymentIntentId) {
     try {
       const im = await getInvoiceMessage(d, key);
       if (im) {
+        const msg = await sendWithFallback((p) => im.reply(p));
+        msgUrl = msg.url;
+        reachedCustomer = true;
+        sentTo = 'a reply under the invoice message';
         const old = im.embeds[0];
         if (old) {
           const paidEmbed = EmbedBuilder.from(old)
@@ -858,10 +951,6 @@ async function deliverFile(key, paymentIntentId) {
           if (d.type === 'monzo') paidEmbed.setDescription('Payment received. Thank you!');
           await im.edit({ embeds: [paidEmbed], components: [] });
         }
-        const msg = await im.reply(payload());
-        msgUrl = msg.url;
-        reachedCustomer = true;
-        sentTo = 'a reply under the invoice message';
       }
     } catch (e) {
       console.log('Could not reply to the stored invoice message:', e.message);
@@ -870,7 +959,7 @@ async function deliverFile(key, paymentIntentId) {
 
   if (!sentTo) try {
     const ch = await client.channels.fetch(d.channelId);
-    const msg = await ch.send(payload());
+    const msg = await sendWithFallback((p) => ch.send(p));
     msgUrl = msg.url;
     reachedCustomer = true;
     sentTo = 'the channel where the invoice was created';
@@ -882,14 +971,14 @@ async function deliverFile(key, paymentIntentId) {
   // and the customer can still press "Get my file" on the invoice message.
   if (!sentTo && owner) {
     try {
-      await owner.send(
+      await sendWithFallback((p) => owner.send(
         dlink
           ? { content: `Couldn't reach <@${d.customerId}>. Here is their download link:\n<${dlink}>` }
           : {
               content: `Couldn't reach <@${d.customerId}>. Here is their file.`,
               files: [new AttachmentBuilder(buffer, { name: d.name })],
             }
-      );
+      ));
       sentTo = 'your DMs';
       ownerGotIt = true;
     } catch (e) {
@@ -903,7 +992,7 @@ async function deliverFile(key, paymentIntentId) {
       d.paid = true;
       saveDeliveries();
     } else {
-      if (d.path && !hosted && !d.vaultKey) {
+      if (d.path && !hosted) {
         try {
           fs.unlinkSync(d.path);
         } catch {}
@@ -1032,6 +1121,22 @@ const vaultCmd = common(
     )
     .addSubcommand((sub) => sub.setName('list').setDescription('List all files currently in your vault'))
     .addSubcommand((sub) =>
+      sub.setName('search')
+        .setDescription('Search vault keys and filenames')
+        .addStringOption((o) => o.setName('query').setDescription('Text to search for').setRequired(true))
+    )
+    .addSubcommand((sub) =>
+      sub.setName('verify')
+        .setDescription('Check that a vault file exists and its checksum is valid')
+        .addStringOption((o) => o.setName('name').setDescription('The vault key').setAutocomplete(true).setRequired(true))
+    )
+    .addSubcommand((sub) =>
+      sub.setName('rename')
+        .setDescription('Rename a vault key without changing the file contents')
+        .addStringOption((o) => o.setName('name').setDescription('Current vault key').setAutocomplete(true).setRequired(true))
+        .addStringOption((o) => o.setName('new_name').setDescription('New vault key').setRequired(true).setMaxLength(60))
+    )
+    .addSubcommand((sub) =>
       sub
         .setName('info')
         .setDescription('View detailed info about a vault item')
@@ -1058,26 +1163,17 @@ const vaultCmd = common(
           o.setName('save_as').setDescription('Vault key for the edited copy (default: <name>-<spawncode>)').setMaxLength(60)
         )
     )
-    .addSubcommand((sub) =>
-      sub.setName('search').setDescription('Search vault files by key or filename')
-        .addStringOption((o) => o.setName('query').setDescription('Text to search for').setRequired(true).setMaxLength(80))
-    )
-    .addSubcommand((sub) =>
-      sub.setName('verify').setDescription('Check a vault file exists and its checksum is valid')
-        .addStringOption((o) => o.setName('name').setDescription('Vault item to verify').setAutocomplete(true).setRequired(true))
-    )
-    .addSubcommand((sub) =>
-      sub.setName('rename').setDescription('Rename a vault key without changing the file contents')
-        .addStringOption((o) => o.setName('name').setDescription('Vault item').setAutocomplete(true).setRequired(true))
-        .addStringOption((o) => o.setName('new_name').setDescription('New vault key').setRequired(true).setMaxLength(60))
-    )
 );
 
-const notificationsCmd = common(
-  new SlashCommandBuilder().setName('notifications').setDescription('View recent bot alerts and test notifications')
-    .addSubcommand((sub) => sub.setName('recent').setDescription('Show the latest bot notifications'))
-    .addSubcommand((sub) => sub.setName('test').setDescription('Send a test notification to the owner and log channel'))
-);
+const sendfileCmd = new SlashCommandBuilder()
+  .setName('sendfile')
+  .setDescription('Schedule a vault ZIP for delivery in this private DM')
+  .setIntegrationTypes([ApplicationIntegrationType.UserInstall])
+  .setContexts([InteractionContextType.PrivateChannel])
+  .addStringOption((o) => o.setName('file').setDescription('Choose a file from your vault').setAutocomplete(true).setRequired(true))
+  .addIntegerOption((o) => o.setName('delay').setDescription('How long to wait').setMinValue(1).setMaxValue(720).setRequired(true))
+  .addStringOption((o) => o.setName('unit').setDescription('Delay unit').setRequired(true)
+    .addChoices({ name: 'Minutes', value: 'minutes' }, { name: 'Hours', value: 'hours' }));
 
 const cancelCmd = common(
   new SlashCommandBuilder()
@@ -1114,9 +1210,21 @@ const restoreCmd = common(
     .addAttachmentOption((o) =>
       o
         .setName('file')
-        .setDescription('Choose a JSON backup file from the backup channel')
+        .setDescription('deliveries.json, downloads.json, vault.json, monzo_payments.json or notifications.json')
         .setRequired(true)
     )
+);
+
+const notificationsCmd = common(
+  new SlashCommandBuilder()
+    .setName('notifications')
+    .setDescription('View and test saved bot notifications')
+    .addSubcommand((sub) =>
+      sub.setName('recent')
+        .setDescription('Show recent bot notifications')
+        .addIntegerOption((o) => o.setName('count').setDescription('How many to show (default 10)').setMinValue(1).setMaxValue(20))
+    )
+    .addSubcommand((sub) => sub.setName('test').setDescription('Send a test notification to the owner'))
 );
 
 const currencyCmd = common(
@@ -1210,208 +1318,353 @@ const setupCmd = new SlashCommandBuilder()
   .setIntegrationTypes([ApplicationIntegrationType.GuildInstall])
   .setContexts([InteractionContextType.Guild]);
 
-const commands = [bankrollCmd, monzoCmd, vaultCmd, notificationsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
+const commands = [bankrollCmd, monzoCmd, vaultCmd, sendfileCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
+  let ch = null;
+  let msgs = [];
+  let exhausted = false;
   try {
-    const ch = BACKUP_CHANNEL_ID
-      ? await client.channels.fetch(BACKUP_CHANNEL_ID).catch(() => null)
-      : findBackupChannel() ?? (await getLogChannel());
-    if (!ch) return;
+    ch = await resolveBackupChannel();
+    if (!ch) {
+      recoveryNote = ' Backup channel #bankroll-backup was not found. Set BACKUP_CHANNEL_ID or create the channel and grant the bot View Channel + Read Message History.';
+      console.error(recoveryNote);
+      return;
+    }
 
-    // Newest first; scan further back only when something is still missing
-    const msgs = [];
+    const me = ch.guild?.members?.me || (ch.guild ? await ch.guild.members.fetchMe().catch(() => null) : null);
+    const perms = me && ch.permissionsFor(me);
+    if (perms && (!perms.has(PermissionFlagsBits.ViewChannel) || !perms.has(PermissionFlagsBits.ReadMessageHistory))) {
+      recoveryNote = ' Bot cannot read the full #bankroll-backup history. Grant View Channel and Read Message History.';
+      console.error(recoveryNote);
+      return;
+    }
+
+    // Read the ENTIRE channel history, not an arbitrary recent-message window.
     let before;
-    let exhausted = false;
-    const loadPages = async (n) => {
-      for (let i = 0; i < n && !exhausted; i++) {
-        const batch = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
-        if (!batch.size) {
-          exhausted = true;
-          break;
-        }
-        msgs.push(...batch.values());
-        before = batch.last().id;
-        if (batch.size < 100) exhausted = true;
-      }
-    };
-    await loadPages(3);
+    let pages = 0;
+    while (!exhausted) {
+      const batch = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      if (!batch.size) { exhausted = true; break; }
+      msgs.push(...batch.values());
+      before = batch.last().id;
+      pages += 1;
+      if (pages % 10 === 0) console.log(`Backup restore scan: ${msgs.length} messages checked...`);
+      if (batch.size < 100) exhausted = true;
+    }
+    console.log(`Backup restore scan complete: ${msgs.length} messages in #${ch.name}.`);
 
+    // The bot's own backups and owner-uploaded backup files are trusted sources.
+    const trusted = (msg) => msg.author?.id === client.user.id || (OWNER_ID && msg.author?.id === OWNER_ID);
     const targets = {
       'deliveries.json': DELIVERIES_FILE,
       'downloads.json': DOWNLOADS_FILE,
       'vault.json': VAULT_FILE,
       'monzo_payments.json': MONZO_FILE,
       'notifications.json': NOTIFICATIONS_FILE,
+      'scheduled_sends.json': SEND_JOBS_FILE,
     };
-    const needs = (f) => !fs.existsSync(f) || fs.readFileSync(f, 'utf8').length < 5;
-    const done = new Set();
-    const restoreJson = async () => {
-      for (const msg of msgs) {
-        if (msg.author.id !== client.user.id) continue;
-        for (const att of msg.attachments.values()) {
-          const fname = att.name.toLowerCase();
-          const target = targets[fname];
-          if (!target || done.has(fname) || !needs(target)) continue;
-          try {
-            const res = await fetch(att.url);
-            const text = await res.text();
-            JSON.parse(text); // validate json
-            atomicWrite(target, text);
-            done.add(fname);
-            console.log(`Auto-recovered ${fname} from backup channel.`);
-          } catch (e) {
-            console.error(`Failed to auto-restore ${fname}:`, e.message);
-          }
-        }
-      }
+    const isValidJsonFor = (name, value) => {
+      if (name === 'notifications.json') return Array.isArray(value);
+      return !!value && typeof value === 'object' && !Array.isArray(value);
     };
-    await restoreJson();
-    if (!exhausted && Object.entries(targets).some(([f, t]) => !done.has(f) && needs(t))) {
-      await loadPages(27);
-      await restoreJson();
-    }
-
-    // Reload files into memory
-    try {
-      deliveries = JSON.parse(fs.readFileSync(DELIVERIES_FILE, 'utf8'));
-    } catch {}
-    try {
-      downloads = JSON.parse(fs.readFileSync(DOWNLOADS_FILE, 'utf8'));
-    } catch {}
-    try {
-      vault = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
-    } catch {}
-    try {
-      monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8'));
-    } catch {}
-    try {
-      const savedNotifications = JSON.parse(fs.readFileSync(NOTIFICATIONS_FILE, 'utf8'));
-      notificationHistory = Array.isArray(savedNotifications) ? savedNotifications.slice(-100) : [];
-    } catch {}
-
-    // Bring every stored file back (vault files, files waiting for payment, hosted downloads)
-    const vaultRoot = path.resolve(VAULT_DIR) + path.sep;
-    for (const [key, item] of Object.entries(vault)) {
-      if (!item.path || !path.resolve(String(item.path)).startsWith(vaultRoot)) {
-        item.path = path.join(VAULT_DIR, `${key}_${String(item.originalName || 'file').replace(/[^\w.\-]/g, '_')}`);
-      }
-    }
-    const wanted = dataFilePaths();
-    const missing = () => wanted.filter((fp) => !fs.existsSync(fp));
-
-    const blobIndex = () => {
-      const m = new Map();
-      for (const msg of msgs) {
-        if (msg.author.id !== client.user.id || !msg.content.startsWith('datafile:')) continue;
-        const bits = msg.content.slice('datafile:'.length).split('|');
-        const pt = String(bits.pop());
-        const size = Number(bits.pop());
-        const rel = bits.join('|');
-        const [pi, tot] = pt.split('/').map(Number);
-        const att = msg.attachments.first();
-        if (!rel || !att || !pi || !tot || !Number.isFinite(size)) continue;
-        const list = m.get(rel) || [];
-        m.set(rel, list);
-        let g = list.find((x) => x.size === size && x.total === tot);
-        if (!g) {
-          g = { size, total: tot, parts: new Map() };
-          list.push(g);
-        }
-        if (!g.parts.has(pi)) g.parts.set(pi, att);
-      }
-      return m;
+    const localNeedsRestore = (name, fp) => {
+      try {
+        const value = JSON.parse(fs.readFileSync(fp, 'utf8'));
+        if (!isValidJsonFor(name, value)) return true;
+        return Array.isArray(value) ? value.length === 0 : Object.keys(value).length === 0;
+      } catch { return true; }
     };
-    const completeGroup = (idx, rel) => (idx.get(rel) || []).find((g) => g.parts.size === g.total);
 
-    let idx = blobIndex();
-    let scanned = 0;
-    while (!exhausted && scanned < 60 && missing().some((fp) => !completeGroup(idx, relData(fp)))) {
-      await loadPages(10);
-      scanned += 10;
-      idx = blobIndex();
-    }
-
-    // Older backups stored vault files one per message as "vaultfile:<key>"
-    const vaultAtts = {};
+    // Newest-first scan means the first valid attachment for each database is the newest snapshot.
+    const jsonBackups = new Map();
     for (const msg of msgs) {
-      if (msg.author.id !== client.user.id || !msg.content.startsWith('vaultfile:')) continue;
-      const key = msg.content.slice('vaultfile:'.length).trim();
-      const att = msg.attachments.first();
-      if (key && att && !vaultAtts[key]) vaultAtts[key] = att;
+      if (!trusted(msg)) continue;
+      for (const att of msg.attachments.values()) {
+        const name = String(att.name || '').toLowerCase();
+        if (!targets[name] || jsonBackups.has(name)) continue;
+        try {
+          if (att.size > 15 * 1024 * 1024) continue;
+          const res = await fetch(att.url);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const raw = await res.text();
+          const parsed = JSON.parse(raw);
+          if (!isValidJsonFor(name, parsed)) throw new Error('unexpected JSON structure');
+          jsonBackups.set(name, { raw, createdTimestamp: Number(msg.createdTimestamp || 0) });
+        } catch (e) {
+          console.error(`Invalid backup attachment ${name}:`, e.message);
+        }
+      }
     }
 
-    let recovered = 0;
-    const lost = [];
-    for (const fp of missing()) {
-      const rel = relData(fp);
-      try {
-        let buf = null;
-        const g = completeGroup(idx, rel);
-        if (g) {
-          const chunks = [];
-          for (let i = 1; i <= g.total; i++) {
-            const res = await fetch(g.parts.get(i).url);
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            chunks.push(Buffer.from(await res.arrayBuffer()));
-          }
-          buf = Buffer.concat(chunks);
-          if (buf.length !== g.size) throw new Error('size mismatch');
-        } else {
-          const vk = Object.keys(vault).find((k) => vault[k].path === fp);
-          const att = vk && vaultAtts[vk];
-          if (att) {
-            const res = await fetch(att.url);
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            buf = Buffer.from(await res.arrayBuffer());
-          }
-        }
-        if (!buf) {
-          lost.push(path.basename(fp));
-          continue;
-        }
-        fs.mkdirSync(path.dirname(fp), { recursive: true });
-        atomicWrite(fp, buf);
-        blobBackedUp[rel] = buf.length;
-        recovered += 1;
-      } catch (e) {
-        console.error(`Could not recover ${rel}:`, e.message);
-        lost.push(path.basename(fp));
-      }
-    }
-    // Invoice files that are just links to a vault file: link them again from the restored vault file
-    for (const e of [...Object.values(deliveries), ...Object.values(downloads)]) {
-      if (!e?.vaultKey || !e.path || fs.existsSync(e.path)) continue;
-      const v = vault[e.vaultKey];
-      if (!v || !fs.existsSync(v.path)) continue;
-      try {
-        fs.mkdirSync(path.dirname(e.path), { recursive: true });
+    let jsonRestored = 0;
+    for (const [name, target] of Object.entries(targets)) {
+      if (!localNeedsRestore(name, target)) continue;
+      const backup = jsonBackups.get(name);
+      if (!backup) continue;
+      let shouldImport = localNeedsRestore(name, target);
+      if (!shouldImport && backup.createdTimestamp) {
         try {
-          fs.linkSync(v.path, e.path);
-        } catch {
-          fs.copyFileSync(v.path, e.path);
-        }
-      } catch (err) {
-        console.error('Could not re-link a vault file:', err.message);
+          // A newer channel snapshot wins over an older on-disk copy; a newer local file is preserved.
+          shouldImport = fs.statSync(target).mtimeMs + 1000 < backup.createdTimestamp;
+        } catch { shouldImport = true; }
+      }
+      if (!shouldImport) continue;
+      try {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        atomicWrite(target, backup.raw);
+        jsonRestored += 1;
+        console.log(`Auto-recovered ${name} from #${ch.name}.`);
+      } catch (e) {
+        console.error(`Failed to write restored ${name}:`, e.message);
       }
     }
-    // Files that survived on disk and already have a backup do not need uploading again
-    for (const fp of wanted) {
-      const rel = relData(fp);
-      try {
-        const g = completeGroup(idx, rel);
-        if (g && !blobBackedUp[rel] && fs.statSync(fp).size === g.size) blobBackedUp[rel] = g.size;
-      } catch {}
+
+    // Reload database objects after importing the newest valid snapshots.
+    try { deliveries = JSON.parse(fs.readFileSync(DELIVERIES_FILE, 'utf8')); } catch {}
+    try { downloads = JSON.parse(fs.readFileSync(DOWNLOADS_FILE, 'utf8')); } catch {}
+    try { vault = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8')); } catch {}
+    try { monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8')); } catch {}
+    try {
+      const restoredNotifications = JSON.parse(fs.readFileSync(NOTIFICATIONS_FILE, 'utf8'));
+      if (Array.isArray(restoredNotifications)) notificationHistory = restoredNotifications.slice(-100);
+    } catch {}
+    try { sendJobs = JSON.parse(fs.readFileSync(SEND_JOBS_FILE, 'utf8')); } catch {}
+
+    fs.mkdirSync(VAULT_DIR, { recursive: true });
+    fs.mkdirSync(FILES_DIR, { recursive: true });
+
+    // Rebase absolute paths saved by older Render instances into this instance's data directory.
+    const vaultRoot = path.resolve(VAULT_DIR) + path.sep;
+    const filesRoot = path.resolve(FILES_DIR) + path.sep;
+    for (const [key, item] of Object.entries(vault)) {
+      if (!item || typeof item !== 'object') continue;
+      if (!item.path || !path.resolve(String(item.path)).startsWith(vaultRoot)) {
+        item.path = path.join(VAULT_DIR, `${String(key).replace(/[^\w-]/g, '_')}_${String(item.originalName || 'file').replace(/[^\w.\-]/g, '_')}`);
+      }
     }
+    const rebaseFileRecords = (records) => {
+      for (const item of Object.values(records || {})) {
+        if (!item?.path) continue;
+        if (!path.resolve(String(item.path)).startsWith(filesRoot)) {
+          item.path = path.join(FILES_DIR, path.basename(String(item.path)));
+        }
+      }
+    };
+    rebaseFileRecords(deliveries);
+    rebaseFileRecords(downloads);
+
+    // Index every backed-up file part across the full channel history.
+    const groups = new Map();
+    const zipBackups = new Map();
+    const legacyVaultAttachments = new Map();
+    const backupLinks = new Map();
+    const addGroupPart = (rel, size, sha, partText, att) => {
+      rel = safeBackupRel(rel);
+      const [part, total] = String(partText || '').split('/').map(Number);
+      if (!rel || !att || !Number.isSafeInteger(size) || size < 1 || size > 150 * 1024 * 1024 || !part || !total || part > total || total > 30) return;
+      const key = `${rel}|${size}|${sha || ''}|${total}`;
+      if (!groups.has(key)) groups.set(key, { rel, size, sha: sha || null, total, parts: new Map(), created: 0 });
+      const group = groups.get(key);
+      if (!group.parts.has(part)) group.parts.set(part, att);
+    };
+
+    for (const msg of msgs) {
+      if (!trusted(msg)) continue;
+      const content = String(msg.content || '');
+      const att = msg.attachments.first();
+      if (content.startsWith('datafilezip-v1:') && att) {
+        try {
+          const meta = JSON.parse(content.slice('datafilezip-v1:'.length));
+          const rel = safeBackupRel(meta.rel);
+          const size = Number(meta.size);
+          if (rel && Number.isSafeInteger(size) && size > 0 && size <= 150 * 1024 * 1024 && typeof meta.entryName === 'string' && meta.entryName === path.basename(meta.entryName)) {
+            if (!zipBackups.has(rel)) zipBackups.set(rel, []);
+            zipBackups.get(rel).push({ att, size, sha: String(meta.sha256 || ''), entryName: meta.entryName });
+          }
+        } catch (e) { console.error('Invalid ZIP backup marker:', e.message); }
+      } else if (content.startsWith('datafile-v2:')) {
+        const bits = content.slice('datafile-v2:'.length).split('|');
+        if (bits.length >= 4) addGroupPart(bits[0], Number(bits[1]), bits[2], bits[3], att);
+      } else if (content.startsWith('datafile:')) {
+        const bits = content.slice('datafile:'.length).split('|');
+        if (bits.length >= 3) addGroupPart(bits.slice(0, -2).join('|'), Number(bits[bits.length - 2]), null, bits[bits.length - 1], att);
+      } else if (content.startsWith('datafilelink:')) {
+        const bits = content.slice('datafilelink:'.length).split('|');
+        if (bits.length >= 3) {
+          const rel = safeBackupRel(bits.slice(0, -2).join('|'));
+          const size = Number(bits[bits.length - 2]);
+          const url = bits[bits.length - 1];
+          if (rel && Number.isSafeInteger(size) && size > 0 && /^https?:\/\//i.test(url) && !backupLinks.has(rel)) backupLinks.set(rel, { size, url });
+        }
+      } else if (content.startsWith('vaultfile:') && att) {
+        const key = content.slice('vaultfile:'.length).trim();
+        if (key && !legacyVaultAttachments.has(key)) legacyVaultAttachments.set(key, att);
+      }
+    }
+
+    const allGroups = [...groups.values()];
+    const completeGroupsFor = (rel) => allGroups.filter((g) => g.rel === rel && g.parts.size === g.total);
+    const downloadGroup = async (g) => {
+      const chunks = [];
+      for (let i = 1; i <= g.total; i++) {
+        const partAtt = g.parts.get(i);
+        if (!partAtt) throw new Error(`missing part ${i}/${g.total}`);
+        const res = await fetch(partAtt.url);
+        if (!res.ok) throw new Error(`HTTP ${res.status} downloading part ${i}`);
+        chunks.push(Buffer.from(await res.arrayBuffer()));
+      }
+      const buf = Buffer.concat(chunks);
+      if (buf.length !== g.size) throw new Error(`size mismatch (${buf.length}/${g.size})`);
+      if (g.sha && crypto.createHash('sha256').update(buf).digest('hex') !== g.sha) throw new Error('SHA-256 mismatch');
+      return buf;
+    };
+    const downloadZipBackup = async (z) => {
+      const res = await fetch(z.att.url);
+      if (!res.ok) throw new Error(`HTTP ${res.status} downloading ZIP backup`);
+      const zipBuffer = Buffer.from(await res.arrayBuffer());
+      const zip = new AdmZip(zipBuffer);
+      const entry = zip.getEntry(z.entryName);
+      if (!entry || entry.isDirectory) throw new Error('ZIP does not contain the expected file');
+      const buf = entry.getData();
+      if (buf.length !== z.size) throw new Error(`ZIP file size mismatch (${buf.length}/${z.size})`);
+      if (z.sha && crypto.createHash('sha256').update(buf).digest('hex') !== z.sha) throw new Error('ZIP file SHA-256 mismatch');
+      return buf;
+    };
+
+    // Recreate old vault indexes from legacy vaultfile:key posts if the JSON index is absent.
+    for (const [key, att] of legacyVaultAttachments) {
+      if (!vault[key]) {
+        const safeKey = String(key).replace(/[^\w-]/g, '_');
+        vault[key] = {
+          path: path.join(VAULT_DIR, `${safeKey}_${String(att.name || 'recovered-file').replace(/[^\w.\-]/g, '_')}`),
+          originalName: att.name || 'recovered-file',
+          size: att.size,
+          addedAt: Date.now(),
+        };
+      }
+    }
+
+    const wanted = dataFilePaths();
+    let recovered = 0;
+    let alreadyPresent = 0;
+    const lost = [];
+    for (const fp of wanted) {
+      const rel = safeBackupRel(relData(fp));
+      if (!rel) continue;
+      const candidates = completeGroupsFor(rel);
+      let existingOk = false;
+      if (fs.existsSync(fp)) {
+        try {
+          const size = fs.statSync(fp).size;
+          const preferred = candidates[0];
+          const vaultRecord = Object.values(vault).find((item) => item?.path && path.resolve(String(item.path)) === path.resolve(fp));
+          if (preferred) {
+            if (size === preferred.size && (!preferred.sha || await sha256File(fp) === preferred.sha)) existingOk = true;
+          } else if (vaultRecord) {
+            const sizeMatches = !vaultRecord.size || size === Number(vaultRecord.size);
+            const hashMatches = !vaultRecord.sha256 || await sha256File(fp) === vaultRecord.sha256;
+            existingOk = sizeMatches && hashMatches;
+          } else {
+            existingOk = true;
+          }
+        } catch {}
+      }
+      if (existingOk) {
+        alreadyPresent += 1;
+        const matching = candidates.find((g) => {
+          try { return fs.statSync(fp).size === g.size; } catch { return false; }
+        });
+        if (matching?.sha) blobBackedUp[rel] = `${matching.size}:${matching.sha}`;
+        continue;
+      }
+
+      let restored = false;
+      let lastError = null;
+      for (const z of (zipBackups.get(rel) || [])) {
+        try {
+          const buf = await downloadZipBackup(z);
+          fs.mkdirSync(path.dirname(fp), { recursive: true });
+          atomicWrite(fp, buf);
+          if (z.sha) blobBackedUp[rel] = `${z.size}:${z.sha}`;
+          recovered += 1;
+          restored = true;
+          break;
+        } catch (e) { lastError = e; }
+      }
+      if (!restored) for (const g of candidates) {
+        try {
+          const buf = await downloadGroup(g);
+          fs.mkdirSync(path.dirname(fp), { recursive: true });
+          atomicWrite(fp, buf);
+          if (g.sha) blobBackedUp[rel] = `${g.size}:${g.sha}`;
+          recovered += 1;
+          restored = true;
+          break;
+        } catch (e) { lastError = e; }
+      }
+
+      if (!restored) {
+        const vaultKey = Object.keys(vault).find((k) => path.resolve(String(vault[k]?.path || '')) === path.resolve(fp));
+        const legacyAtt = vaultKey && legacyVaultAttachments.get(vaultKey);
+        if (legacyAtt) {
+          try {
+            const res = await fetch(legacyAtt.url);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const buf = Buffer.from(await res.arrayBuffer());
+            fs.mkdirSync(path.dirname(fp), { recursive: true });
+            atomicWrite(fp, buf);
+            recovered += 1;
+            restored = true;
+          } catch (e) { lastError = e; }
+        }
+      }
+
+      if (!restored && backupLinks.has(rel)) {
+        try {
+          const link = backupLinks.get(rel);
+          const res = await fetch(link.url, { signal: AbortSignal.timeout(120000) });
+          if (!res.ok) throw new Error(`backup link HTTP ${res.status}`);
+          const buf = Buffer.from(await res.arrayBuffer());
+          if (buf.length !== link.size) throw new Error('backup link size mismatch');
+          fs.mkdirSync(path.dirname(fp), { recursive: true });
+          atomicWrite(fp, buf);
+          recovered += 1;
+          restored = true;
+        } catch (e) { lastError = e; }
+      }
+
+      if (!restored) {
+        if (!fs.existsSync(fp)) lost.push(`${rel}${lastError ? ` (${lastError.message})` : ''}`);
+        else lost.push(`${rel} (backup checksum/size mismatch)`);
+      }
+    }
+
+    // Recreate delivery/download hard links that point at a restored vault file.
+    for (const entry of [...Object.values(deliveries), ...Object.values(downloads)]) {
+      if (!entry?.vaultKey || !entry.path || fs.existsSync(entry.path)) continue;
+      const item = vault[entry.vaultKey];
+      if (!item?.path || !fs.existsSync(item.path)) continue;
+      try {
+        fs.mkdirSync(path.dirname(entry.path), { recursive: true });
+        try { fs.linkSync(item.path, entry.path); } catch { fs.copyFileSync(item.path, entry.path); }
+      } catch (e) { console.error('Could not recreate a vault delivery link:', e.message); }
+    }
+
     if (Object.keys(vault).length) saveVault();
-    if (recovered) console.log(`Recovered ${recovered} file(s) from backup channel.`);
-    recoveryInfo = { ready: wanted.length - lost.length, total: wanted.length, restored: recovered, lost: [...lost] };
-    recoveryNote =
-      (wanted.length ? ` Files: ${wanted.length - lost.length} of ${wanted.length} ready${recovered ? ` (${recovered} restored from backup)` : ''}.` : '') +
-      (lost.length ? ` Could not recover: ${lost.join(', ')}. Re-add them (/vault add or a new invoice).` : '');
+    try {
+      const dbBuffers = Object.values(targets).map((fp) => fs.readFileSync(fp));
+      lastBackupHash = crypto.createHash('sha256').update(Buffer.concat(dbBuffers)).digest('hex');
+    } catch {}
+    lastBackupAt = msgs.find((m) => trusted(m) && String(m.content || '').startsWith('BANKROLL_BACKUP_SNAPSHOT'))?.createdTimestamp || lastBackupAt;
+    recoveryInfo = { ready: wanted.length - lost.length, total: wanted.length, restored: recovered, lost: [...lost], scannedMessages: msgs.length, jsonRestored };
+    recoveryNote = ` Scanned ${msgs.length} messages in #${ch.name}; restored ${jsonRestored} database file(s) and ${recovered} stored file(s); ${alreadyPresent} file(s) were already present.` +
+      (lost.length ? ` Could not recover: ${lost.join(', ')}.` : ' All indexed files are available.');
+    console.log(`Backup restore finished. JSON restored: ${jsonRestored}; files restored: ${recovered}; already present: ${alreadyPresent}; missing: ${lost.length}.`);
   } catch (e) {
     console.error('Auto-restore on startup failed:', e.message);
+    recoveryNote = ` Backup restore failed: ${e.message}`;
   } finally {
     restoreDone = true;
   }
@@ -1421,36 +1674,20 @@ const onReady = async () => {
   if (started) return;
   started = true;
   console.log(`Logged in as ${client.user.tag}`);
-  const commandJson = commands.map((c) => c.toJSON());
-  // Guild-level commands appear immediately; global commands support user-installed contexts.
-  const guildCommandJson = commandJson.map((command) => {
-    const copy = { ...command };
-    delete copy.contexts;
-    delete copy.integration_types;
-    return copy;
-  });
-  const targets = DISCORD_GUILD_ID
-    ? [await client.guilds.fetch(DISCORD_GUILD_ID).catch((e) => { throw new Error(`Could not find DISCORD_GUILD_ID ${DISCORD_GUILD_ID}: ${e.message}`); })]
-    : [...client.guilds.cache.values()];
-  let guildSuccess = 0;
-  for (const guild of targets) {
-    try {
-      await guild.commands.set(guildCommandJson);
-      guildSuccess += 1;
-      console.log(`Guild slash commands registered: ${guild.name} (${guild.id})`);
-    } catch (e) {
-      console.error(`Guild command registration failed for ${guild.id}:`, e);
-      await alertOwner(`Guild command registration failed (${guild.id})`, e);
-    }
-  }
   try {
-    await client.application.commands.set(commandJson);
-    console.log(`Global slash commands registered (${commandJson.length} commands).`);
+    if (DISCORD_GUILD_ID) {
+      // /sendfile must be global for a user-installed app in a private two-person DM.
+      await client.application.commands.set([sendfileCmd.toJSON()]);
+      const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
+      await guild.commands.set(commands.filter((c) => c.name !== 'sendfile').map((c) => c.toJSON()));
+      console.log(`Global /sendfile and guild commands registered to ${DISCORD_GUILD_ID}`);
+    } else {
+      await client.application.commands.set(commands.map((c) => c.toJSON()));
+      console.log('Global slash commands registered');
+    }
   } catch (e) {
-    console.error('Global command registration failed:', e);
-    await alertOwner('Global slash command registration failed', e);
+    console.error('Command registration failed:', e);
   }
-  console.log(`Command sync complete: ${guildSuccess}/${targets.length} guild(s), ${commandJson.length} global command(s).`);
 
   await autoRestoreOnStartup();
 
@@ -1755,7 +1992,7 @@ async function sendStripeCheckout(interaction) {
       }
     }
 
-    const mode = vaultKey ? 'direct' : (interaction.options.getString('delivery') ?? (BASE_URL ? 'link' : 'direct'));
+    const mode = interaction.options.getString('delivery') ?? (BASE_URL ? 'link' : 'direct');
     if ((file || vaultKey) && mode === 'link' && !BASE_URL) {
       throw new Error('Hosted links are not set up yet (PUBLIC_URL is missing). Pick Direct file upload.');
     }
@@ -1833,7 +2070,6 @@ async function sendStripeCheckout(interaction) {
       saveDelivery(session.id, fileData, interaction, customer);
       if (vaultKey) {
         deliveries[session.id].vaultKey = vaultKey;
-        deliveries[session.id].mode = 'direct';
         saveDeliveries();
       }
     }
@@ -1854,7 +2090,7 @@ async function sendStripeCheckout(interaction) {
       embed.addFields({ name: 'Pay by', value: `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
     }
     if (fileData) {
-      embed.addFields({ name: 'File', value: `${fileData.name} (click Get my file after payment to receive the ZIP here)` });
+      embed.addFields({ name: 'File', value: `${fileData.name} (sent here after payment, or press Get my file)` });
     }
     if (linkUrl) {
       embed.addFields({ name: 'Download', value: 'Link sent here after payment, or press Get my file' });
@@ -1952,7 +2188,7 @@ async function sendMonzoInvoice(interaction) {
       }
     }
 
-    const mode = vaultKey ? 'direct' : (interaction.options.getString('delivery') ?? (BASE_URL ? 'link' : 'direct'));
+    const mode = interaction.options.getString('delivery') ?? (BASE_URL ? 'link' : 'direct');
     if ((file || vaultKey) && mode === 'link' && !BASE_URL) {
       throw new Error('Hosted links are not set up yet (PUBLIC_URL is missing). Pick Direct file upload.');
     }
@@ -1975,7 +2211,6 @@ async function sendMonzoInvoice(interaction) {
       saveDelivery(key, fileData, interaction, customer);
       if (vaultKey) {
         deliveries[key].vaultKey = vaultKey;
-        deliveries[key].mode = 'direct';
         saveDeliveries();
       }
     } else if (linkUrl) saveLinkDelivery(key, linkUrl, interaction, customer);
@@ -2027,7 +2262,7 @@ async function sendMonzoInvoice(interaction) {
       );
     embed.addFields({ name: 'Pay by', value: `<t:${tsec(monzoLedger[key].expiresAt)}:R>` });
     if (MONZO_PAYMENT_DETAILS) embed.addFields({ name: 'Pay to', value: MONZO_PAYMENT_DETAILS.replace(/\\n/g, '\n') });
-    if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (click Get my file after payment to receive the ZIP here)` });
+    if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (sent here as soon as payment lands, or press Get my file)` });
     if (linkUrl) embed.addFields({ name: 'Download', value: 'Link sent here as soon as payment lands, or press Get my file' });
     embed
       .addFields(
@@ -2209,9 +2444,8 @@ async function cmdVault(interaction) {
 
   if (sub === 'add') {
     const att = interaction.options.getAttachment('file');
-    const key = interaction.options.getString('name').toLowerCase().trim().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').slice(0, 60);
-    if (!key) return interaction.editReply('Choose a vault name containing letters or numbers.');
-
+    const key = interaction.options.getString('name').toLowerCase().trim().replace(/[^a-z0-9\-_]/g, '-');
+    
     if (vault[key] && fs.existsSync(vault[key].path)) {
       return interaction.editReply(`A vault item with the name **${key}** already exists. Remove it first or pick a different name.`);
     }
@@ -2243,7 +2477,7 @@ async function cmdVault(interaction) {
     };
     delete blobBackedUp[relData(filePath)];
     saveVault();
-    await notifyEvent('vault.add', 'Vault file added', `\`${key}\` — ${att.name} (${(info.size / 1048576).toFixed(2)} MB)`, 'success');
+    recordNotification('vault.add', 'Vault file added', `${key}: ${att.name}`, 'success');
 
     let codeNote = '';
     if (/\.zip$/i.test(att.name)) {
@@ -2269,6 +2503,69 @@ async function cmdVault(interaction) {
     return;
   }
 
+  if (sub === 'search') {
+    const query = interaction.options.getString('query').trim().toLowerCase();
+    const matches = Object.entries(vault).filter(([key, item]) =>
+      key.toLowerCase().includes(query) || String(item.originalName || '').toLowerCase().includes(query)
+    ).slice(0, 25);
+    if (!matches.length) return interaction.editReply(`No vault files matched \`${query}\`.`);
+    return interaction.editReply(matches.slice(0, 12).map(([key, item]) =>
+      `• \`${key}\` — ${item.originalName || 'unnamed'} (${fs.existsSync(item.path) ? 'available' : 'missing'})`
+    ).join('\n').slice(0, 1900));
+  }
+
+  if (sub === 'verify') {
+    const key = interaction.options.getString('name');
+    const item = vault[key];
+    if (!item) return interaction.editReply(`Vault item \`${key}\` not found.`);
+    if (!item.path || !fs.existsSync(item.path)) return interaction.editReply(`\`${key}\` is missing from disk. Re-add the file with /vault add.`);
+    try {
+      const actualHash = await sha256File(item.path);
+      const actualSize = fs.statSync(item.path).size;
+      let zipCheck = 'Not a ZIP file';
+      if (/\.zip$/i.test(item.originalName || item.path)) {
+        try {
+          const zip = new AdmZip(item.path);
+          zip.getEntries();
+          zipCheck = 'ZIP opened successfully';
+        } catch (zipError) {
+          zipCheck = `ZIP could not be opened: ${short(zipError.message, 180)}`;
+        }
+      }
+      const hashMatches = !item.sha256 || item.sha256 === actualHash;
+      if (!item.sha256) { item.sha256 = actualHash; saveVault(); }
+      if (!item.size || item.size !== actualSize) { item.size = actualSize; saveVault(); }
+      return interaction.editReply({ embeds: [new EmbedBuilder().setColor(hashMatches ? GREEN : RED)
+        .setTitle(`Vault verification: ${key}`)
+        .setDescription(hashMatches ? 'File exists and checksum is valid.' : 'Checksum mismatch: the file may have changed or become corrupted.')
+        .addFields(
+          { name: 'Filename', value: String(item.originalName || 'Unknown'), inline: true },
+          { name: 'Size', value: `${(actualSize / (1024 * 1024)).toFixed(2)} MB`, inline: true },
+          { name: 'SHA-256', value: actualHash },
+          { name: 'ZIP check', value: zipCheck }
+        )] });
+    } catch (e) {
+      return interaction.editReply(`Could not verify \`${key}\`: ${e.message}`);
+    }
+  }
+
+  if (sub === 'rename') {
+    const oldKey = interaction.options.getString('name');
+    const newKey = interaction.options.getString('new_name').toLowerCase().trim().replace(/[^a-z0-9_-]/g, '-').slice(0, 60);
+    if (!/^[a-z0-9][a-z0-9_-]{0,59}$/.test(newKey)) return interaction.editReply('Choose a key using letters, numbers, underscores or hyphens.');
+    if (!vault[oldKey]) return interaction.editReply(`Vault item \`${oldKey}\` not found.`);
+    if (vault[newKey]) return interaction.editReply(`Vault key \`${newKey}\` already exists.`);
+    vault[newKey] = { ...vault[oldKey] };
+    delete vault[oldKey];
+    for (const d of [...Object.values(deliveries), ...Object.values(downloads)]) {
+      if (d?.vaultKey === oldKey) d.vaultKey = newKey;
+    }
+    saveVault(); saveDeliveries(); saveDownloads();
+    await interaction.editReply(`Renamed vault key \`${oldKey}\` to \`${newKey}\`. The file itself was not changed.`);
+    recordNotification('vault.rename', 'Vault item renamed', `${oldKey} -> ${newKey}`, 'success');
+    return;
+  }
+
   if (sub === 'list') {
     const keys = Object.keys(vault);
     if (!keys.length) return interaction.editReply('Your vault is currently empty.');
@@ -2281,8 +2578,7 @@ async function cmdVault(interaction) {
     const embed = new EmbedBuilder()
       .setColor(GREEN)
       .setTitle(`Vault Inventory (${keys.length} items)`)
-      .setDescription(short(lines.join('\n'), 4000))
-      .setFooter({ text: 'Use /vault search to find an item, /vault info for details, or /vault verify to check its file.' });
+      .setDescription(lines.join('\n'));
     return interaction.editReply({ embeds: [embed] });
   }
 
@@ -2297,10 +2593,7 @@ async function cmdVault(interaction) {
       .addFields(
         { name: 'Original Filename', value: item.originalName, inline: true },
         { name: 'File Size', value: `${(item.size / (1024 * 1024)).toFixed(2)} MB`, inline: true },
-        { name: 'Added At', value: item.addedAt ? `<t:${Math.floor(item.addedAt / 1000)}:f>` : 'Unknown', inline: true },
-        { name: 'File Status', value: fs.existsSync(item.path) ? 'Available' : 'Missing', inline: true },
-        { name: 'Checksum', value: item.sha256 ? `\`${item.sha256.slice(0, 16)}…\`` : 'Not recorded', inline: true },
-        { name: 'Spawn Code', value: item.spawncode ? `\`${item.spawncode}\`` : 'Not recorded', inline: true }
+        { name: 'Added At', value: `<t:${Math.floor(item.addedAt / 1000)}:f>`, inline: true }
       );
     return interaction.editReply({ embeds: [embed] });
   }
@@ -2361,7 +2654,7 @@ async function cmdVault(interaction) {
     };
     delete blobBackedUp[relData(outPath)];
     saveVault();
-    await notifyEvent('vault.edit', 'Vault ZIP edited', `\`${key}\`: spawn code \`${oldCode}\` → \`${newCode}\`. Saved as \`${newKey}\`.`, 'success');
+    recordNotification('vault.edit', 'Vault file edited', `${key} -> ${newKey}`, 'success');
 
     const lines = [
       `Saved as vault item \`${newKey}\` (**${outName}**). Spawn code \`${oldCode}\` is now \`${newCode}\`.`,
@@ -2379,67 +2672,6 @@ async function cmdVault(interaction) {
     return;
   }
 
-  if (sub === 'search') {
-    const query = interaction.options.getString('query').trim().toLowerCase();
-    const matches = Object.entries(vault).filter(([key, item]) => `${key} ${item.originalName || ''}`.toLowerCase().includes(query)).slice(0, 20);
-    if (!matches.length) return interaction.editReply(`No vault files matched \`${query}\`.`);
-    const lines = matches.map(([key, item]) => `• \`${key}\` — ${short(item.originalName, 70)} (${fs.existsSync(item.path) ? 'available' : 'missing'})`);
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(GREEN).setTitle(`Vault search: ${matches.length} result(s)`).setDescription(lines.join('\n'))] });
-  }
-
-  if (sub === 'verify') {
-    const key = interaction.options.getString('name');
-    const item = vault[key];
-    if (!item) return interaction.editReply(`Vault item \`${key}\` not found.`);
-    if (!fs.existsSync(item.path)) {
-      await notifyEvent('vault.verify', 'Vault file missing', `\`${key}\` points to a file that is not on disk.`, 'error');
-      return interaction.editReply(`The file for \`${key}\` is missing from disk. Re-add it with /vault add.`);
-    }
-    const actual = crypto.createHash('sha256').update(await fs.promises.readFile(item.path)).digest('hex');
-    const matches = !item.sha256 || actual === item.sha256;
-    let zipStatus = 'Not a ZIP file';
-    if (/\.zip$/i.test(item.originalName)) {
-      try { new AdmZip(item.path).getEntries(); zipStatus = 'ZIP readable'; }
-      catch { zipStatus = 'ZIP could not be opened'; }
-    }
-    const embed = new EmbedBuilder().setColor(matches && zipStatus !== 'ZIP could not be opened' ? GREEN : RED)
-      .setTitle(`Vault verification: ${key}`)
-      .addFields(
-        { name: 'File', value: 'Present', inline: true },
-        { name: 'Checksum', value: matches ? (item.sha256 ? 'Matches saved SHA-256' : 'No previous checksum; current checksum recorded') : 'MISMATCH', inline: true },
-        { name: 'Archive', value: zipStatus, inline: true }
-      );
-    if (!item.sha256) { item.sha256 = actual; item.size = fs.statSync(item.path).size; saveVault(); }
-    await interaction.editReply({ embeds: [embed] });
-    if (!matches || zipStatus === 'ZIP could not be opened') await notifyEvent('vault.verify', 'Vault verification warning', `\`${key}\` needs attention. Checksum: ${matches ? 'OK' : 'MISMATCH'}; archive: ${zipStatus}.`, 'error');
-    return;
-  }
-
-  if (sub === 'rename') {
-    const key = interaction.options.getString('name');
-    const item = vault[key];
-    if (!item || !fs.existsSync(item.path)) return interaction.editReply(`Vault item \`${key}\` was not found or its file is missing.`);
-    const newKey = interaction.options.getString('new_name').toLowerCase().trim().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').slice(0, 60);
-    if (!newKey) return interaction.editReply('Enter a valid new vault key.');
-    if (newKey === key) return interaction.editReply('That is already the current key.');
-    if (vault[newKey]) return interaction.editReply(`A vault item called \`${newKey}\` already exists.`);
-    const extName = path.basename(item.path);
-    const safeOriginalName = String(item.originalName || path.basename(extName)).replace(/[^\w.\-]/g, '_');
-    const newPath = path.join(VAULT_DIR, `${newKey}_${safeOriginalName}`);
-    try { await fs.promises.rename(item.path, newPath); }
-    catch (e) { return interaction.editReply(`Could not rename the stored file: ${e.message}`); }
-    delete blobBackedUp[relData(item.path)];
-    item.path = newPath;
-    item.renamedAt = Date.now();
-    vault[newKey] = item;
-    delete vault[key];
-    saveVault();
-    await notifyEvent('vault.rename', 'Vault item renamed', `\`${key}\` → \`${newKey}\` (${item.originalName})`, 'success');
-    clearTimeout(backupTimer);
-    backupData().catch(() => {});
-    return interaction.editReply(`Renamed vault key \`${key}\` to \`${newKey}\`. The file contents are unchanged.`);
-  }
-
   if (sub === 'remove') {
     const key = interaction.options.getString('name');
     if (!vault[key]) return interaction.editReply(`Vault item \`${key}\` not found.`);
@@ -2447,29 +2679,13 @@ async function cmdVault(interaction) {
     try {
       fs.unlinkSync(vault[key].path);
     } catch {}
-    const removedName = vault[key].originalName;
     delete blobBackedUp[relData(vault[key].path)];
     delete vault[key];
     saveVault();
-    await notifyEvent('vault.remove', 'Vault file removed', `\`${key}\` — ${removedName}`, 'warning');
+    recordNotification('vault.remove', 'Vault file removed', key, 'success');
 
     return interaction.editReply(`Removed \`${key}\` from the vault.`);
   }
-}
-
-// ---------- /notifications ----------
-async function cmdNotifications(interaction) {
-  if (!allowed.has(interaction.user.id)) return interaction.reply({ content: 'Only authorized users can view notifications.', ephemeral: true });
-  await interaction.deferReply({ ephemeral: true });
-  const sub = interaction.options.getSubcommand();
-  if (sub === 'test') {
-    await notifyEvent('system.test', 'Bankroll notification test', `Test requested by ${interaction.user.tag}. Owner DM and log delivery were attempted.`, 'success');
-    return interaction.editReply('Test notification recorded. Check the owner DMs and #bankroll-log (if configured).');
-  }
-  const recent = notificationHistory.slice(-10).reverse();
-  if (!recent.length) return interaction.editReply('No notifications have been recorded yet.');
-  const lines = recent.map((n) => `${n.status === 'error' ? '⚠️' : n.status === 'success' ? '✅' : 'ℹ️'} **${short(n.title, 80)}** — ${short(n.detail, 180)} · <t:${Math.floor(n.at / 1000)}:R>`);
-  return interaction.editReply({ embeds: [new EmbedBuilder().setColor(GREY).setTitle('Recent notifications').setDescription(lines.join('\n')).setFooter({ text: `Showing ${recent.length} of the latest 100 saved notifications.` })] });
 }
 
 // ---------- /cancel ----------
@@ -2618,6 +2834,28 @@ async function cmdUnpaid(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
+async function cmdNotifications(interaction) {
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'test') {
+    const embed = new EmbedBuilder().setColor(GREEN).setTitle('Bankroll notification test')
+      .setDescription('Notifications are working. This test has been saved to notification history.')
+      .setTimestamp();
+    await notifyOwner({ embeds: [embed] }, { notificationType: 'notification.test', notificationStatus: 'success' });
+    return interaction.editReply('Test notification sent to the bot owner (or check the logs if DMs are disabled).');
+  }
+  const count = interaction.options.getInteger('count') || 10;
+  const recent = notificationHistory.slice(-count).reverse();
+  if (!recent.length) return interaction.editReply('No notifications have been recorded yet.');
+  const lines = recent.map((n) => {
+    const stamp = Math.floor((n.at || Date.now()) / 1000);
+    const mark = n.status === 'error' ? '❌' : n.status === 'success' ? '✅' : 'ℹ️';
+    return `${mark} <t:${stamp}:R> **${short(n.title, 90)}**\n${short(n.detail, 180)}`;
+  });
+  const embed = new EmbedBuilder().setColor(GREY).setTitle('Recent notifications')
+    .setDescription(lines.join('\n\n').slice(0, 4000));
+  return interaction.editReply({ embeds: [embed] });
+}
+
 async function cmdStatus(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the owner can run this.');
   let open = 'unknown';
@@ -2637,12 +2875,11 @@ async function cmdStatus(interaction) {
       { name: 'Reminders queued', value: String(agentReminderTimers.size + monzoReminderTimers.size), inline: true },
       { name: 'Files waiting', value: String(Object.keys(deliveries).length), inline: true },
       { name: 'Vault items', value: String(Object.keys(vault).length), inline: true },
-      { name: 'Saved notifications', value: String(notificationHistory.length), inline: true },
-      { name: 'Slash command scope', value: DISCORD_GUILD_ID ? `Guild (${DISCORD_GUILD_ID})` : 'Global', inline: true },
+      { name: 'Notifications saved', value: String(notificationHistory.length), inline: true },
       { name: 'Hosted links', value: BASE_URL ? 'On' : 'Off (PUBLIC_URL not set)', inline: true },
       {
         name: 'File storage',
-        value: process.env.DATA_DIR ? 'Persistent folder set' : 'Default folder (wiped on redeploy)',
+        value: short(DATA_DIR_STATUS, 100),
         inline: true,
       },
       { name: 'Last Stripe notice', value: lastWebhookAt ? `${when(lastWebhookAt)} (${lastWebhookType})` : 'None since start', inline: true },
@@ -2670,14 +2907,13 @@ async function cmdRestore(interaction) {
   } catch {
     return interaction.editReply('That file could not be read as a backup.');
   }
+  if (!data || typeof data !== 'object' || (Array.isArray(data) && target !== 'notifications')) {
+    return interaction.editReply('That file does not look like a backup.');
+  }
   if (target === 'notifications') {
-    if (!Array.isArray(data)) return interaction.editReply('That notifications backup is not a valid JSON list.');
-    notificationHistory = data.filter((n) => n && typeof n === 'object').slice(-100);
+    notificationHistory = Array.isArray(data) ? data.filter((n) => n && typeof n === 'object').slice(-100) : [];
     saveNotifications();
     return interaction.editReply(`Restored ${notificationHistory.length} notification record(s).`);
-  }
-  if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    return interaction.editReply('That file does not look like a backup.');
   }
 
   const store = target === 'deliveries' ? deliveries : target === 'downloads' ? downloads : target === 'monzo' ? monzoLedger : vault;
@@ -2715,7 +2951,7 @@ async function cmdRestore(interaction) {
         skipped += 1;
         continue;
       }
-    } else if (target !== 'vault' && target !== 'monzo') {
+    } else if (target !== 'vault' && target !== 'monzo' && target !== 'notifications') {
       skipped += 1;
       continue;
     }
@@ -3022,7 +3258,8 @@ async function onAutocomplete(interaction) {
     if (
       (interaction.commandName === 'vault' && ['remove', 'info', 'edit', 'verify', 'rename'].includes(interaction.options.getSubcommand())) ||
       interaction.commandName === 'bankroll' ||
-      interaction.commandName === 'bankroll-monzo'
+      interaction.commandName === 'bankroll-monzo' ||
+      interaction.commandName === 'sendfile'
     ) {
       const typed = interaction.options.getFocused().toLowerCase();
       const entries = Object.entries(vault);
@@ -3261,7 +3498,18 @@ async function onGetFile(interaction) {
 
   let dlink = d.link || null;
   let hosted = false;
-  if (!d.vaultKey && !dlink && BASE_URL && d.mode !== 'direct' && d.path && fs.existsSync(d.path)) {
+  if (d.fallbackLink) {
+    const token = d.fallbackLink.split('/').pop();
+    const savedLink = downloads[token];
+    if (savedLink && !savedLink.used && Date.now() < savedLink.expiresAt && fs.existsSync(savedLink.path)) {
+      dlink = d.fallbackLink;
+      hosted = true;
+    } else {
+      delete d.fallbackLink;
+      saveDeliveries();
+    }
+  }
+  if (!dlink && !d.vaultKey && BASE_URL && d.mode !== 'direct' && d.path && fs.existsSync(d.path)) {
     dlink = makeDownloadLink(d, checkPi);
     hosted = true;
   }
@@ -3270,40 +3518,55 @@ async function onGetFile(interaction) {
     try {
       buffer = fs.readFileSync(d.path);
     } catch {
+      delete deliveries[key];
+      saveDeliveries();
       return interaction.reply({
-        content: 'Sorry, the file is not available on the bot right now. Please contact the seller so it can be restored to the vault.',
+        content: 'Sorry, the file is no longer available.',
         ephemeral: true,
       });
     }
   }
 
-  // Acknowledge the button but leave it in place until the upload succeeds.
-  // If Discord rejects an oversized attachment, the customer can retry after the seller fixes it.
   await interaction.deferUpdate();
   let msg;
+  const sendGetFilePayload = () => dlink
+    ? { content: `<@${d.customerId}> here is your download link${hosted ? ' (valid for 24 hours and one download)' : ''}:\n<${dlink}>` }
+    : {
+        content: `<@${d.customerId}> here is the file for this purchase.`,
+        files: [new AttachmentBuilder(buffer, { name: d.name })],
+      };
   try {
-    msg = await interaction.followUp(
-      dlink
-        ? { content: `<@${d.customerId}> here is your download link:\n<${dlink}>` }
-        : {
-            content: `<@${d.customerId}> here is the ZIP file for this purchase.`,
-            files: [new AttachmentBuilder(buffer, { name: d.name })],
-          }
-    );
-  } catch (e) {
-    console.error('Get my file upload failed:', e.message);
-    return interaction.followUp({
-      content: `Discord could not attach **${d.name}**. The file may be larger than this server's upload limit. The Get my file button is still available; ask the seller to check the server's upload limit.`,
-      ephemeral: true,
-    }).catch(() => {});
+    msg = await interaction.followUp(sendGetFilePayload());
+  } catch (attachmentError) {
+    console.error('Get my file attachment failed:', attachmentError.message);
+    if (!dlink && BASE_URL && d.path && fs.existsSync(d.path)) {
+      try {
+        dlink = makeDownloadLink(d, checkPi);
+        hosted = true;
+        d.fallbackLink = dlink;
+        saveDeliveries();
+        msg = await interaction.followUp(sendGetFilePayload());
+      } catch (linkError) {
+        console.error('Get my file link fallback failed:', linkError.message);
+        return interaction.followUp({
+          content: `Discord rejected the ZIP and the download link could not be sent. Your paid file is still saved. Please contact the seller. Error: ${short(linkError.message, 180)}`,
+          ephemeral: true,
+        });
+      }
+    } else {
+      return interaction.followUp({
+        content: `Discord rejected the ZIP (${short(attachmentError.message, 180)}). ${BASE_URL ? 'The download link could not be created; your paid file is still saved. Please contact the seller.' : 'The seller needs to set PUBLIC_URL in Render to enable the download-link fallback.'}`,
+        ephemeral: true,
+      });
+    }
   }
   const old = interaction.message.embeds[0];
   await interaction.message.edit({
     embeds: old ? [EmbedBuilder.from(old).setColor(GREY).setTitle(String(old.title || '').startsWith('PAID') ? old.title : `PAID - ${old.title}`)] : [],
     components: [],
-  }).catch((e) => console.error('Could not remove Get my file button:', e.message));
+  }).catch(() => {});
 
-  if (d.path && !hosted && !d.vaultKey) {
+  if (d.path && !hosted) {
     try {
       fs.unlinkSync(d.path);
     } catch {}
@@ -3322,7 +3585,122 @@ async function onGetFile(interaction) {
   await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}>.` });
 }
 
+function sendfileProgress(job, now = Date.now()) {
+  const total = Math.max(1, job.dueAt - job.createdAt);
+  const pct = Math.max(0, Math.min(100, Math.floor(((now - job.createdAt) / total) * 100)));
+  const filled = Math.round(pct / 10);
+  const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
+  const eta = Math.floor(job.dueAt / 1000);
+  const durationMinutes = total / 60000;
+  // Match the requested display examples: 2 minutes = 2 GB; 2 hours = 200 GB.
+  const searchGb = Math.max(2, Math.round(2 + ((durationMinutes - 2) * 198 / 118)));
+  const state = now >= job.dueAt ? 'Search complete — ready to retrieve' : `Searching through approximately **${searchGb} GB** of disk space`;
+  return `**Scheduled file: ${job.originalName}**\n${bar} **${pct}%**\n${state}\nEstimated completion: <t:${eta}:F> (<t:${eta}:R>)\nUse **Check progress / Get File** to refresh this status. When it reaches 100%, the button attempts the ZIP first and a download link second.`;
+}
+function sendfileButton(jobId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`sendfile:${jobId}`).setLabel('Check progress / Get File').setStyle(ButtonStyle.Primary)
+  );
+}
+async function startScheduledSend(interaction) {
+  if (interaction.inGuild() || interaction.channel?.type !== ChannelType.DM) {
+    return interaction.reply({ content: 'Run /sendfile inside a one-to-one private DM, not in a server or group DM.', ephemeral: true });
+  }
+  const key = interaction.options.getString('file', true);
+  const item = vault[key];
+  if (!item || !item.path || !fs.existsSync(item.path)) {
+    return interaction.reply({ content: `Vault file \`${key}\` is unavailable. Check it with /vault verify.`, ephemeral: true });
+  }
+  if (!/\.zip$/i.test(String(item.originalName || item.path))) {
+    return interaction.reply({ content: ' /sendfile currently accepts ZIP files only. Add a .zip file to the vault first.', ephemeral: true });
+  }
+  try { new AdmZip(item.path).getEntries(); }
+  catch { return interaction.reply({ content: 'That vault item is not a readable ZIP file. Check it with /vault verify.', ephemeral: true }); }
+  const amount = interaction.options.getInteger('delay', true);
+  const unit = interaction.options.getString('unit', true);
+  const multiplier = unit === 'hours' ? 60 * 60 * 1000 : 60 * 1000;
+  const durationMs = amount * multiplier;
+  if (durationMs > 30 * 24 * 60 * 60 * 1000) {
+    return interaction.reply({ content: 'The maximum delay is 30 days.', ephemeral: true });
+  }
+  const jobId = crypto.randomBytes(9).toString('hex');
+  const now = Date.now();
+  const job = {
+    id: jobId,
+    vaultKey: key,
+    originalName: String(item.originalName || path.basename(item.path)),
+    ownerId: interaction.user.id,
+    channelId: interaction.channelId,
+    createdAt: now,
+    dueAt: now + durationMs,
+    status: 'waiting',
+  };
+  sendJobs[jobId] = job;
+  saveSendJobs();
+  await interaction.reply({ content: sendfileProgress(job, now), components: [sendfileButton(jobId)], allowedMentions: { parse: [] } });
+  try {
+    const msg = await interaction.fetchReply();
+    job.messageId = msg.id;
+    saveSendJobs();
+  } catch (e) { console.error('Could not save /sendfile message ID:', e.message); }
+}
+async function onScheduledSendButton(interaction) {
+  const jobId = interaction.customId.slice('sendfile:'.length);
+  const job = sendJobs[jobId];
+  if (!job || job.channelId !== interaction.channelId) {
+    return interaction.reply({ content: 'This scheduled file request could not be found in this DM.', ephemeral: true });
+  }
+  if (job.status === 'sent' || job.status === 'link_sent') {
+    return interaction.reply({ content: job.status === 'sent' ? 'This ZIP has already been sent.' : 'The download link has already been sent.', ephemeral: true });
+  }
+  if (Date.now() < job.dueAt) {
+    return interaction.update({ content: sendfileProgress(job), components: [sendfileButton(jobId)], allowedMentions: { parse: [] } });
+  }
+
+  const item = vault[job.vaultKey];
+  if (!item?.path || !fs.existsSync(item.path)) {
+    return interaction.update({ content: `The scheduled time has arrived, but vault file \`${job.vaultKey}\` is missing. Re-add it, then contact the bot owner.`, components: [sendfileButton(jobId)] });
+  }
+
+  try {
+    await interaction.reply({ content: `**${job.originalName}** — scheduled delivery complete.`, files: [new AttachmentBuilder(item.path, { name: path.basename(job.originalName) })], allowedMentions: { parse: [] } });
+    job.status = 'sent';
+    job.completedAt = Date.now();
+    saveSendJobs();
+    await interaction.message.edit({ components: [] }).catch(() => {});
+    return;
+  } catch (uploadError) {
+    console.error('Scheduled ZIP upload failed; trying link fallback:', uploadError.message);
+  }
+
+  if (BASE_URL) {
+    try {
+      const rel = relData(item.path);
+      if (!rel) throw new Error('Vault file is outside the configured data directory.');
+      const link = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
+      const content = `Discord could not attach **${job.originalName}**. Here is the download link instead:\n${link}`;
+      if (interaction.deferred || interaction.replied) await interaction.followUp({ content, allowedMentions: { parse: [] } });
+      else await interaction.reply({ content, allowedMentions: { parse: [] } });
+      job.status = 'link_sent';
+      job.completedAt = Date.now();
+      saveSendJobs();
+      await interaction.message.edit({ components: [] }).catch(() => {});
+      return;
+    } catch (linkError) {
+      console.error('Scheduled file link fallback failed:', linkError.message);
+    }
+  }
+
+  const retryRow = sendfileButton(jobId);
+  const failure = `I couldn't send **${job.originalName}** as a ZIP${BASE_URL ? ' or create its download link' : '. No PUBLIC_URL is configured, so a link cannot be created'}. You can press **Check progress / Get File** to retry.`;
+  try {
+    if (interaction.deferred || interaction.replied) await interaction.followUp({ content: failure, components: [retryRow], allowedMentions: { parse: [] } });
+    else await interaction.reply({ content: failure, components: [retryRow], allowedMentions: { parse: [] } });
+  } catch (e) { console.error('Could not report scheduled send failure:', e.message); }
+}
+
 async function onButton(interaction) {
+  if (interaction.customId.startsWith('sendfile:')) return onScheduledSendButton(interaction);
   if (interaction.customId.startsWith('getfile:')) return onGetFile(interaction);
   if (interaction.customId.startsWith('refund_')) return onRefundButton(interaction);
   if (!interaction.customId.startsWith('delivered:')) return;
@@ -3392,8 +3770,8 @@ client.on('interactionCreate', async (interaction) => {
         return await sendMonzoInvoice(interaction);
       case 'vault':
         return await cmdVault(interaction);
-      case 'notifications':
-        return await cmdNotifications(interaction);
+      case 'sendfile':
+        return await startScheduledSend(interaction);
       case 'cancel':
         return await cmdCancel(interaction);
       case 'remind':
@@ -3407,6 +3785,9 @@ client.on('interactionCreate', async (interaction) => {
       case 'status':
         await interaction.deferReply({ ephemeral: true });
         return await cmdStatus(interaction);
+      case 'notifications':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdNotifications(interaction);
       case 'currency':
         await interaction.deferReply({ ephemeral: true });
         return await cmdCurrency(interaction);
