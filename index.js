@@ -988,8 +988,12 @@ async function updateInvoicePaidMessage(d, key, paymentIntentId = null) {
       { name: 'Transaction Reference', value: String(d.txId || paymentIntentId || d.paymentIntentId || key).slice(0,100) }
     );
   const rows = [];
+  // Once payment is confirmed, remove the old Download ZIP interaction button.
+  // The customer receives one delivery message with the actual secure download link.
   for (const row of invoice.components || []) {
-    const kept = (row.components || []).filter((component) => component.customId);
+    const kept = (row.components || []).filter((component) =>
+      component.customId && !String(component.customId).startsWith('getfile:')
+    );
     if (kept.length) rows.push(new ActionRowBuilder().addComponents(kept.map((component) => ButtonBuilder.from(component))));
   }
   try {
@@ -4319,18 +4323,32 @@ app.get('/:name/:token', (req, res) => {
     return res.status(200).send('Download link');
   }
   t.used = true; activeDownloadTokens.add(token); saveDownloads();
+  const downloadStartedAt = Date.now();
+  const expectedBytes = fs.statSync(t.path).size;
   res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Length', String(expectedBytes));
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(t.name)}`);
   let finished = false;
   res.on('finish', () => {
     finished = true;
+    const downloadedAt = Date.now();
+    const elapsedMs = downloadedAt - downloadStartedAt;
     try {
       fs.unlinkSync(t.path);
     } catch {}
     delete downloads[token]; activeDownloadTokens.delete(token); saveDownloads();
-    recordDownloadEvent('download_completed',{file:t.name,customerId:t.customerId,agentId:t.agentId,token,detail:'The complete file was successfully streamed.'});
-    notifyOwner({ content: `<@${t.customerId}> downloaded "${t.name}".` });
-    recordInStripe(t.paymentIntentId, { downloaded_at: new Date().toISOString() });
+    recordDownloadEvent('download_completed', {
+      file:t.name, customerId:t.customerId, agentId:t.agentId, token,
+      detail:`Completed file transfer: ${expectedBytes} bytes in ${elapsedMs} ms at ${new Date(downloadedAt).toISOString()}.`
+    });
+    notifyOwner({
+      content: `<@${t.customerId}> successfully downloaded **${t.name}**.\nCompleted: <t:${Math.floor(downloadedAt/1000)}:F>\nFile size: ${(expectedBytes/(1024*1024)).toFixed(2)} MB.`
+    });
+    recordInStripe(t.paymentIntentId, {
+      downloaded_at: new Date(downloadedAt).toISOString(),
+      downloaded_file: String(t.name || '').slice(0,100),
+      downloaded_bytes: String(expectedBytes)
+    });
   });
   res.on('close', () => { if(!finished){t.used=false;activeDownloadTokens.delete(token);saveDownloads();recordDownloadEvent('download_interrupted',{file:t.name,customerId:t.customerId,token,detail:'Connection closed before the file finished; link re-enabled.'});} });
   const stream = fs.createReadStream(t.path);
