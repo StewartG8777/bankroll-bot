@@ -44,6 +44,8 @@ const {
   MONZO_ACCOUNT_ID = '',
   MONZO_ACCESS_TOKEN = '',
   DISCORD_GUILD_ID = '',
+  RENDER_API_KEY = '',
+  RENDER_SERVICE_ID = '',
 } = process.env;
 
 const MONZO_LINK = (MONZO_ME_URL || (MONZO_USERNAME ? `https://monzo.me/${MONZO_USERNAME.replace(/^\/+|\/+$/g, '')}` : '')).replace(/\/+$/, '');
@@ -1450,6 +1452,22 @@ const previewCmd = common(
   new SlashCommandBuilder().setName('preview').setDescription('Select a customer and preview their Bankroll experience')
 );
 
+const botAdminCmd = common(
+  new SlashCommandBuilder()
+    .setName('bot')
+    .setDescription('Owner controls for the Bankroll bot')
+    .addSubcommand((sub) => sub.setName('export-index').setDescription('Send the currently running index.js file privately'))
+    .addSubcommand((sub) => sub.setName('redeploy').setDescription('Trigger a new deployment from the latest GitHub commit on Render'))
+    .addSubcommand((sub) => sub.setName('restart').setDescription('Restart the running Render service'))
+    .addSubcommand((sub) => sub.setName('avatar').setDescription('Change the bot profile picture').addAttachmentOption((o) => o.setName('image').setDescription('PNG, JPG or GIF image').setRequired(true)))
+    .addSubcommand((sub) => sub.setName('status').setDescription('Change the bot online presence').addStringOption((o) => o.setName('presence').setDescription('Discord presence colour/status').setRequired(true).addChoices(
+      { name: 'Online (green)', value: 'online' },
+      { name: 'Idle (yellow)', value: 'idle' },
+      { name: 'Do Not Disturb (red)', value: 'dnd' },
+      { name: 'Invisible', value: 'invisible' }
+    )))
+);
+
 const refundCmd = common(
   new SlashCommandBuilder()
     .setName('refund')
@@ -1492,7 +1510,7 @@ const downloadsCmd = common(new SlashCommandBuilder().setName('downloads').setDe
   .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate data and file backup'))
   .addSubcommand((sub) => sub.setName('verify').setDescription('Verify a vault ZIP archive and checksum').addStringOption((o) => o.setName('vault_key').setDescription('Exact vault key').setRequired(true))));
 
-const commands = [bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd];
+const commands = [bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -3480,6 +3498,56 @@ async function cmdTotal(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
+async function cmdBotAdmin(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can use these controls.');
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === 'export-index') {
+    const indexPath = path.join(__dirname, 'index.js');
+    if (!fs.existsSync(indexPath)) return interaction.editReply('Could not find the running index.js file on this instance.');
+    return interaction.editReply({ content: 'Here is the current index.js from this running bot instance.', files: [new AttachmentBuilder(indexPath, { name: 'index.js' })] });
+  }
+
+  if (sub === 'avatar') {
+    const image = interaction.options.getAttachment('image');
+    const type = String(image.contentType || '').toLowerCase();
+    if (!/^image\/(png|jpe?g|gif|webp)$/.test(type)) return interaction.editReply('Please upload a PNG, JPG, GIF or WEBP image.');
+    if (image.size > 8 * 1024 * 1024) return interaction.editReply('That image is over 8 MB. Please upload a smaller image.');
+    const response = await fetch(image.url);
+    if (!response.ok) throw new Error(`Could not download the avatar image (HTTP ${response.status}).`);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!buffer.length || buffer.length > 8 * 1024 * 1024) return interaction.editReply('The image is empty or exceeds the 8 MB limit.');
+    await client.user.setAvatar(buffer);
+    return interaction.editReply('Bot profile picture updated successfully.');
+  }
+
+  if (sub === 'status') {
+    const presence = interaction.options.getString('presence');
+    await client.user.setPresence({ status: presence, activities: [] });
+    const labels = { online: 'Online (green)', idle: 'Idle (yellow)', dnd: 'Do Not Disturb (red)', invisible: 'Invisible' };
+    return interaction.editReply(`Bot presence changed to **${labels[presence] || presence}**.`);
+  }
+
+  if (sub === 'restart' || sub === 'redeploy') {
+    if (!RENDER_API_KEY || !RENDER_SERVICE_ID) {
+      return interaction.editReply('Render control is not configured. Add RENDER_API_KEY and RENDER_SERVICE_ID to the Render environment variables, then try again.');
+    }
+    const endpoint = sub === 'restart'
+      ? `https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}/restart`
+      : `https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}/deploys`;
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RENDER_API_KEY}`, 'Content-Type': 'application/json' },
+      ...(sub === 'redeploy' ? { body: JSON.stringify({ clearCache: 'do_not_clear' }) } : {}),
+    });
+    const body = await response.text();
+    if (!response.ok) throw new Error(`Render ${sub} request failed (HTTP ${response.status}): ${short(body, 350)}`);
+    return interaction.editReply(sub === 'redeploy'
+      ? 'Render accepted the deployment request. It will build and deploy the latest commit from the connected branch.'
+      : 'Render accepted the restart request. The bot will briefly go offline while the service restarts.');
+  }
+}
+
 async function cmdCustomerPreview(interaction) {
   const ids = new Set();
   for (const d of Object.values(deliveries)) if (d?.customerId) ids.add(String(d.customerId));
@@ -4285,6 +4353,9 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdRefund(interaction);
       case 'setup':
         return await cmdSetup(interaction);
+      case 'bot':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdBotAdmin(interaction);
       default:
         await interaction.deferReply({ ephemeral: true });
         if (interaction.commandName === 'payments') return await cmdPayments(interaction);
