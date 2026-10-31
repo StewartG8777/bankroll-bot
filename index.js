@@ -1792,13 +1792,47 @@ async function autoRestoreOnStartup() {
       return buf;
     };
     const downloadZipBackup = async (z) => {
-      const res = await fetch(z.att.url);
+      const res = await fetch(z.att.url, { signal: AbortSignal.timeout(120000) });
       if (!res.ok) throw new Error(`HTTP ${res.status} downloading ZIP backup`);
       const zipBuffer = Buffer.from(await res.arrayBuffer());
-      const zip = new AdmZip(zipBuffer);
-      const entry = zip.getEntry(z.entryName);
-      if (!entry || entry.isDirectory) throw new Error('ZIP does not contain the expected file');
-      const buf = entry.getData();
+
+      // Read legacy backup ZIPs with yauzl's streaming inflater. AdmZip.getData()
+      // inflates the whole entry synchronously and was causing long gateway stalls.
+      const buf = await new Promise((resolve, reject) => {
+        yauzl.fromBuffer(zipBuffer, { lazyEntries: true, autoClose: true, decodeStrings: true }, (openError, zip) => {
+          if (openError) return reject(openError);
+          let settled = false;
+          const fail = (error) => {
+            if (settled) return;
+            settled = true;
+            try { zip.close(); } catch {}
+            reject(error);
+          };
+          zip.on('error', fail);
+          zip.on('end', () => {
+            if (!settled) fail(new Error('ZIP does not contain the expected file'));
+          });
+          zip.on('entry', (entry) => {
+            if (entry.fileName !== z.entryName || entry.fileName.endsWith('/')) {
+              zip.readEntry();
+              return;
+            }
+            zip.openReadStream(entry, (streamError, stream) => {
+              if (streamError) return fail(streamError);
+              const chunks = [];
+              stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+              stream.on('error', fail);
+              stream.on('end', () => {
+                if (settled) return;
+                settled = true;
+                resolve(Buffer.concat(chunks));
+                try { zip.close(); } catch {}
+              });
+            });
+          });
+          zip.readEntry();
+        });
+      });
       if (buf.length !== z.size) throw new Error(`ZIP file size mismatch (${buf.length}/${z.size})`);
       if (z.sha && crypto.createHash('sha256').update(buf).digest('hex') !== z.sha) throw new Error('ZIP file SHA-256 mismatch');
       return buf;
