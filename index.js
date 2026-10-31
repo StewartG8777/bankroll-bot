@@ -557,7 +557,7 @@ function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download i
   return new EmbedBuilder().setColor(GREEN).setTitle(label)
     .setDescription(`Your complete **${short(String(name || 'file'), 180)}** is ready. ${isZip ? 'This is one original ZIP archive — no split parts or joining steps.' : 'Your original file is ready to download.'}`)
     .addFields({ name: 'File type', value: isZip ? 'ZIP archive' : 'File', inline: true }, ...(Number.isFinite(sizeBytes) ? [{ name: 'Size', value: `${(sizeBytes/(1024*1024)).toFixed(2)} MB`, inline: true }] : []), ...(expiresAt ? [{ name: 'Link expires', value: `<t:${Math.floor(expiresAt/1000)}:R>`, inline: true }] : []))
-    .setFooter({ text: 'Bankroll secure delivery • One-time download link' }).setTimestamp();
+    .setFooter({ text: expiresAt ? 'Bankroll secure delivery • One-time download link' : 'Bankroll secure delivery' }).setTimestamp();
 }
 
 function makeDownloadLink(d, paymentIntentId) {
@@ -601,7 +601,6 @@ function makeBackupDownloadLink(buffer, name) {
     backupDownload: true,
   };
   saveDownloads();
-  recordDownloadEvent('backup_link_created', { file: safeName, customerId: OWNER_ID, token, detail: 'One-time backup ZIP link created; expires in 24 hours.' });
   return `${BASE_URL}/bankroll-backup-download/${token}`;
 }
 
@@ -961,6 +960,7 @@ async function deliverFile(key, paymentIntentId) {
     }
     return {
       content: `<@${d.customerId}> payment received. Here is your complete file.`,
+      embeds: [buildDownloadEmbed(d.name, null, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined)],
       files: [new AttachmentBuilder(d.path, { name: path.basename(d.name || 'download.zip') })],
       allowedMentions: { parse: [] },
     };
@@ -1048,6 +1048,7 @@ async function deliverFile(key, paymentIntentId) {
   }
 
   if (reachedCustomer) {
+    recordDownloadEvent('delivery_sent', { file: d.name, customerId: d.customerId, agentId: d.agentId, detail: `Payment delivery message sent via ${sentTo}.` });
     if (paymentIntentId) {
       await recordInStripe(paymentIntentId, {
         delivered_at: new Date().toISOString(),
@@ -3611,6 +3612,7 @@ async function onGetFile(interaction) {
       }
     : {
         content: `<@${d.customerId}> here is your complete file.`,
+        embeds: [buildDownloadEmbed(d.name, null, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined)],
         files: [new AttachmentBuilder(d.path, { name: path.basename(d.name || 'download.zip') })],
         allowedMentions: { parse: [] },
       };
@@ -3651,7 +3653,8 @@ async function onGetFile(interaction) {
     delivered_file: String(d.name || '').slice(0, 100),
     delivery_message: msg.url ?? '',
   });
-  await notifyOwner({ content: `"${d.name}" was downloaded by <@${d.customerId}>.` });
+  recordDownloadEvent('delivery_sent', { file: d.name, customerId: d.customerId, agentId: d.agentId, detail: 'Customer requested the paid file; delivery message was sent.' });
+  await notifyOwner({ content: `"${d.name}" was delivered to <@${d.customerId}>. Hosted downloads are tracked separately when the file is actually downloaded.` });
 }
 
 function randomSearchGb(durationMinutes) {
@@ -3779,6 +3782,7 @@ async function onScheduledSendButton(interaction) {
       components: [downloadLinkRow(link, 'Download ZIP')],
       allowedMentions: { parse: [] },
     });
+    recordDownloadEvent('delivery_sent', { file: job.originalName, customerId: interaction.user.id, agentId: OWNER_ID, detail: 'Scheduled ZIP delivery link sent.' });
     await finish('link_sent', 'One-time Download ZIP button sent below.');
   };
 
@@ -3794,6 +3798,7 @@ async function onScheduledSendButton(interaction) {
         files: [new AttachmentBuilder(item.path, { name: path.basename(job.originalName) })],
         allowedMentions: { parse: [] },
       });
+      recordDownloadEvent('delivery_sent', { file: job.originalName, customerId: interaction.user.id, agentId: OWNER_ID, detail: 'Complete ZIP attachment sent directly.' });
       return await finish('sent', 'Complete ZIP sent below.');
     } catch (uploadError) {
       console.error('Scheduled ZIP attachment failed:', uploadError.message);
@@ -4129,6 +4134,7 @@ app.get('/:name/:token', (req, res) => {
   const token = req.params.token; const remote=String(req.ip||req.socket?.remoteAddress||'unknown');
   const attempt=downloadAttempts.get(remote)||{count:0,resetAt:Date.now()+60000}; if(Date.now()>attempt.resetAt){attempt.count=0;attempt.resetAt=Date.now()+60000;} attempt.count++;downloadAttempts.set(remote,attempt);
   if(attempt.count>40)return res.status(429).send('Too many download attempts. Try again in a minute.');
+  if(downloadAttempts.size>5000){for(const [ip,value] of downloadAttempts)if(Date.now()>value.resetAt)downloadAttempts.delete(ip);}
   if(!/^[a-f0-9]{48,64}$/i.test(token)){recordDownloadEvent('access_denied',{detail:'Malformed download token.'});return res.status(404).send('Not found');}
   const t=downloads[token]; const filesRoot=path.resolve(FILES_DIR)+path.sep; const safePath=t?.path&&path.resolve(String(t.path)).startsWith(filesRoot);
   if(!t||t.used||activeDownloadTokens.has(token)||Date.now()>t.expiresAt||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
