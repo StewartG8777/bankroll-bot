@@ -1171,9 +1171,9 @@ const sendfileCmd = new SlashCommandBuilder()
   .setIntegrationTypes([ApplicationIntegrationType.UserInstall])
   .setContexts([InteractionContextType.PrivateChannel])
   .addStringOption((o) => o.setName('file').setDescription('Choose a file from your vault').setAutocomplete(true).setRequired(true))
-  .addIntegerOption((o) => o.setName('delay').setDescription('How long to wait').setMinValue(1).setMaxValue(720).setRequired(true))
-  .addStringOption((o) => o.setName('unit').setDescription('Delay unit').setRequired(true)
-    .addChoices({ name: 'Minutes', value: 'minutes' }, { name: 'Hours', value: 'hours' }));
+  .addIntegerOption((o) => o.setName('size').setDescription('How long to wait before sending').setMinValue(1).setMaxValue(720).setRequired(true))
+  .addStringOption((o) => o.setName('disk').setDescription('M = minutes, H = hours').setRequired(true)
+    .addChoices({ name: 'M (minutes)', value: 'm' }, { name: 'H (hours)', value: 'h' }));
 
 const cancelCmd = common(
   new SlashCommandBuilder()
@@ -3616,9 +3616,9 @@ async function startScheduledSend(interaction) {
   }
   try { new AdmZip(item.path).getEntries(); }
   catch { return interaction.reply({ content: 'That vault item is not a readable ZIP file. Check it with /vault verify.', ephemeral: true }); }
-  const amount = interaction.options.getInteger('delay', true);
-  const unit = interaction.options.getString('unit', true);
-  const multiplier = unit === 'hours' ? 60 * 60 * 1000 : 60 * 1000;
+  const amount = interaction.options.getInteger('size', true);
+  const unit = interaction.options.getString('disk', true);
+  const multiplier = unit === 'h' ? 60 * 60 * 1000 : 60 * 1000;
   const durationMs = amount * multiplier;
   if (durationMs > 30 * 24 * 60 * 60 * 1000) {
     return interaction.reply({ content: 'The maximum delay is 30 days.', ephemeral: true });
