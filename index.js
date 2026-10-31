@@ -629,6 +629,7 @@ const blobBackedUp = {}; // relative path -> size already in the backup channel
 
 // BEGIN backup helpers
 const backupFailures = {}; // relative path -> { count, nextTry, error }
+const backupHow = {}; // relative path -> how it was backed up (shown in /backup status)
 let backupRetryTimer = null;
 const shaCache = new Map();
 
@@ -681,7 +682,7 @@ async function sendChunked(ch, fp, rel, st, sha256, limit) {
         const buf = await readChunk(fp, start, Math.min(chunkSize, st.size - start));
         await ch.send({
           content: `datafile-v2:${rel}|${st.size}|${sha256}|${i + 1}/${total}`,
-          files: [new AttachmentBuilder(buf, { name: `${path.basename(fp)}.part${i + 1}of${total}` })],
+          files: [new AttachmentBuilder(buf, { name: `${path.basename(fp)}.${String(i + 1).padStart(3, '0')}` })],
           allowedMentions: { parse: [] },
         });
       }
@@ -708,7 +709,121 @@ async function fetchRetry(url, { tries = 3, timeoutMs = 120000 } = {}) {
   }
   throw lastErr;
 }
+
+function sha256Buf(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+function isTooBigUpload(e) {
+  const code = e?.code;
+  return code === 40005 || code === 50045 || /too large|exceeds the maximum|maximum size|entity/i.test(String(e?.message || ''));
+}
+
+// Splits a ZIP into several smaller, fully valid ZIPs. Every file inside is copied as-is (same name, same
+// extension, same bytes), so a .yft stays a .yft and each part can be opened by hand.
+// Returns null when it can't be done without touching a file (e.g. one file alone is bigger than the limit).
+function splitZipByEntries(zipPath, maxBytes) {
+  const zip = new AdmZip(zipPath);
+  const entries = zip.getEntries().filter((e) => !e.isDirectory);
+  if (!entries.length) return null;
+  const est = (e) => (e.header?.compressedSize || e.header?.size || 0) + Buffer.byteLength(e.entryName) * 2 + 160;
+  const build = (list) => {
+    const z = new AdmZip();
+    for (const e of list) {
+      z.addFile(e.entryName, e.getData());
+      try { z.getEntry(e.entryName).header.time = e.header.time; } catch {}
+    }
+    return z.toBuffer();
+  };
+  const out = [];
+  const pack = (list) => {
+    const groups = [];
+    let cur = [];
+    let curSize = 0;
+    for (const e of list) {
+      const s = est(e);
+      if (cur.length && curSize + s > maxBytes) { groups.push(cur); cur = []; curSize = 0; }
+      cur.push(e);
+      curSize += s;
+    }
+    if (cur.length) groups.push(cur);
+    for (const g of groups) {
+      const buf = build(g);
+      if (buf.length <= maxBytes) {
+        out.push({ buffer: buf, entries: g.length, uncompressed: g.reduce((n, e) => n + (e.header?.size || 0), 0) });
+      } else if (g.length > 1) {
+        const mid = Math.ceil(g.length / 2);
+        if (!pack(g.slice(0, mid)) || !pack(g.slice(mid))) return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  };
+  return pack(entries) ? out : null;
+}
+
+// Backup: a big ZIP goes up as N smaller ZIPs (datafilezipset-v1). Returns how many parts were posted, 0 if not possible.
+async function sendZipSet(ch, fp, rel, st, sha256, limit) {
+  if (!/\.zip$/i.test(fp)) return 0;
+  let parts;
+  try { parts = splitZipByEntries(fp, limit - 64 * 1024); } catch { return 0; }
+  if (!parts || parts.length < 2 || parts.length > 30) return 0;
+  const allEntries = parts.reduce((n, p) => n + p.entries, 0);
+  const uncompressed = parts.reduce((n, p) => n + p.uncompressed, 0);
+  const base = path.basename(fp).replace(/\.zip$/i, '');
+  for (let i = 0; i < parts.length; i++) {
+    const marker = { rel, size: st.size, sha256, part: i + 1, total: parts.length, allEntries, uncompressed, partSha256: sha256Buf(parts[i].buffer) };
+    await ch.send({
+      content: `datafilezipset-v1:${JSON.stringify(marker)}`,
+      files: [new AttachmentBuilder(parts[i].buffer, { name: `${base}.part${i + 1}of${parts.length}.zip` })],
+      allowedMentions: { parse: [] },
+    });
+  }
+  return parts.length;
+}
+
+// Delivery: when one big ZIP is refused, send it as several smaller valid ZIPs, one per message.
+async function sendZipParts(send, filePath, name, limitBytes, intro) {
+  if (!/\.zip$/i.test(String(name || filePath))) return null;
+  let parts;
+  try { parts = splitZipByEntries(filePath, limitBytes - 64 * 1024); } catch { return null; }
+  if (!parts || parts.length < 2 || parts.length > 30) return null;
+  const base = path.basename(String(name)).replace(/\.zip$/i, '');
+  const msgs = [];
+  for (let i = 0; i < parts.length; i++) {
+    msgs.push(
+      await send(
+        {
+          content:
+            i === 0
+              ? `${intro} It is too big for one Discord upload, so it comes as ${parts.length} ZIP parts. Every file inside is untouched: extract all the parts into the same folder.`
+              : `Part ${i + 1} of ${parts.length}`,
+          files: [new AttachmentBuilder(parts[i].buffer, { name: `${base}.part${i + 1}of${parts.length}.zip` })],
+        },
+        true
+      )
+    );
+  }
+  return msgs;
+}
 // END backup helpers
+
+// A download link next to the backup parts. It only works while this server instance is running,
+// so the Discord parts are the permanent backup and this is the quick way to grab the whole file.
+async function postBackupLink(ch, rel, st) {
+  if (!BASE_URL) return;
+  const url = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
+  await ch.send({
+    content: `datafilelink:${rel}|${st.size}|${url}`,
+    embeds: [
+      new EmbedBuilder()
+        .setColor(GREY)
+        .setDescription(`Download link for \`${path.basename(rel)}\` (${(st.size / (1024 * 1024)).toFixed(1)} MB). Works while the bot server is running; the attached parts are the permanent backup.`),
+    ],
+    allowedMentions: { parse: [] },
+  });
+}
 
 function backupSummary() {
   const rels = dataFilePaths().map((fp) => safeBackupRel(relData(fp))).filter(Boolean);
@@ -766,6 +881,20 @@ async function planBackupPrune(ch) {
         const rel = safeBackupRel(JSON.parse(c.slice('datafilezip-v1:'.length)).rel);
         if (rel) units.set(`zip|${m.id}`, { rel, msgs: [m], newest: m.createdTimestamp, total: 1, parts: new Set([1]) });
       } catch {}
+    } else if (c.startsWith('datafilezipset-v1:')) {
+      try {
+        const meta = JSON.parse(c.slice('datafilezipset-v1:'.length));
+        const rel = safeBackupRel(meta.rel);
+        const part = Number(meta.part);
+        const total = Number(meta.total);
+        if (!rel || !part || !total) continue;
+        const key = `zs|${rel}|${meta.sha256}|${total}`;
+        if (!units.has(key)) units.set(key, { rel, msgs: [], newest: 0, total, parts: new Set() });
+        const u = units.get(key);
+        u.msgs.push(m);
+        u.parts.add(part);
+        u.newest = Math.max(u.newest, m.createdTimestamp);
+      } catch {}
     } else if (c.startsWith('datafile-v2:')) {
       const bits = c.slice('datafile-v2:'.length).split('|');
       if (bits.length < 4) continue;
@@ -800,10 +929,13 @@ async function planBackupPrune(ch) {
       }
     }
   }
+  const seenLink = new Set();
   for (const m of links) {
     const bits = String(m.content).slice('datafilelink:'.length).split('|');
     const rel = safeBackupRel(bits.slice(0, -2).join('|'));
-    if (rel && (byRel.get(rel) || []).some((u) => u.complete)) plan.deadLinks.push(m);
+    if (!rel) continue;
+    if (!seenLink.has(rel)) { seenLink.add(rel); continue; } // keep the newest link per file
+    plan.deadLinks.push(m);
   }
   return plan;
 }
@@ -945,11 +1077,20 @@ async function backupDataOnce() {
             sentSingle = true;
           }
         }
+        let how = 'single ZIP';
         if (!sentSingle) {
-          const parts = await sendChunked(ch, fp, rel, st, sha256, limit);
-          console.log(`Backed up ${rel} in ${parts} part(s).`);
+          const zipParts = await sendZipSet(ch, fp, rel, st, sha256, limit);
+          if (zipParts) {
+            how = `${zipParts} ZIP parts`;
+          } else {
+            const rawParts = await sendChunked(ch, fp, rel, st, sha256, limit);
+            how = `${rawParts} raw parts (.001, .002...)`;
+          }
+          console.log(`Backed up ${rel} as ${how}.`);
         }
         blobBackedUp[rel] = signature;
+        backupHow[rel] = how;
+        await postBackupLink(ch, rel, st).catch((e) => console.error(`Could not post the backup link for ${rel}:`, e.message));
         delete backupFailures[rel];
         lastBackupAt = Date.now();
       } catch (e) {
@@ -1088,6 +1229,16 @@ async function deliverFile(key, paymentIntentId) {
     try {
       return await send(payload());
     } catch (attachmentError) {
+      // Same idea as /sendfile: if one big ZIP is refused here, send it as several smaller valid ZIPs.
+      if (!noFile && !dlink && d.path && fs.existsSync(d.path) && isTooBigUpload(attachmentError)) {
+        try {
+          const limitChannel = await client.channels.fetch(d.channelId).catch(() => null);
+          const parts = await sendZipParts(send, d.path, d.name, uploadLimitBytes(limitChannel), `<@${d.customerId}> payment received. Here is the file for this purchase.`);
+          if (parts) return parts[0];
+        } catch (splitError) {
+          console.error(`Sending ${d.name} as ZIP parts failed:`, splitError.message);
+        }
+      }
       if (noFile || dlink || !BASE_URL || !d.path || !fs.existsSync(d.path)) throw attachmentError;
       try {
         dlink = makeDownloadLink(d, paymentIntentId);
@@ -1165,8 +1316,8 @@ async function deliverFile(key, paymentIntentId) {
   // and the customer can still press "Get my file" on the invoice message.
   if (!sentTo && owner) {
     try {
-      await sendWithFallback((p) => owner.send(
-        dlink
+      await sendWithFallback((p, isPart) => owner.send(
+        isPart ? p : dlink
           ? { content: `Couldn't reach <@${d.customerId}>. Here is their download link:\n<${dlink}>` }
           : {
               content: `Couldn't reach <@${d.customerId}>. Here is their file.`,
@@ -1686,6 +1837,7 @@ async function autoRestoreOnStartup() {
     // Index every backed-up file part across the full channel history.
     const groups = new Map();
     const zipBackups = new Map();
+    const zipSets = new Map();
     const legacyVaultAttachments = new Map();
     const backupLinks = new Map();
     const addGroupPart = (rel, size, sha, partText, att) => {
@@ -1712,6 +1864,20 @@ async function autoRestoreOnStartup() {
             zipBackups.get(rel).push({ att, size, sha: String(meta.sha256 || ''), entryName: meta.entryName });
           }
         } catch (e) { console.error('Invalid ZIP backup marker:', e.message); }
+      } else if (content.startsWith('datafilezipset-v1:') && att) {
+        try {
+          const meta = JSON.parse(content.slice('datafilezipset-v1:'.length));
+          const rel = safeBackupRel(meta.rel);
+          const part = Number(meta.part);
+          const total = Number(meta.total);
+          const size = Number(meta.size);
+          if (rel && Number.isSafeInteger(part) && Number.isSafeInteger(total) && part >= 1 && part <= total && total <= 30 && size > 0 && size <= 150 * 1024 * 1024) {
+            const key = `${rel}|${meta.sha256}|${total}`;
+            if (!zipSets.has(key)) zipSets.set(key, { rel, size, sha: String(meta.sha256 || ''), total, allEntries: Number(meta.allEntries) || 0, uncompressed: Number(meta.uncompressed) || 0, parts: new Map() });
+            const zs = zipSets.get(key);
+            if (!zs.parts.has(part)) zs.parts.set(part, { att, sha: String(meta.partSha256 || '') });
+          }
+        } catch (e) { console.error('Invalid ZIP-set marker:', e.message); }
       } else if (content.startsWith('datafile-v2:')) {
         const bits = content.slice('datafile-v2:'.length).split('|');
         if (bits.length >= 4) addGroupPart(bits[0], Number(bits[1]), bits[2], bits[3], att);
@@ -1759,6 +1925,32 @@ async function autoRestoreOnStartup() {
       if (buf.length !== z.size) throw new Error(`ZIP file size mismatch (${buf.length}/${z.size})`);
       if (z.sha && crypto.createHash('sha256').update(buf).digest('hex') !== z.sha) throw new Error('ZIP file SHA-256 mismatch');
       return buf;
+    };
+
+    const completeZipSetsFor = (rel) => [...zipSets.values()].filter((z) => z.rel === rel && z.parts.size === z.total);
+    // Rebuilds one ZIP from the smaller ZIP parts. Every file is copied as-is and checked (part hash, CRC, counts).
+    const restoreZipSet = async (zs, fp) => {
+      const out = new AdmZip();
+      let count = 0;
+      let bytes = 0;
+      for (let i = 1; i <= zs.total; i++) {
+        const p = zs.parts.get(i);
+        if (!p) throw new Error(`missing ZIP part ${i}/${zs.total}`);
+        const buf = Buffer.from(await (await fetchRetry(p.att.url)).arrayBuffer());
+        if (p.sha && sha256Buf(buf) !== p.sha) throw new Error(`ZIP part ${i} checksum mismatch`);
+        for (const e of new AdmZip(buf).getEntries()) {
+          if (e.isDirectory) continue;
+          const data = e.getData();
+          out.addFile(e.entryName, data);
+          try { out.getEntry(e.entryName).header.time = e.header.time; } catch {}
+          count += 1;
+          bytes += data.length;
+        }
+      }
+      if (zs.allEntries && count !== zs.allEntries) throw new Error(`file count mismatch (${count}/${zs.allEntries})`);
+      if (zs.uncompressed && bytes !== zs.uncompressed) throw new Error(`content size mismatch (${bytes}/${zs.uncompressed})`);
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      atomicWrite(fp, out.toBuffer());
     };
 
     // Streams the parts to a temp file and verifies size + SHA-256 before the file replaces anything.
@@ -1851,6 +2043,19 @@ async function autoRestoreOnStartup() {
           fs.mkdirSync(path.dirname(fp), { recursive: true });
           atomicWrite(fp, buf);
           if (z.sha) blobBackedUp[rel] = `${z.size}:${z.sha}`;
+          recovered += 1;
+          restored = true;
+          break;
+        } catch (e) { lastError = e; }
+      }
+      if (!restored) for (const zs of prefer(completeZipSetsFor(rel))) {
+        try {
+          await restoreZipSet(zs, fp);
+          // The rebuilt ZIP holds identical files but is not byte-identical, so refresh its size/hash everywhere.
+          const st2 = fs.statSync(fp);
+          const sha2 = await sha256File(fp);
+          blobBackedUp[rel] = `${st2.size}:${sha2}`;
+          if (rec) { rec.size = st2.size; rec.sha256 = sha2; }
           recovered += 1;
           restored = true;
           break;
@@ -3817,6 +4022,7 @@ async function onGetFile(interaction) {
 
   await interaction.deferUpdate();
   let msg;
+  let splitDone = false;
   const sendGetFilePayload = () => dlink
     ? { content: `<@${d.customerId}> here is your download link${hosted ? ' (valid for 24 hours and one download)' : ''}:\n<${dlink}>` }
     : {
@@ -3827,7 +4033,17 @@ async function onGetFile(interaction) {
     msg = await interaction.followUp(sendGetFilePayload());
   } catch (attachmentError) {
     console.error('Get my file attachment failed:', attachmentError.message);
-    if (!dlink && BASE_URL && d.path && fs.existsSync(d.path)) {
+    if (!dlink && d.path && fs.existsSync(d.path) && isTooBigUpload(attachmentError)) {
+      try {
+        const parts = await sendZipParts((p) => interaction.followUp(p), d.path, d.name, uploadLimitBytes(interaction.channel), `<@${d.customerId}> here is the file for this purchase.`);
+        if (parts) { msg = parts[0]; splitDone = true; }
+      } catch (splitError) {
+        console.error('Get my file ZIP parts failed:', splitError.message);
+      }
+    }
+    if (splitDone) {
+      // delivered as several smaller ZIPs
+    } else if (!dlink && BASE_URL && d.path && fs.existsSync(d.path)) {
       try {
         dlink = makeDownloadLink(d, checkPi);
         hosted = true;
@@ -3998,6 +4214,14 @@ async function onScheduledSendButton(interaction) {
     return await finish('sent', 'File sent below.');
   } catch (uploadError) {
     console.error('Scheduled ZIP upload failed; trying link fallback:', uploadError.message);
+    if (isTooBigUpload(uploadError)) {
+      try {
+        const parts = await sendZipParts((p) => interaction.followUp({ ...p, allowedMentions: { parse: [] } }), item.path, job.originalName, uploadLimitBytes(interaction.channel), `**${job.originalName}** - scheduled delivery complete.`);
+        if (parts) return await finish('sent', `File sent below as ${parts.length} ZIP parts.`);
+      } catch (splitError) {
+        console.error('Scheduled ZIP parts failed:', splitError.message);
+      }
+    }
   }
 
   if (BASE_URL) {
@@ -4163,7 +4387,7 @@ function backupStatusEmbed(ch) {
     const mb = (() => { try { return (fs.statSync(fp).size / (1024 * 1024)).toFixed(1) + ' MB'; } catch { return 'missing'; } })();
     let state = 'pending';
     if (!fs.existsSync(fp)) state = 'FILE MISSING - re-upload it';
-    else if (blobBackedUp[rel]) state = 'backed up';
+    else if (blobBackedUp[rel]) state = `backed up${backupHow[rel] ? ` (${backupHow[rel]})` : ''}${BASE_URL ? ` - [link](${BASE_URL}/bankroll-backup-file/${backupToken(rel)})` : ''}`;
     else if (backupFailures[rel]) state = `FAILING x${backupFailures[rel].count}: ${short(backupFailures[rel].error, 80)}`;
     rows.push(`• \`${rel}\` (${mb}) - ${state}`);
   }
