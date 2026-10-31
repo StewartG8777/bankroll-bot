@@ -1441,12 +1441,13 @@ const cancelCmd = common(
 );
 
 const spamCmd = common(
-  new SlashCommandBuilder().setName('spam').setDescription('Send a timed, opt-in wake-up reminder')
-    .addSubcommand((sub) => sub.setName('start').setDescription('Ask someone to opt in to timed wake-up messages')
-      .addUserOption((o) => o.setName('user').setDescription('Person receiving reminders').setRequired(true))
-      .addIntegerOption((o) => o.setName('interval').setDescription('Seconds between reminders (minimum 60)').setMinValue(60).setMaxValue(3600).setRequired(true))
+  new SlashCommandBuilder().setName('spam').setDescription('Send a timed, opt-in message sequence')
+    .addSubcommand((sub) => sub.setName('start').setDescription('Send a DM request with your chosen message')
+      .addUserOption((o) => o.setName('user').setDescription('Person receiving the messages').setRequired(true))
+      .addStringOption((o) => o.setName('message').setDescription('Text or emoji to repeat').setMaxLength(1800).setRequired(true))
+      .addIntegerOption((o) => o.setName('interval').setDescription('Seconds between messages (minimum 60)').setMinValue(60).setMaxValue(3600).setRequired(true))
       .addIntegerOption((o) => o.setName('duration').setDescription('Duration in minutes (maximum 15)').setMinValue(1).setMaxValue(15).setRequired(true)))
-    .addSubcommand((sub) => sub.setName('stop').setDescription('Stop your active wake-up reminders'))
+    .addSubcommand((sub) => sub.setName('stop').setDescription('Stop your active message sessions'))
 );
 const remindCmd = common(
   new SlashCommandBuilder()
@@ -4528,7 +4529,7 @@ async function onDisputeClosed(d) {
   await notifyOwner({ embeds: [embed] });
 }
 
-// ---------- Opt-in wake-up reminders ----------
+// ---------- Opt-in timed message sessions ----------
 const spamSessions = new Map();
 const spamRequests = new Map();
 
@@ -4536,54 +4537,121 @@ async function cmdSpam(interaction) {
   const sub = interaction.options.getSubcommand();
   if (sub === 'stop') {
     const active = [...spamSessions.entries()].filter(([, session]) => session.ownerId === interaction.user.id);
-    if (!active.length) return interaction.reply({ content: 'You do not have an active reminder session.', ephemeral: true });
-    for (const [id, session] of active) { clearTimeout(session.timeout); spamSessions.delete(id); session.target.send('The wake-up reminders have been stopped.').catch(() => {}); }
-    return interaction.reply({ content: 'Stopped ' + active.length + ' reminder session(s).', ephemeral: true });
+    if (!active.length) return interaction.reply({ content: 'You do not have an active message session.', ephemeral: true });
+    for (const [id, session] of active) {
+      clearTimeout(session.timeout);
+      spamSessions.delete(id);
+      session.target.send('The message session has been stopped.').catch(() => {});
+    }
+    return interaction.reply({ content: 'Stopped ' + active.length + ' message session(s).', ephemeral: true });
   }
+
   const target = interaction.options.getUser('user', true);
+  const message = interaction.options.getString('message', true);
   const intervalSeconds = interaction.options.getInteger('interval', true);
   const durationMinutes = interaction.options.getInteger('duration', true);
   if (target.bot || target.id === interaction.user.id) return interaction.reply({ content: 'Choose another person, not a bot or yourself.', ephemeral: true });
+
   const requestId = crypto.randomBytes(8).toString('hex');
-  const request = { ownerId: interaction.user.id, targetId: target.id, intervalSeconds, durationMinutes, expiresAt: Date.now() + 120000 };
+  const request = { ownerId: interaction.user.id, targetId: target.id, message, intervalSeconds, durationMinutes, expiresAt: Date.now() + 10 * 60 * 1000 };
   spamRequests.set(requestId, request);
-  const expiry = setTimeout(() => spamRequests.delete(requestId), 120000); expiry.unref?.();
+  const expiry = setTimeout(() => spamRequests.delete(requestId), 10 * 60 * 1000);
+  expiry.unref?.();
+
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('spam:accept:' + requestId).setLabel('Allow reminders').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('spam:accept:' + requestId).setLabel('Start').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('spam:decline:' + requestId).setLabel('No thanks').setStyle(ButtonStyle.Secondary)
   );
   try {
-    await target.send({ embeds: [new EmbedBuilder().setColor(GREY).setTitle('Wake-up reminder request').setDescription('<@' + interaction.user.id + '> wants to send you ✌️😃 every **' + intervalSeconds + ' seconds** for **' + durationMinutes + ' minute(s)**. Nothing will be sent unless you accept.')], components: [row] });
-    return interaction.reply({ content: 'Request sent to <@' + target.id + '>. They must accept first.', ephemeral: true });
-  } catch { spamRequests.delete(requestId); return interaction.reply({ content: 'I could not DM that person. They may have DMs disabled.', ephemeral: true }); }
+    await target.send({
+      embeds: [new EmbedBuilder().setColor(GREY).setTitle('Message request')
+        .setDescription('<@' + interaction.user.id + '> wants to send you a repeated message.')
+        .addFields(
+          { name: 'Message', value: message.slice(0, 1024) },
+          { name: 'Interval', value: intervalSeconds + ' seconds', inline: true },
+          { name: 'Duration', value: durationMinutes + ' minute(s)', inline: true }
+        )
+        .setFooter({ text: 'Nothing will be sent unless you press Start.' })],
+      components: [row],
+      allowedMentions: { parse: [] }
+    });
+    return interaction.reply({ content: 'Start request sent to <@' + target.id + '>. They must accept it first.', ephemeral: true });
+  } catch (error) {
+    spamRequests.delete(requestId);
+    console.error('Could not send spam request DM:', error.message);
+    return interaction.reply({ content: 'I could not DM that person. They may have DMs disabled or block the bot.', ephemeral: true });
+  }
 }
 
 async function handleSpamConsent(interaction) {
-  const parts = interaction.customId.split(':'); const action = parts[1]; const requestId = parts[2];
+  const parts = interaction.customId.split(':');
+  const action = parts[1];
+  const requestId = parts[2];
   const request = spamRequests.get(requestId);
-  if (!request || request.expiresAt < Date.now()) return interaction.reply({ content: 'This reminder request has expired.', ephemeral: true });
+  if (!request || request.expiresAt < Date.now()) return interaction.reply({ content: 'This message request has expired. Run /spam start again.', ephemeral: true });
   if (interaction.user.id !== request.targetId) return interaction.reply({ content: 'Only the recipient can respond to this request.', ephemeral: true });
   spamRequests.delete(requestId);
-  if (action === 'decline') return interaction.update({ content: 'Reminder request declined.', embeds: [], components: [] });
-  const sessionId = crypto.randomBytes(8).toString('hex'); const target = interaction.user;
-  const session = { ownerId: request.ownerId, target, endAt: Date.now() + request.durationMinutes * 60000, intervalMs: request.intervalSeconds * 1000, sent: 0, timeout: null };
+  if (action === 'decline') return interaction.update({ content: 'Request declined.', embeds: [], components: [] });
+
+  const sessionId = crypto.randomBytes(8).toString('hex');
+  const target = interaction.user;
+  const session = {
+    ownerId: request.ownerId,
+    target,
+    sourceMessage: interaction.message,
+    message: request.message,
+    endAt: Date.now() + request.durationMinutes * 60000,
+    intervalMs: request.intervalSeconds * 1000,
+    sent: 0,
+    timeout: null
+  };
   spamSessions.set(sessionId, session);
-  await interaction.update({ content: 'You accepted. You can stop these at any time below.', embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Spam initiated').setDescription('You will receive ✌️😃 every **' + request.intervalSeconds + ' seconds** for up to **' + request.durationMinutes + ' minutes**.')], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('spam:stop:' + sessionId).setLabel('Stop reminders').setStyle(ButtonStyle.Danger))] });
+  await interaction.update({
+    content: 'You started this message session. You can stop it at any time.',
+    embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Spam initiated')
+      .setDescription('The message below will be posted as replies to this embed.')
+      .addFields({ name: 'Repeated message', value: request.message.slice(0, 1024) })
+      .setFooter({ text: 'Maximum 15 messages; press Stop reminders to end early.' })],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('spam:stop:' + sessionId).setLabel('Stop').setStyle(ButtonStyle.Danger)
+    )]
+  });
+
   const sendNext = async () => {
     if (!spamSessions.has(sessionId)) return;
-    if (Date.now() >= session.endAt || session.sent >= 15) { spamSessions.delete(sessionId); await target.send('Wake-up reminders have finished.').catch(() => {}); return; }
-    try { await target.send('✌️😃'); session.sent += 1; } catch (error) { spamSessions.delete(sessionId); console.error('Wake-up reminder failed:', error.message); return; }
-    session.timeout = setTimeout(sendNext, session.intervalMs); session.timeout.unref?.();
+    if (Date.now() >= session.endAt || session.sent >= 15) {
+      spamSessions.delete(sessionId);
+      await session.sourceMessage.reply({ content: 'Message session finished.', allowedMentions: { parse: [] } }).catch(() => {});
+      return;
+    }
+    try {
+      await session.sourceMessage.reply({ content: session.message, allowedMentions: { parse: [] } });
+      session.sent += 1;
+    } catch (error) {
+      spamSessions.delete(sessionId);
+      console.error('Timed message reply failed:', error.message);
+      return;
+    }
+    if (session.sent >= 15 || Date.now() >= session.endAt) {
+      spamSessions.delete(sessionId);
+      return;
+    }
+    session.timeout = setTimeout(sendNext, session.intervalMs);
+    session.timeout.unref?.();
   };
-  session.timeout = setTimeout(sendNext, session.intervalMs); session.timeout.unref?.();
+
+  // Send the first reply immediately after the recipient presses Start.
+  await sendNext();
 }
 
 async function handleSpamStopButton(interaction) {
-  const id = interaction.customId.split(':')[2]; const session = spamSessions.get(id);
-  if (!session) return interaction.reply({ content: 'This reminder session has already ended.', ephemeral: true });
-  if (interaction.user.id !== session.target.id) return interaction.reply({ content: 'Only you can stop reminders sent to you.', ephemeral: true });
-  clearTimeout(session.timeout); spamSessions.delete(id);
-  return interaction.update({ content: 'Wake-up reminders stopped.', embeds: [], components: [] });
+  const id = interaction.customId.split(':')[2];
+  const session = spamSessions.get(id);
+  if (!session) return interaction.reply({ content: 'This message session has already ended.', ephemeral: true });
+  if (interaction.user.id !== session.target.id) return interaction.reply({ content: 'Only the recipient can stop this session.', ephemeral: true });
+  clearTimeout(session.timeout);
+  spamSessions.delete(id);
+  return interaction.update({ content: 'Message session stopped.', embeds: [], components: [] });
 }
 // ---------- Interaction router ----------
 client.on('interactionCreate', async (interaction) => {
