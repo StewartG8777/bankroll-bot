@@ -1235,8 +1235,14 @@ const testCmd = common(
   new SlashCommandBuilder()
     .setName('test')
     .setDescription('Run a fake payment and secure-download test (owner only)')
-    .addSubcommand((sub) => sub.setName('bankroll').setDescription('Simulate a paid Bankroll card invoice'))
-    .addSubcommand((sub) => sub.setName('monzo').setDescription('Simulate a paid Monzo invoice'))
+    .addSubcommand((sub) => sub
+      .setName('bankroll')
+      .setDescription('Simulate a paid Bankroll card invoice')
+      .addUserOption((o) => o.setName('customer').setDescription('Customer who should receive the test DM').setRequired(true)))
+    .addSubcommand((sub) => sub
+      .setName('monzo')
+      .setDescription('Simulate a paid Monzo invoice')
+      .addUserOption((o) => o.setName('customer').setDescription('Customer who should receive the test DM').setRequired(true)))
 );
 
 const monzoCmd = common(
@@ -3163,6 +3169,7 @@ async function cmdPaymentTest(interaction) {
   }
 
   const method = interaction.options.getSubcommand();
+  const selectedCustomer = interaction.options.getUser('customer', true);
   await interaction.deferReply({ ephemeral: true });
   let sourcePath = null;
   let token = null;
@@ -3172,16 +3179,15 @@ async function cmdPaymentTest(interaction) {
     sourcePath = path.join(FILES_DIR, 'bankroll_test_source_' + testId + '.zip');
     const testZip = new AdmZip();
     testZip.addFile('BANKROLL_TEST.txt', Buffer.from(
-      'Bankroll ' + method.toUpperCase() + ' delivery test\nTest ID: ' + testId + '\nThis is a fake test file. No payment was taken.\n',
+      'Bankroll ' + method.toUpperCase() + ' delivery test\\nTest ID: ' + testId + '\\nThis is a fake test file. No payment was taken.\\n',
       'utf8'
     ));
     testZip.writeZip(sourcePath);
 
-    const stat = fs.statSync(sourcePath);
     const testUrl = makeDownloadLink({
       path: sourcePath,
       name: fileName,
-      customerId: OWNER_ID,
+      customerId: selectedCustomer.id,
       agentId: OWNER_ID,
       description: 'test-' + method,
       testMode: true,
@@ -3191,14 +3197,16 @@ async function cmdPaymentTest(interaction) {
     sourcePath = null;
 
     const owner = await client.users.fetch(OWNER_ID);
+    const customer = await client.users.fetch(selectedCustomer.id);
     const paidAt = Date.now();
     const reference = 'TEST-' + method.toUpperCase() + '-' + testId;
+    const methodLabel = method === 'monzo' ? 'Monzo' : 'Bankroll card';
     const paidEmbed = new EmbedBuilder()
       .setColor(GREEN)
       .setTitle('[TEST] PAID | ' + (method === 'monzo' ? 'MONZO PAYMENT RECEIVED' : 'BANKROLL PAYMENT RECEIVED'))
-      .setDescription('Simulated successful ' + (method === 'monzo' ? 'Monzo' : 'Bankroll card') + ' payment. No real payment was made.')
+      .setDescription('Simulated successful ' + methodLabel + ' payment. No real payment was made.')
       .addFields(
-        { name: 'Customer', value: '<@' + OWNER_ID + '>', inline: true },
+        { name: 'Customer', value: '<@' + selectedCustomer.id + '>', inline: true },
         { name: 'Sales Agent', value: '<@' + OWNER_ID + '>', inline: true },
         { name: 'Amount Paid', value: money(1.23, 'gbp'), inline: true },
         { name: 'Payment Status', value: 'PAID (TEST)', inline: true },
@@ -3208,24 +3216,50 @@ async function cmdPaymentTest(interaction) {
       .setFooter({ text: 'TEST MODE • No Stripe charge or Monzo transaction' })
       .setTimestamp();
 
+    // Seller-side notifications always go to the bot owner.
     await owner.send({ embeds: [paidEmbed] });
-    recordNotification('test.payment_paid', paidEmbed.data.title, 'Simulated ' + method + ' payment ' + reference, 'success');
+    recordNotification('test.payment_paid', paidEmbed.data.title, 'Simulated ' + method + ' payment ' + reference + ' for customer ' + selectedCustomer.id, 'success');
 
     await owner.send({
-      content: '[TEST] Payment received. The ZIP was delivered successfully. This is a simulation; no payment was taken.',
+      content: '[TEST] Payment received. The ZIP was delivered successfully to <@' + selectedCustomer.id + '>. This is a simulation; no payment was taken.',
       allowedMentions: { parse: [] },
     });
-    recordNotification('test.delivery_ready', 'Test delivery confirmation sent', fileName + ' seller confirmation sent without a download button.', 'success');
+    recordNotification('test.delivery_ready', 'Test delivery confirmation sent', fileName + ' seller confirmation sent for customer ' + selectedCustomer.id + '.', 'success');
+
+    // Customer-side delivery goes only to the selected customer.
+    const download = downloads[token];
+    const customerEmbed = new EmbedBuilder()
+      .setColor(GREEN)
+      .setTitle('[TEST] Payment received')
+      .setDescription('Your simulated payment was successful. Your test ZIP is ready to download.')
+      .addFields(
+        { name: 'File', value: fileName, inline: true },
+        { name: 'Amount', value: money(1.23, 'gbp'), inline: true },
+        { name: 'Reference', value: reference }
+      )
+      .setFooter({ text: 'TEST MODE • No real payment was taken' })
+      .setTimestamp();
+    await customer.send({
+      content: 'Your Bankroll test payment is confirmed. Your ZIP is ready below.',
+      embeds: [customerEmbed, buildDownloadEmbed(fileName, download?.expiresAt, fs.statSync(download.path).size)],
+      components: [downloadLinkRow(testUrl, 'Download Test ZIP')],
+      allowedMentions: { parse: [] },
+    });
+
     recordDownloadEvent('test_payment_simulated', {
       file: fileName,
-      customerId: OWNER_ID,
+      customerId: selectedCustomer.id,
       agentId: OWNER_ID,
       token: token,
-      detail: 'Simulated ' + method + ' payment. No live invoice, Stripe payment, Monzo transaction, delivery record or vault item was created.',
+      detail: 'Simulated ' + method + ' payment and customer DM delivery to ' + selectedCustomer.id + '. No live invoice, Stripe payment, Monzo transaction, delivery record or vault item was created.',
     });
 
     return interaction.editReply(
-      'Test started for **' + (method === 'monzo' ? 'Monzo' : 'Bankroll') + '**. I sent you the fake **PAID** embed and a short **Payment received / ZIP delivered successfully** DM. The seller DM contains no download button. No real payment was taken and no live invoice or vault data was changed.'
+      'Test started for **' + methodLabel + '**.\\n' +
+      '• Seller PAID and delivery-confirmation DMs sent to you.\\n' +
+      '• Customer delivery DM sent to <@' + selectedCustomer.id + '>.\\n' +
+      '• The customer received a one-time test ZIP download button.\\n' +
+      'No real payment was taken and no live invoice or vault data was changed.'
     );
   } catch (err) {
     if (token && downloads[token]) {
