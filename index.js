@@ -887,7 +887,7 @@ async function deliverFile(key, paymentIntentId) {
       ? { content: `<@${d.customerId}> payment received. Here is your download link${hosted ? ' (works once, expires in 24 hours)' : ''}:\n<${dlink}>` }
       : zipParts
       ? {
-          content: `<@${d.customerId}> payment received. Your file is sent as ${zipParts.length} ZIP files: download all of them and extract them into the same folder. Part 1 of ${zipParts.length}:`,
+          content: `<@${d.customerId}> payment received. Your file is sent as ${zipParts.length} ZIP files: download all of them and extract them into the same folder.${zipParts.needsJoin ? ' Then double-click JOIN_FILES.bat (it rebuilds the big files).' : ''} Part 1 of ${zipParts.length}:`,
           files: [new AttachmentBuilder(zipParts[0].buf, { name: zipPartName(d, 0, zipParts.length) })],
         }
       : {
@@ -3555,7 +3555,7 @@ async function onGetFile(interaction) {
     ? { content: `<@${d.customerId}> here is your download link${hosted ? ' (valid for 24 hours and one download)' : ''}:\n<${dlink}>` }
     : zipParts
     ? {
-        content: `<@${d.customerId}> here is the file for this purchase. It is sent as ${zipParts.length} ZIP files: download all of them and extract them into the same folder. Part 1 of ${zipParts.length}:`,
+        content: `<@${d.customerId}> here is the file for this purchase. It is sent as ${zipParts.length} ZIP files: download all of them and extract them into the same folder.${zipParts.needsJoin ? ' Then double-click JOIN_FILES.bat (it rebuilds the big files).' : ''} Part 1 of ${zipParts.length}:`,
         files: [new AttachmentBuilder(zipParts[0].buf, { name: zipPartName(d, 0, zipParts.length) })],
       }
     : {
@@ -3704,12 +3704,45 @@ async function startScheduledSend(interaction) {
 // folder paths kept, so extracting all of them into the same folder rebuilds the original resource.
 const ZIP_PART_MAX = 9 * 1024 * 1024;
 
+const ZIP_CHUNK = 8 * 1024 * 1024;
+
 function buildZipParts(zipPath, maxBytes = ZIP_PART_MAX) {
-  const entries = new AdmZip(zipPath)
+  let entries = new AdmZip(zipPath)
     .getEntries()
     .filter((e) => !e.isDirectory)
-    .map((e) => ({ name: e.entryName, data: e.getData(), size: e.header.compressedSize || 0 }))
-    .sort((a, b) => a.size - b.size); // small files (metas, manifest) land in part 1
+    .map((e) => ({ name: e.entryName, data: e.getData(), size: e.header.compressedSize || 0 }));
+
+  // A single file bigger than one message can't sit in a normal ZIP, so it is cut into pieces
+  // (file.yft.part001, .part002 ...) spread over the ZIPs, and a JOIN_FILES.bat in part 1 glues them back.
+  const joins = [];
+  const out = [];
+  for (const f of entries) {
+    if (f.size <= maxBytes - 1024 * 1024 && f.data.length <= maxBytes * 4) {
+      out.push(f);
+      continue;
+    }
+    const n = Math.ceil(f.data.length / ZIP_CHUNK);
+    const names = [];
+    for (let i = 0; i < n; i++) {
+      const pn = `${f.name}.part${String(i + 1).padStart(3, '0')}`;
+      names.push(pn);
+      const data = f.data.subarray(i * ZIP_CHUNK, (i + 1) * ZIP_CHUNK);
+      out.push({ name: pn, data, size: data.length });
+    }
+    joins.push({ name: f.name, pieces: names });
+  }
+  if (joins.length) {
+    const win = (p) => p.replace(/\//g, '\\');
+    const lines = ['@echo off', 'cd /d "%~dp0"', 'echo Putting the big files back together...'];
+    for (const j of joins) {
+      const src = j.pieces.map((p) => `"${win(p)}"`).join('+');
+      const dels = j.pieces.map((p) => `"${win(p)}"`).join(' ');
+      lines.push(`copy /b /y ${src} "${win(j.name)}" >nul && del ${dels}`);
+    }
+    lines.push('echo Done. You can delete this file now.', 'pause');
+    out.push({ name: 'JOIN_FILES.bat', data: Buffer.from(lines.join('\r\n') + '\r\n'), size: 0 });
+  }
+  entries = out.sort((a, b) => a.size - b.size); // small files (metas, manifest, join.bat) land in part 1
 
   const make = (group) => {
     const z = new AdmZip();
@@ -3746,6 +3779,7 @@ function buildZipParts(zipPath, maxBytes = ZIP_PART_MAX) {
     estimate += f.size + 300;
   }
   flush();
+  parts.needsJoin = joins.length > 0;
   return parts;
 }
 
@@ -3826,7 +3860,7 @@ async function onScheduledSendButton(interaction) {
       return await finish('sent', 'File sent below.');
     }
     await interaction.followUp({
-      content: `**${job.originalName}** is sent as ${parts.length} ZIP files. Download all of them and extract them into the same folder.`,
+      content: `**${job.originalName}** is sent as ${parts.length} ZIP files. Download all of them and extract them into the same folder.${parts.needsJoin ? ' Then double-click JOIN_FILES.bat (it rebuilds the big files).' : ''}`,
       allowedMentions: { parse: [] },
     });
     for (let i = 0; i < parts.length; i++) {
