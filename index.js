@@ -926,49 +926,19 @@ async function backupDataOnce() {
       const signature = `${st.size}:${sha256}`;
       if (blobBackedUp[rel] === signature) continue;
 
-      let zipBuffer = null;
-      let backupLink = null;
-      const marker = { rel, size: st.size, sha256, entryName: path.basename(fp), originalName: path.basename(fp) };
-      // AdmZip builds the complete archive in memory. Very large GTA/FiveM assets can
-      // exceed Node's maximum string/buffer limits and throw "Invalid string length".
-      // Keep small files as verified ZIPs; stream large originals through the hosted
-      // recovery endpoint instead of attempting a dangerous in-memory compression.
-      if (st.size <= 50 * 1024 * 1024) {
-        try {
-          const zip = new AdmZip();
-          zip.addFile(path.basename(fp), fs.readFileSync(fp));
-          zipBuffer = zip.toBuffer();
-          const checkedBackup = new AdmZip(zipBuffer);
-          if (checkedBackup.test() === false) throw new Error('Generated backup ZIP failed its integrity check.');
-          backupLink = makeBackupDownloadLink(zipBuffer, `${path.basename(fp)}.backup.zip`);
-          await ch.send({
-            content: `datafilezip-v1:${JSON.stringify(marker)}`,
-            files: [new AttachmentBuilder(zipBuffer, { name: `${path.basename(fp)}.backup.zip` })],
-            ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
-            allowedMentions: { parse: [] },
-          });
-          blobBackedUp[rel] = signature;
-          lastBackupAt = Date.now();
-          continue;
-        } catch (zipError) {
-          console.error(`ZIP backup upload failed for ${rel}:`, zipError?.stack || zipError);
-        }
-      } else {
-        console.warn(`Skipping in-memory ZIP for large file ${rel} (${(st.size / (1024 * 1024)).toFixed(1)} MB); using streamed hosted recovery instead.`);
-      }
-
+      // Keep original files intact and serve them through the hosted recovery route.
+      // AdmZip compression is synchronous and can block Discord interactions for
+      // many seconds, especially when the source file is already a ZIP archive.
       if (BASE_URL) {
         try {
           const recoveryUrl = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
-          backupLink = backupLink || (zipBuffer ? makeBackupDownloadLink(zipBuffer, `${path.basename(fp)}.backup.zip`) : null);
           await ch.send({
             content: `datafilelink:${rel}|${st.size}|${recoveryUrl}`,
-            ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
             allowedMentions: { parse: [] },
           });
           blobBackedUp[rel] = signature;
           lastBackupAt = Date.now();
-          console.warn(`Stored hosted recovery fallback for ${rel}. The Download ZIP button is a separate one-time convenience link.`);
+          console.log(`Stored original file for recovery without recompression: ${rel} (${(st.size / (1024 * 1024)).toFixed(1)} MB).`);
           continue;
         } catch (linkError) {
           console.error(`Hosted-link backup failed for ${rel}:`, linkError.message);
@@ -5040,7 +5010,8 @@ app.get('/', (_, res) => res.send('Bankroll bot running'));
 app.listen(PORT, () => console.log(`Webhook server listening on :${PORT}`));
 
 // Monitor process memory and event-loop stalls. Configure MEMORY_WARN_MB in Render if needed.
-const eventLoopMonitor = monitorEventLoopDelay({ resolution: 20000 });
+// Resolution is milliseconds; 20,000 would make the monitor itself report a ~20-second baseline.
+const eventLoopMonitor = monitorEventLoopDelay({ resolution: 20 });
 eventLoopMonitor.enable();
 const configuredMemoryWarnMb = Number(process.env.MEMORY_WARN_MB || 384);
 const MEMORY_WARN_MB = Number.isFinite(configuredMemoryWarnMb) ? Math.max(128, configuredMemoryWarnMb) : 384;
