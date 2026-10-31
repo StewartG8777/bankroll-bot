@@ -4291,6 +4291,7 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.commandName === 'total') return await cmdTotal(interaction);
         if (interaction.commandName === 'customer') return await cmdCustomer(interaction);
         if (interaction.commandName === 'history') return await cmdHistory(interaction);
+        if (interaction.commandName === 'preview') return await cmdCustomerPreview(interaction);
     }
   } catch (err) {
     alertOwner(`/${interaction.commandName ?? interaction.customId?.split(':')[0]} failed`, err);
