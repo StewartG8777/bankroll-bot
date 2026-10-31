@@ -258,6 +258,47 @@ function periodStart(period) {
 const FILES_DIR = path.join(DATA_DIR, 'files');
 const DELIVERIES_FILE = path.join(DATA_DIR, 'deliveries.json');
 const MONZO_FILE = path.join(DATA_DIR, 'monzo_payments.json');
+const WEBHOOK_EVENTS_FILE = path.join(DATA_DIR, 'webhook_events.json');
+let processedWebhookEvents = {};
+try { processedWebhookEvents = JSON.parse(fs.readFileSync(WEBHOOK_EVENTS_FILE, 'utf8')); } catch {}
+function hasProcessedWebhook(id) { return !!(id && processedWebhookEvents[id]); }
+function markWebhookProcessed(id, type) {
+  if (!id) return;
+  processedWebhookEvents[id] = { type: String(type || 'unknown'), at: Date.now() };
+  processedWebhookEvents = Object.fromEntries(Object.entries(processedWebhookEvents).sort((a,b) => Number(b[1]?.at || 0)-Number(a[1]?.at || 0)).slice(0,2000));
+  try { atomicWrite(WEBHOOK_EVENTS_FILE, JSON.stringify(processedWebhookEvents)); } catch (e) { console.error('Could not persist webhook event:', e.message); }
+  scheduleBackup();
+}
+const deliveryRetryTimers = new Map();
+function scheduleDeliveryRetry(key, paymentIntentId, delayMs) {
+  const d = deliveries[key];
+  if (!d || d.deliveryComplete || deliveryRetryTimers.has(key)) return false;
+  const attempts = Number(d.deliveryAttempts || 0);
+  if (attempts >= 8) { alertOwner('Automatic delivery retry limit reached', new Error(`Order ${key} still needs manual delivery.`)); return false; }
+  const delays = [15000, 60000, 300000, 900000, 1800000];
+  const delay = Math.max(1000, Number(delayMs || delays[Math.min(attempts, delays.length - 1)]));
+  d.nextDeliveryRetryAt = Date.now() + delay;
+  if (paymentIntentId) d.paymentIntentId = paymentIntentId;
+  try { atomicWrite(DELIVERIES_FILE, JSON.stringify(deliveries)); } catch {}
+  const timer = setTimeout(async () => {
+    deliveryRetryTimers.delete(key);
+    const current = deliveries[key];
+    if (!current || current.deliveryComplete) return;
+    current.deliveryAttempts = Number(current.deliveryAttempts || 0) + 1;
+    current.lastDeliveryAttemptAt = Date.now(); delete current.nextDeliveryRetryAt; saveDeliveries();
+    try { await deliverFile(key, paymentIntentId || current.paymentIntentId || null); } catch (e) { alertOwner('Automatic delivery retry failed', e); }
+  }, delay);
+  timer.unref?.(); deliveryRetryTimers.set(key, timer); return true;
+}
+function restorePendingDeliveryRetries() {
+  let count = 0;
+  for (const [key,d] of Object.entries(deliveries)) {
+    if (!d || d.deliveryComplete || !(d.paymentConfirmed || d.paid)) continue;
+    if (scheduleDeliveryRetry(key, d.paymentIntentId || null, Math.max(1000, Number(d.nextDeliveryRetryAt || Date.now()) - Date.now()))) count++;
+  }
+  if (count) console.log(`Restored ${count} pending paid-delivery retry(s).`);
+  return count;
+}
 
 // Write to a temp file then rename, so a crash mid-write can never leave a half-written data file.
 function atomicWrite(file, data) {
@@ -485,6 +526,8 @@ function saveDelivery(key, fileData, interaction, customer) {
     customerId: customer.id,
     agentId: interaction.user.id,
     savedAt: Date.now(),
+    ...(fileData.sha256 ? { sha256: fileData.sha256 } : {}),
+    ...(fileData.size ? { size: fileData.size } : {}),
   };
   saveDeliveries();
 }
@@ -743,7 +786,7 @@ async function backupDataOnce() {
   }
 
   try {
-    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json'];
+    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json'];
     const files = [];
     for (const name of jsonNames) {
       const fp = path.join(DATA_DIR, name);
@@ -809,6 +852,8 @@ async function backupDataOnce() {
         const zip = new AdmZip();
         zip.addFile(path.basename(fp), fs.readFileSync(fp));
         zipBuffer = zip.toBuffer();
+        const checkedBackup = new AdmZip(zipBuffer);
+        if (checkedBackup.test() === false) throw new Error('Generated backup ZIP failed its integrity check.');
         backupLink = makeBackupDownloadLink(zipBuffer, `${path.basename(fp)}.backup.zip`);
         await ch.send({
           content: `datafilezip-v1:${JSON.stringify(marker)}`,
@@ -906,15 +951,62 @@ async function getInvoiceMessage(d, key) {
   return findInvoiceMessage(d.channelId, key);
 }
 
+
+async function updateInvoicePaidMessage(d, key, paymentIntentId = null) {
+  let invoice = null;
+  const live = liveInteractions.get(key);
+  if (live?.interaction) { try { invoice = await live.interaction.fetchReply(); } catch {} }
+  if (!invoice) invoice = await getInvoiceMessage(d, key);
+  if (!invoice?.embeds?.[0]) return false;
+  const previous = invoice.embeds[0];
+  const oldTitle = String(previous.title || 'Bankroll Invoice').replace(/^PAID\\s*[|:-]\\s*/i, '');
+  const paidAt = d.paidAt || d.paymentConfirmedAt || Date.now();
+  const fields = (previous.fields || []).filter((x) => !['payment status','paid at','amount paid','transaction reference'].includes(String(x.name || '').toLowerCase()));
+  const paidEmbed = EmbedBuilder.from(previous).setColor(GREEN).setTitle(`PAID | ${oldTitle}`)
+    .setDescription(d.type === 'monzo' ? 'Payment received successfully. Thank you! Your Monzo payment has been confirmed.' : 'Payment received successfully. Your Stripe payment has been confirmed.')
+    .setFields(fields).addFields(
+      { name: 'Payment Status', value: 'PAID', inline: true },
+      { name: 'Amount Paid', value: money(Number(d.amount || 0), d.type === 'monzo' ? 'gbp' : (d.currency || CURRENCY)), inline: true },
+      { name: 'Paid At', value: `<t:${Math.floor(paidAt / 1000)}:F>`, inline: true },
+      { name: 'Transaction Reference', value: String(d.txId || paymentIntentId || d.paymentIntentId || key).slice(0,100) }
+    );
+  const rows = [];
+  for (const row of invoice.components || []) {
+    const kept = (row.components || []).filter((component) => component.customId);
+    if (kept.length) rows.push(new ActionRowBuilder().addComponents(kept.map((component) => ButtonBuilder.from(component))));
+  }
+  try {
+    const payload = { embeds: [paidEmbed], components: rows };
+    if (live?.interaction && Date.now() - live.at < 24*60*60*1000) await live.interaction.editReply(payload);
+    else await invoice.edit(payload);
+    return true;
+  } catch (e) { console.log('Could not update paid invoice embed:', e.message); return false; }
+}
+
 async function deliverFile(key, paymentIntentId) {
   const d = deliveries[key];
   if (!d) return;
 
   let owner = null;
   try { owner = await client.users.fetch(OWNER_ID); } catch {}
+  d.paymentConfirmed = true; d.paid = true;
+  d.paymentConfirmedAt = d.paymentConfirmedAt || Date.now();
+  if (paymentIntentId) d.paymentIntentId = paymentIntentId;
+  saveDeliveries();
+  await updateInvoicePaidMessage(d, key, paymentIntentId);
 
   const noFile = !d.link && !d.path;
-  if(d.path && fs.existsSync(d.path)){try{verifyZipIntegrity(d.path);}catch(e){recordDownloadEvent('verification_failed',{file:d.name,customerId:d.customerId,agentId:d.agentId,detail:e.message});if(owner)await owner.send(`Download blocked: **${d.name}** failed ZIP integrity verification. The paid file was not sent. ${short(e.message,180)}`).catch(()=>{});return;}}
+  if (d.path && fs.existsSync(d.path)) {
+    try {
+      verifyZipIntegrity(d.path);
+      if (d.sha256 && await sha256File(d.path) !== d.sha256) throw new Error('SHA-256 checksum does not match the saved file record.');
+    } catch (e) {
+      recordDownloadEvent('verification_failed',{file:d.name,customerId:d.customerId,agentId:d.agentId,detail:e.message});
+      d.deliveryError = `File verification failed: ${short(e.message,180)}`; saveDeliveries();
+      if(owner) await owner.send(`Download blocked: **${d.name}** failed integrity verification. The paid order has been retained for manual recovery. ${short(e.message,180)}`).catch(()=>{});
+      return;
+    }
+  }
   let dlink = d.link || null;
   let hosted = false;
 
@@ -941,9 +1033,8 @@ async function deliverFile(key, paymentIntentId) {
   }
 
   if (!noFile && !dlink && (!d.path || !fs.existsSync(d.path))) {
-    if (owner) await owner.send(`Payment received for ${key}, but the file "${d.name}" is gone. Please send it manually to <@${d.customerId}>.`).catch(() => {});
-    delete deliveries[key];
-    saveDeliveries();
+    d.deliveryError = 'The paid file is missing from storage.'; d.paymentConfirmed = true; d.paid = true; saveDeliveries();
+    if (owner) await owner.send(`Payment received for ${key}, but the file "${d.name}" is missing. The paid order has been retained for recovery; please restore the file or send it manually to <@${d.customerId}>.`).catch(() => {});
     return;
   }
 
@@ -991,12 +1082,7 @@ async function deliverFile(key, paymentIntentId) {
       msgUrl = msg.url;
       reachedCustomer = true;
       sentTo = 'a reply under the invoice message';
-      const old = original.embeds[0];
-      if (old) {
-        const paidEmbed = EmbedBuilder.from(old).setColor(GREY).setTitle(String(old.title || '').startsWith('PAID') ? old.title : `PAID - ${old.title}`);
-        if (d.type === 'monzo') paidEmbed.setDescription('Payment received. Thank you!');
-        await live.interaction.editReply({ embeds: [paidEmbed], components: [] });
-      }
+      // Original invoice status is updated centrally by updateInvoicePaidMessage().
     } catch (e) { console.log('Could not reply under invoice:', e.message); }
   }
   liveInteractions.delete(key);
@@ -1009,12 +1095,7 @@ async function deliverFile(key, paymentIntentId) {
         msgUrl = msg.url;
         reachedCustomer = true;
         sentTo = 'a reply under the invoice message';
-        const old = im.embeds[0];
-        if (old) {
-          const paidEmbed = EmbedBuilder.from(old).setColor(GREY).setTitle(String(old.title || '').startsWith('PAID') ? old.title : `PAID - ${old.title}`);
-          if (d.type === 'monzo') paidEmbed.setDescription('Payment received. Thank you!');
-          await im.edit({ embeds: [paidEmbed], components: [] });
-        }
+        // Original invoice status is updated centrally by updateInvoicePaidMessage().
       }
     } catch (e) { console.log('Could not reply to the stored invoice message:', e.message); }
   }
@@ -1048,6 +1129,7 @@ async function deliverFile(key, paymentIntentId) {
   }
 
   if (reachedCustomer) {
+    const retryTimer = deliveryRetryTimers.get(key); if (retryTimer) clearTimeout(retryTimer); deliveryRetryTimers.delete(key);
     recordDownloadEvent('delivery_sent', { file: d.name, customerId: d.customerId, agentId: d.agentId, detail: `Payment delivery message sent via ${sentTo}.` });
     if (paymentIntentId) {
       await recordInStripe(paymentIntentId, {
@@ -1058,8 +1140,10 @@ async function deliverFile(key, paymentIntentId) {
       });
     }
     await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}>.` });
-  } else if (!sentTo && owner) {
-    await owner.send(`I could not deliver "${d.name}" to <@${d.customerId}>. The paid delivery is still saved; they can use the Download ZIP button on their invoice.`).catch(() => {});
+  } else {
+    if (!sentTo && owner) await owner.send(`I could not deliver "${d.name}" to <@${d.customerId}>. The paid delivery is saved and automatic retries will continue.`).catch(() => {});
+    if (d.deliveryAttempts == null) d.deliveryAttempts = 0;
+    scheduleDeliveryRetry(key, paymentIntentId);
   }
 }
 
@@ -1417,6 +1501,7 @@ async function autoRestoreOnStartup() {
       'monzo_payments.json': MONZO_FILE,
       'notifications.json': NOTIFICATIONS_FILE,
       'scheduled_sends.json': SEND_JOBS_FILE,
+      'webhook_events.json': WEBHOOK_EVENTS_FILE,
     };
     const isValidJsonFor = (name, value) => {
       if (name === 'notifications.json' || name === 'download_history.json') return Array.isArray(value);
@@ -1485,6 +1570,7 @@ async function autoRestoreOnStartup() {
       if (Array.isArray(restoredNotifications)) notificationHistory = restoredNotifications.slice(-100);
     } catch {}
     try { sendJobs = JSON.parse(fs.readFileSync(SEND_JOBS_FILE, 'utf8')); } catch {}
+    try { processedWebhookEvents = JSON.parse(fs.readFileSync(WEBHOOK_EVENTS_FILE, 'utf8')); } catch {}
 
     fs.mkdirSync(VAULT_DIR, { recursive: true });
     fs.mkdirSync(FILES_DIR, { recursive: true });
@@ -1724,6 +1810,22 @@ async function autoRestoreOnStartup() {
   }
 }
 
+async function reconcilePaidStripeDeliveries() {
+  let count = 0;
+  for (const [key,d] of Object.entries(deliveries)) {
+    if (!key.startsWith('cs_') || !d || d.paymentConfirmed || d.paid) continue;
+    try {
+      const session = await stripe.checkout.sessions.retrieve(key);
+      if (session.payment_status !== 'paid') continue;
+      d.paymentConfirmed = true; d.paid = true; d.paymentConfirmedAt = session.created ? session.created*1000 : Date.now();
+      d.amount = (session.amount_total || 0)/100; d.currency = String(session.currency || CURRENCY).toLowerCase(); d.paymentIntentId = session.payment_intent || null;
+      saveDeliveries(); await deliverFile(key, session.payment_intent || null); count++;
+    } catch (e) { console.error(`Could not reconcile Stripe order ${key}:`,e.message); }
+  }
+  if (count) console.log(`Recovered ${count} paid Stripe order(s) during startup reconciliation.`);
+  return count;
+}
+
 const onReady = async () => {
   if (started) return;
   started = true;
@@ -1746,6 +1848,8 @@ const onReady = async () => {
   }
 
   await autoRestoreOnStartup();
+  await reconcilePaidStripeDeliveries();
+  restorePendingDeliveryRetries();
 
   backfillMonzoLedger();
   const monzoRebuilt = restoreMonzoReminders();
@@ -1758,6 +1862,16 @@ const onReady = async () => {
   });
   setTimeout(backupData, 2 * 60 * 1000);
   setInterval(backupData, 6 * 60 * 60 * 1000);
+  setInterval(async () => {
+    try {
+      fs.accessSync(DATA_DIR, fs.constants.W_OK);
+      if (restoreDone && lastBackupAt && Date.now() - lastBackupAt > 18*60*60*1000) await alertOwner('Backup health warning', new Error('No successful backup has been recorded in over 18 hours.'));
+      for (const [key,d] of Object.entries(deliveries)) {
+        if ((d?.paymentConfirmed || d?.paid) && !deliveryRetryTimers.has(key) && !d.deliveryComplete)
+          scheduleDeliveryRetry(key,d.paymentIntentId || null,Math.max(1000,Number(d.nextDeliveryRetryAt || Date.now())-Date.now()));
+      }
+    } catch (e) { await alertOwner('Bankroll storage health check failed',e); }
+  },5*60*1000);
 };
 let shuttingDown = false;
 for (const sig of ['SIGTERM', 'SIGINT']) {
@@ -3955,11 +4069,10 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
     return res.status(403).send('Forbidden');
   }
   console.log('Monzo webhook hit! Type:', req.body?.type);
-  res.status(200).send('OK');
-
   try {
     const data = req.body?.data;
-    if (req.body?.type !== 'transaction.created' || !data) return;
+    if (req.body?.type !== 'transaction.created' || !data) return res.status(200).send('Ignored');
+    if (data.id && hasProcessedWebhook(`monzo:${data.id}`)) return res.status(200).send('Duplicate');
     if (MONZO_ACCOUNT_ID && data.account_id && data.account_id !== MONZO_ACCOUNT_ID) return;
     if (data.id) {
       if (processedMonzoTx.has(data.id)) return;
@@ -3980,7 +4093,7 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
         console.log('Monzo API check failed:', e.message);
       }
     }
-    if (tx.decline_reason) return;
+    if (tx.decline_reason) return res.status(200).send('Declined');
 
     const amountPaid = Math.round(Number(tx.amount)) / 100;
     if (!(amountPaid > 0)) return;
@@ -4005,12 +4118,14 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
 
       const paidEmbed = new EmbedBuilder()
         .setColor(GREEN)
-        .setTitle('Bankroll Monzo Payment Received')
+        .setTitle('PAID | MONZO PAYMENT RECEIVED')
         .setDescription(d.description || 'No description')
         .addFields(
           { name: 'Customer', value: d.customerId ? `<@${d.customerId}>` : 'Unknown', inline: true },
           { name: 'Sales Agent', value: d.agentId ? `<@${d.agentId}>` : 'Unknown', inline: true },
-          { name: 'Amount', value: money(amountPaid, 'gbp'), inline: true },
+          { name: 'Amount Paid', value: money(amountPaid, 'gbp'), inline: true },
+          { name: 'Payment Status', value: 'PAID', inline: true },
+          { name: 'Paid At', value: `<t:${Math.floor(Date.now()/1000)}:F>`, inline: true },
           { name: 'Payment reference', value: d.reference ? `\`${d.reference}\`` : 'None', inline: true },
           { name: 'Transaction ID', value: String(data.id ?? 'Unknown') }
         );
@@ -4033,8 +4148,11 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
           : `Monzo payment of ${money(amountPaid, 'gbp')} arrived${tx.counterparty?.name ? ` from ${tx.counterparty.name}` : ''}, but no open Monzo invoice matches it, so nothing was sent.`,
       });
     }
+    if (data.id) markWebhookProcessed(`monzo:${data.id}`, 'monzo.transaction.created');
+    return res.status(200).send('OK');
   } catch (e) {
     alertOwner('Monzo webhook error', e);
+    return res.status(500).send('Webhook processing failed; retry required.');
   }
 });
 
@@ -4053,12 +4171,17 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  if (hasProcessedWebhook(event.id)) return res.json({ received: true, duplicate: true });
   lastWebhookAt = Date.now();
   lastWebhookType = event.type;
 
   if (event.type === 'checkout.session.completed') {
     const s = event.data.object;
     if (s.payment_status === 'paid') {
+      if (deliveries[s.id]) {
+        Object.assign(deliveries[s.id], { paymentConfirmed:true, paid:true, paymentConfirmedAt:event.created ? event.created*1000 : Date.now(), amount:(s.amount_total || 0)/100, currency:String(s.currency || CURRENCY).toLowerCase(), paymentIntentId:s.payment_intent || null });
+        saveDeliveries();
+      }
       await recordInStripe(s.payment_intent, { paid_at: new Date(event.created * 1000).toISOString() });
       try {
         const { customer_id, agent_id, description } = s.metadata ?? {};
@@ -4071,7 +4194,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           .addFields(
             { name: 'Customer', value: customer_id ? `<@${customer_id}>` : 'Unknown', inline: true },
             { name: 'Sales Agent', value: agent_id ? `<@${agent_id}>` : 'Unknown', inline: true },
-            { name: 'Amount', value: total.toFixed(2), inline: true },
+            { name: 'Amount', value: money(total, s.currency || CURRENCY), inline: true },
+            { name: 'Payment Status', value: 'PAID', inline: true },
+            { name: 'Paid At', value: `<t:${event.created}:F>`, inline: true },
             { name: 'Transaction ID', value: s.id }
           );
 
@@ -4110,6 +4235,24 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     }
   }
 
+  if (event.type === 'charge.refunded') {
+    const charge = event.data.object;
+    const piId = typeof charge.payment_intent === 'string' ? charge.payment_intent : charge.payment_intent?.id;
+    const pi = piId ? await stripe.paymentIntents.retrieve(piId).catch(() => null) : null;
+    const refunded = Number(charge.amount_refunded || 0)/100;
+    const refundEmbed = new EmbedBuilder().setColor(RED).setTitle('REFUND PROCESSED')
+      .setDescription('Stripe reported a refund for a Bankroll payment.')
+      .addFields(
+        { name:'Refunded Amount', value:money(refunded,charge.currency || CURRENCY), inline:true },
+        { name:'Original Amount', value:money(Number(charge.amount || 0)/100,charge.currency || CURRENCY), inline:true },
+        { name:'Payment Intent', value:String(piId || 'Unknown') },
+        { name:'Customer', value:pi?.metadata?.customer_id ? `<@${pi.metadata.customer_id}>` : 'Not available', inline:true },
+        { name:'Refund Status', value:charge.refunded ? 'Fully refunded' : 'Partially refunded', inline:true }
+      );
+    if (piId) await recordInStripe(piId,{refunded_at:new Date(event.created*1000).toISOString(),refund_amount:refunded,refund_status:charge.refunded?'refunded':'partially_refunded'});
+    await notifyOwner({embeds:[refundEmbed]},{notificationType:'payment.refunded',notificationStatus:'warning'});
+  }
+
   if (event.type === 'charge.dispute.created') {
     await onDisputeCreated(event.data.object).catch((e) => alertOwner('Dispute alert failed', e));
   }
@@ -4117,6 +4260,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     await onDisputeClosed(event.data.object).catch((e) => alertOwner('Dispute close alert failed', e));
   }
 
+  markWebhookProcessed(event.id, event.type);
   res.json({ received: true });
 });
 
