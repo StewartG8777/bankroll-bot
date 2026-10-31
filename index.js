@@ -1188,7 +1188,8 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
         delivery_message: msgUrl || '',
       });
     }
-    await notifyOwner({ content: `Payment received. The ${/\\.zip$/i.test(String(d.name || '')) ? 'ZIP' : 'file'} was delivered successfully to <@${d.customerId}>.` });
+    if (force) await notifyOwner({ content: `Manual resend completed for **${d.name}** to <@${d.customerId}>. The original payment was not charged again.` });
+    else await notifyOwner({ content: `Payment received. The ${/\\.zip$/i.test(String(d.name || '')) ? 'ZIP' : 'file'} was delivered successfully to <@${d.customerId}>.` });
   } else {
     if (!sentTo && owner) await owner.send(`I could not deliver "${d.name}" to <@${d.customerId}>. The paid delivery is saved and automatic retries will continue.`).catch(() => {});
     if (d.deliveryAttempts == null) d.deliveryAttempts = 0;
@@ -3735,7 +3736,7 @@ async function cmdDelivery(interaction) {
   if (!d) return interaction.editReply('Order not found in saved delivery records. Use the full Checkout Session ID (cs_...) or Monzo invoice ID.');
   const paid = !!(d.paymentConfirmed || d.paid || d.status === 'paid');
   if (sub === 'status') {
-    const completed = downloadHistory.find((e) => e.type === 'download_completed' && e.customerId === d.customerId && e.file === d.name);
+    const completed = downloadHistory.find((e) => e.type === 'download_completed' && e.customerId === d.customerId && e.file === d.name && Number(e.at || 0) >= Number(d.deliveredAt || 0));
     const state = !paid ? 'AWAITING PAYMENT' : d.deliveryComplete ? (completed ? 'DOWNLOADED' : 'DELIVERED — AWAITING DOWNLOAD') : d.deliveryError ? 'DELIVERY FAILED / NEEDS ATTENTION' : 'PAID — DELIVERY PENDING';
     const lines = [
       '**Order:** ' + key,
