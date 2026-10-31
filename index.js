@@ -2110,7 +2110,7 @@ async function sendStripeCheckout(interaction) {
       row.addComponents(
         new ButtonBuilder()
           .setCustomId(`getfile:${session.id}`)
-          .setLabel('Download ZIP')
+          .setLabel(fileData && /\.zip$/i.test(fileData.name || '') ? 'Download ZIP' : 'Download File')
           .setStyle(ButtonStyle.Secondary)
       );
     }
@@ -2279,7 +2279,7 @@ async function sendMonzoInvoice(interaction) {
     }
     if (fileData || linkUrl) {
       row.addComponents(
-        new ButtonBuilder().setCustomId(`getfile:${key}`).setLabel('Download ZIP').setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`getfile:${key}`).setLabel(fileData && /\.zip$/i.test(fileData.name || '') ? 'Download ZIP' : 'Download File').setStyle(ButtonStyle.Secondary)
       );
     }
 
