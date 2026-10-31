@@ -1437,7 +1437,7 @@ const cancelCmd = common(
 );
 
 const spamCmd = common(
-  new SlashCommandBuilder().setName('spam').setDescription('Post a timed repeated-message embed in this channel')
+  new SlashCommandBuilder().setName('spam').setDescription('Post a timed repeated-message embed in this chat or channel')
     .addStringOption((o) => o.setName('message').setDescription('Text or emoji to repeat').setMaxLength(1800).setRequired(true))
     .addIntegerOption((o) => o.setName('duration').setDescription('Duration in minutes (1–15)').setMinValue(1).setMaxValue(15).setRequired(true))
 );
@@ -3732,7 +3732,7 @@ async function cmdBotAdmin(interaction) {
         guildNote = '\\nRemoved old server-only command copies.';
       }
     }
-    return interaction.editReply(`**Slash commands refreshed successfully**\n\n**What changed:**\n• **/spam** now takes a message and duration only — the user/recipient option has been removed.\n• Running /spam posts a Start embed in the channel where you used the command.\n• Clicking **Start** sends your chosen message as a reply to that embed every second, for the selected 1–15 minutes.\n• The session can be stopped with the embed's **Stop** button; the bot owner can use **/stop** to stop all active sessions.\n\n**${commands.length}** command(s) registered globally. Discord should show the latest commands without restarting your client.${guildNote}`);
+    return interaction.editReply(`**Slash commands refreshed successfully**\n\n**What changed:**\n• **/spam** takes a message and duration only — there is no user/recipient option.\n• **/spam now works in server text channels and direct messages** where the Bankroll app is available (including DMs using the user-installed app).\n• Running /spam posts a Start embed in the chat/channel where you used the command.\n• Clicking **Start** sends your chosen message as a reply to that embed every second, for the selected 1–15 minutes.\n• The session can be stopped with the embed's **Stop** button; the bot owner can use **/stop** in a server or DM to stop all active sessions.\n\n**${commands.length}** command(s) registered globally. Discord should show the latest commands without restarting your client.${guildNote}`);
   }
 
   if (sub === 'export-index') {
@@ -4758,8 +4758,8 @@ const spamSessions = new Map();
 const spamRequests = new Map();
 
 async function cmdSpam(interaction) {
-  if (!interaction.inGuild() || !interaction.channel?.isTextBased()) {
-    return interaction.reply({ content: 'Use /spam in a server text channel.', ephemeral: true });
+  if (!interaction.channel?.isTextBased()) {
+    return interaction.reply({ content: 'I cannot post a spam setup in this location. Use /spam in a server text channel or a direct message where Bankroll is available.', ephemeral: true });
   }
   const message = interaction.options.getString('message', true);
   const durationMinutes = interaction.options.getInteger('duration', true);
