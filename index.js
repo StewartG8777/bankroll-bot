@@ -3111,14 +3111,16 @@ async function cmdCancel(interaction) {
   const input = interaction.options.getString('order').trim();
 
   if (input.startsWith('monzo_')) {
-    const e = monzoLedger[input];
+    const ledgerEntry = Object.entries(monzoLedger).find(([key, entry]) => key === input || entry.key === input);
+    const ledgerKey = ledgerEntry?.[0] || input;
+    const e = ledgerEntry?.[1] || monzoLedger[input];
     if (!e) return interaction.editReply('I could not find that Monzo invoice.');
     if (e.status !== 'open') return interaction.editReply(`That Monzo invoice is already ${e.status} (cannot be cancelled).`);
     e.status = 'cancelled';
     e.cancelledAt = Date.now();
     e.cancelledBy = interaction.user.id;
     saveMonzo();
-    const hadPending = discardPending(input);
+    const hadPending = discardPending(ledgerKey);
     const embed = new EmbedBuilder()
       .setColor(GREY)
       .setTitle('Monzo Invoice Cancelled / Removed')
@@ -4032,11 +4034,12 @@ async function onAutocomplete(interaction) {
           name: `[Card] ${money((s.amount_total ?? 0) / 100, s.currency)} - ${short(s.metadata.description, 50)} - ID: ${s.id}`.slice(0, 100),
           value: s.id,
         }));
-      const monzo = monzoOpen()
-        .filter((m) => !typed || `${m.description} ${m.reference} ${m.key}`.toLowerCase().includes(typed))
-        .map((m) => ({
-          name: `[Monzo] ${money(m.amount, m.currency)} - ${short(m.description, 50)} - ${m.reference}`.slice(0, 100),
-          value: m.key,
+      const monzo = Object.entries(monzoLedger)
+        .filter(([key, m]) => m.status === 'open' && Date.now() < (m.expiresAt ?? m.createdAt + MONZO_OPEN_MS))
+        .filter(([key, m]) => !typed || `${m.description ?? ''} ${m.reference ?? ''} ${key}`.toLowerCase().includes(typed))
+        .map(([key, m]) => ({
+          name: `[Monzo] ${money(m.amount ?? 0, m.currency || 'gbp')} - ${short(m.description || m.reference || 'Monzo invoice', 50)} - ${m.reference || key}`.slice(0, 100),
+          value: key,
         }));
       return await interaction.respond([...monzo, ...card].slice(0, 25));
     }
