@@ -3929,17 +3929,20 @@ async function cmdWipe(interaction) {
   recordNotification('customer.wipe', 'Customer records wiped',
     'Removed Bankroll-local Monzo, delivery, download and audit records for customer ' + id + '. Provider-side payment records are not deleted.', 'warning');
   await backupData();
-  return interaction.editReply([
-    '**Customer records wiped**',
-    'Customer: <@' + id + '> (' + id + ')',
-    'Monzo records removed: **' + monzoCount + '**',
-    'Delivery/order records removed: **' + deliveryCount + '**',
-    'Download links removed: **' + downloadCount + '**',
-    'Download history entries removed: **' + historyCount + '**',
-    'Bot-authored log messages deleted: **' + logCount + '**',
-    '',
-    'Their card payments are now hidden from Bankroll reports. Actual Stripe payments and Monzo bank statements remain unchanged.',
-  ].join('\n'), { allowedMentions: { users: [id] } });
+  return interaction.editReply({
+    content: [
+      '**Customer records wiped**',
+      'Customer: <@' + id + '> (' + id + ')',
+      'Monzo records removed: **' + monzoCount + '**',
+      'Delivery/order records removed: **' + deliveryCount + '**',
+      'Download links removed: **' + downloadCount + '**',
+      'Download history entries removed: **' + historyCount + '**',
+      'Bot-authored log messages deleted: **' + logCount + '**',
+      '',
+      'Their card payments are now hidden from Bankroll reports. Actual Stripe payments and Monzo bank statements remain unchanged.',
+    ].join('\n'),
+    allowedMentions: { users: [id] },
+  });
 }
 
 async function cmdCustomer(interaction) {
