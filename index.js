@@ -1440,6 +1440,14 @@ const cancelCmd = common(
     )
 );
 
+const spamCmd = common(
+  new SlashCommandBuilder().setName('spam').setDescription('Send a timed, opt-in wake-up reminder')
+    .addSubcommand((sub) => sub.setName('start').setDescription('Ask someone to opt in to timed wake-up messages')
+      .addUserOption((o) => o.setName('user').setDescription('Person receiving reminders').setRequired(true))
+      .addIntegerOption((o) => o.setName('interval').setDescription('Seconds between reminders (minimum 60)').setMinValue(60).setMaxValue(3600).setRequired(true))
+      .addIntegerOption((o) => o.setName('duration').setDescription('Duration in minutes (maximum 15)').setMinValue(1).setMaxValue(15).setRequired(true)))
+    .addSubcommand((sub) => sub.setName('stop').setDescription('Stop your active wake-up reminders'))
+);
 const remindCmd = common(
   new SlashCommandBuilder()
     .setName('remind')
@@ -1609,7 +1617,7 @@ const deliveryCmd = common(new SlashCommandBuilder().setName('delivery').setDesc
   .addSubcommand((sub) => sub.setName('status').setDescription('Check a payment order delivery status').addStringOption((o) => o.setName('order').setDescription('Checkout session ID or Monzo invoice ID').setRequired(true)))
   .addSubcommand((sub) => sub.setName('resend').setDescription('Resend a paid customer file without charging again').addStringOption((o) => o.setName('order').setDescription('Checkout session ID or Monzo invoice ID').setRequired(true))));
 
-const commands = [deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd];
+const commands = [spamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -4517,6 +4525,63 @@ async function onDisputeClosed(d) {
   await notifyOwner({ embeds: [embed] });
 }
 
+// ---------- Opt-in wake-up reminders ----------
+const spamSessions = new Map();
+const spamRequests = new Map();
+
+async function cmdSpam(interaction) {
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'stop') {
+    const active = [...spamSessions.entries()].filter(([, session]) => session.ownerId === interaction.user.id);
+    if (!active.length) return interaction.reply({ content: 'You do not have an active reminder session.', ephemeral: true });
+    for (const [id, session] of active) { clearTimeout(session.timeout); spamSessions.delete(id); session.target.send('The wake-up reminders have been stopped.').catch(() => {}); }
+    return interaction.reply({ content: 'Stopped ' + active.length + ' reminder session(s).', ephemeral: true });
+  }
+  const target = interaction.options.getUser('user', true);
+  const intervalSeconds = interaction.options.getInteger('interval', true);
+  const durationMinutes = interaction.options.getInteger('duration', true);
+  if (target.bot || target.id === interaction.user.id) return interaction.reply({ content: 'Choose another person, not a bot or yourself.', ephemeral: true });
+  const requestId = crypto.randomBytes(8).toString('hex');
+  const request = { ownerId: interaction.user.id, targetId: target.id, intervalSeconds, durationMinutes, expiresAt: Date.now() + 120000 };
+  spamRequests.set(requestId, request);
+  const expiry = setTimeout(() => spamRequests.delete(requestId), 120000); expiry.unref?.();
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('spam:accept:' + requestId).setLabel('Allow reminders').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('spam:decline:' + requestId).setLabel('No thanks').setStyle(ButtonStyle.Secondary)
+  );
+  try {
+    await target.send({ embeds: [new EmbedBuilder().setColor(GREY).setTitle('Wake-up reminder request').setDescription('<@' + interaction.user.id + '> wants to send you ✌️😃 every **' + intervalSeconds + ' seconds** for **' + durationMinutes + ' minute(s)**. Nothing will be sent unless you accept.')], components: [row] });
+    return interaction.reply({ content: 'Request sent to <@' + target.id + '>. They must accept first.', ephemeral: true });
+  } catch { spamRequests.delete(requestId); return interaction.reply({ content: 'I could not DM that person. They may have DMs disabled.', ephemeral: true }); }
+}
+
+async function handleSpamConsent(interaction) {
+  const parts = interaction.customId.split(':'); const action = parts[1]; const requestId = parts[2];
+  const request = spamRequests.get(requestId);
+  if (!request || request.expiresAt < Date.now()) return interaction.reply({ content: 'This reminder request has expired.', ephemeral: true });
+  if (interaction.user.id !== request.targetId) return interaction.reply({ content: 'Only the recipient can respond to this request.', ephemeral: true });
+  spamRequests.delete(requestId);
+  if (action === 'decline') return interaction.update({ content: 'Reminder request declined.', embeds: [], components: [] });
+  const sessionId = crypto.randomBytes(8).toString('hex'); const target = interaction.user;
+  const session = { ownerId: request.ownerId, target, endAt: Date.now() + request.durationMinutes * 60000, intervalMs: request.intervalSeconds * 1000, sent: 0, timeout: null };
+  spamSessions.set(sessionId, session);
+  await interaction.update({ content: 'You accepted. You can stop these at any time below.', embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Spam initiated').setDescription('You will receive ✌️😃 every **' + request.intervalSeconds + ' seconds** for up to **' + request.durationMinutes + ' minutes**.')], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('spam:stop:' + sessionId).setLabel('Stop reminders').setStyle(ButtonStyle.Danger))] });
+  const sendNext = async () => {
+    if (!spamSessions.has(sessionId)) return;
+    if (Date.now() >= session.endAt || session.sent >= 15) { spamSessions.delete(sessionId); await target.send('Wake-up reminders have finished.').catch(() => {}); return; }
+    try { await target.send('✌️😃'); session.sent += 1; } catch (error) { spamSessions.delete(sessionId); console.error('Wake-up reminder failed:', error.message); return; }
+    session.timeout = setTimeout(sendNext, session.intervalMs); session.timeout.unref?.();
+  };
+  session.timeout = setTimeout(sendNext, session.intervalMs); session.timeout.unref?.();
+}
+
+async function handleSpamStopButton(interaction) {
+  const id = interaction.customId.split(':')[2]; const session = spamSessions.get(id);
+  if (!session) return interaction.reply({ content: 'This reminder session has already ended.', ephemeral: true });
+  if (interaction.user.id !== session.target.id) return interaction.reply({ content: 'Only you can stop reminders sent to you.', ephemeral: true });
+  clearTimeout(session.timeout); spamSessions.delete(id);
+  return interaction.update({ content: 'Wake-up reminders stopped.', embeds: [], components: [] });
+}
 // ---------- Interaction router ----------
 client.on('interactionCreate', async (interaction) => {
   try {
@@ -4535,6 +4600,10 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply({ content: 'Bankroll message deleted.', ephemeral: true });
     }
     if (interaction.isAutocomplete()) return await onAutocomplete(interaction);
+    if (interaction.isButton() && interaction.customId.startsWith('spam:')) {
+      if (interaction.customId.startsWith('spam:stop:')) return await handleSpamStopButton(interaction);
+      return await handleSpamConsent(interaction);
+    }
     if (interaction.isButton()) return await onButton(interaction);
     if (interaction.isStringSelectMenu() && interaction.customId === 'customer_preview_select') return await onCustomerPreviewSelect(interaction);
     if (!interaction.isChatInputCommand()) return;
@@ -4568,6 +4637,8 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdCancel(interaction);
       case 'remind':
         return await cmdRemind(interaction);
+      case 'spam':
+        return await cmdSpam(interaction);
       case 'restore':
         await interaction.deferReply({ ephemeral: true });
         return await cmdRestore(interaction);
