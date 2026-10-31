@@ -1158,7 +1158,7 @@ async function deliverFile(key, paymentIntentId) {
         delivery_message: msgUrl || '',
       });
     }
-    await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}>.` });
+    await notifyOwner({ content: `Payment received. The ${/\\.zip$/i.test(String(d.name || '')) ? 'ZIP' : 'file'} was delivered successfully to <@${d.customerId}>.` });
   } else {
     if (!sentTo && owner) await owner.send(`I could not deliver "${d.name}" to <@${d.customerId}>. The paid delivery is saved and automatic retries will continue.`).catch(() => {});
     if (d.deliveryAttempts == null) d.deliveryAttempts = 0;
