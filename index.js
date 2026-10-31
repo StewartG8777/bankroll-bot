@@ -7,6 +7,7 @@ const Stripe = require('stripe');
 const AdmZip = require('adm-zip'); // npm install adm-zip (used by /vault edit)
 const { pipeline } = require('stream/promises');
 const { Readable, Transform } = require('stream');
+const { monitorEventLoopDelay } = require('perf_hooks');
 const {
   Client,
   GatewayIntentBits,
@@ -718,17 +719,14 @@ async function logInvoiceWithFile(embed, fileData, filePath) {
     await logToServer({ embeds: [embed] });
     return;
   }
-  const buffer = await fs.promises.readFile(p);
+  const sizeBytes = fs.statSync(p).size;
   try {
-    await ch.send({
-      embeds: [embed],
-      files: [new AttachmentBuilder(buffer, { name: fileData.name })],
-      allowedMentions: { parse: [] },
-    });
+    // Pass the path to Discord.js so the attachment is read as a stream instead of buffering the entire file.
+    await ch.send({ embeds: [embed], files: [new AttachmentBuilder(p, { name: fileData.name })], allowedMentions: { parse: [] } });
   } catch (e) {
     console.error('Log post with file failed:', e.message);
     await ch.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
-    const mb = (buffer.length / (1024 * 1024)).toFixed(2);
+    const mb = (sizeBytes / (1024 * 1024)).toFixed(2);
     if (BASE_URL) {
       try {
         const token = crypto.randomBytes(24).toString('hex');
@@ -3352,7 +3350,10 @@ async function cmdStatus(interaction) {
       { name: 'Last Stripe notice', value: lastWebhookAt ? `${when(lastWebhookAt)} (${lastWebhookType})` : 'None since start', inline: true },
       { name: 'Open Monzo invoices', value: String(monzoOpen().length), inline: true },
       { name: 'Last Monzo notice', value: lastMonzoAt ? when(lastMonzoAt) : 'None since start', inline: true },
-      { name: 'Last data backup', value: when(lastBackupAt), inline: true }
+      { name: 'Last data backup', value: when(lastBackupAt), inline: true },
+      { name: 'Memory (RSS)', value: `${(process.memoryUsage().rss / 1024 / 1024).toFixed(0)} MB`, inline: true },
+      { name: 'Heap used', value: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(0)} MB`, inline: true },
+      { name: 'Event loop delay', value: `${(eventLoopMonitor.mean / 1e6 || 0).toFixed(1)} ms avg`, inline: true }
     );
   return interaction.editReply({ embeds: [embed] });
 }
@@ -4556,6 +4557,19 @@ client.on('interactionCreate', async (interaction) => {
 // ---------- Monzo Webhook Listener ----------
 const app = express();
 
+// Liveness and readiness endpoints for Render or external uptime monitors.
+function healthSnapshot() {
+  const mem = process.memoryUsage();
+  return { service: 'bankroll', status: 'ok', uptimeSeconds: Math.floor(process.uptime()), discordReady: client.isReady(), memory: { rssBytes: mem.rss, heapUsedBytes: mem.heapUsed, heapTotalBytes: mem.heapTotal, externalBytes: mem.external, arrayBuffersBytes: mem.arrayBuffers || 0 }, eventLoopDelayMs: { mean: Number.isFinite(eventLoopMonitor.mean) ? Number((eventLoopMonitor.mean / 1e6).toFixed(2)) : 0, max: Number.isFinite(eventLoopMonitor.max) ? Number((eventLoopMonitor.max / 1e6).toFixed(2)) : 0 }, lastBackupAt: lastBackupAt || null, lastBackupAgeSeconds: lastBackupAt ? Math.floor((Date.now() - lastBackupAt) / 1000) : null, storage: DATA_DIR_STATUS, checkedAt: new Date().toISOString() };
+}
+app.get('/healthz', (_req, res) => res.status(200).json(healthSnapshot()));
+app.get('/readyz', (_req, res) => {
+  let storageWritable = true;
+  try { fs.accessSync(DATA_DIR, fs.constants.W_OK); } catch { storageWritable = false; }
+  const ready = client.isReady() && storageWritable;
+  res.status(ready ? 200 : 503).json({ ...healthSnapshot(), status: ready ? 'ready' : 'not_ready', storageWritable });
+});
+
 app.post('/monzo-webhook', express.json(), async (req, res) => {
   if (MONZO_WEBHOOK_TOKEN && req.query.token !== MONZO_WEBHOOK_TOKEN) {
     console.error('Monzo webhook rejected: bad or missing token');
@@ -4826,6 +4840,35 @@ app.get('/:name/:token', (req, res) => {
 
 app.get('/', (_, res) => res.send('Bankroll bot running'));
 app.listen(PORT, () => console.log(`Webhook server listening on :${PORT}`));
+
+// Monitor process memory and event-loop stalls. Configure MEMORY_WARN_MB in Render if needed.
+const eventLoopMonitor = monitorEventLoopDelay({ resolution: 20000 });
+eventLoopMonitor.enable();
+const MEMORY_WARN_MB = Math.max(128, Number(process.env.MEMORY_WARN_MB || 384));
+let memoryWarningActive = false;
+let lastMemorySampleAt = 0;
+function sampleRuntimeHealth() {
+  const now = Date.now();
+  const mem = process.memoryUsage();
+  const rssMb = mem.rss / 1024 / 1024;
+  const heapMb = mem.heapUsed / 1024 / 1024;
+  const loopMeanMs = Number.isFinite(eventLoopMonitor.mean) ? eventLoopMonitor.mean / 1e6 : 0;
+  const loopMaxMs = Number.isFinite(eventLoopMonitor.max) ? eventLoopMonitor.max / 1e6 : 0;
+  if (now - lastMemorySampleAt >= 5 * 60 * 1000) {
+    console.log(`[HEALTH] RSS ${rssMb.toFixed(0)} MB; heap ${heapMb.toFixed(0)} MB; external ${(mem.external/1024/1024).toFixed(0)} MB; event-loop mean ${loopMeanMs.toFixed(1)} ms, max ${loopMaxMs.toFixed(1)} ms`);
+    lastMemorySampleAt = now;
+  }
+  if (rssMb >= MEMORY_WARN_MB && !memoryWarningActive) {
+    memoryWarningActive = true;
+    void alertOwner('High memory usage', new Error(`Bankroll RSS is ${rssMb.toFixed(0)} MB (alert threshold ${MEMORY_WARN_MB} MB); heap ${heapMb.toFixed(0)} MB, external ${(mem.external/1024/1024).toFixed(0)} MB.`));
+  } else if (memoryWarningActive && rssMb < MEMORY_WARN_MB * 0.9) {
+    memoryWarningActive = false;
+    console.log(`[HEALTH] Memory usage recovered to ${rssMb.toFixed(0)} MB RSS.`);
+  }
+  if (loopMaxMs >= 2000) console.warn(`[HEALTH] Event loop was blocked for up to ${loopMaxMs.toFixed(0)} ms since the previous sample.`);
+  eventLoopMonitor.reset();
+}
+setInterval(sampleRuntimeHealth, 60 * 1000).unref?.();
 
 client.on('error', (e) => console.error('Client error:', e));
 client.on('shardError', (e) => console.error('Shard error:', e));
