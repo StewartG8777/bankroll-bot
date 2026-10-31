@@ -92,6 +92,18 @@ function selectWritableDataDir() {
 }
 const DATA_DIR = selectWritableDataDir();
 const NOTIFICATIONS_FILE = path.join(DATA_DIR, 'notifications.json');
+const PRESENCE_FILE = path.join(DATA_DIR, 'presence.json');
+let savedPresence = { status: 'online', updatedAt: 0 };
+try {
+  const parsedPresence = JSON.parse(fs.readFileSync(PRESENCE_FILE, 'utf8'));
+  if (['online', 'idle', 'dnd', 'invisible'].includes(parsedPresence?.status)) savedPresence = { status: parsedPresence.status, updatedAt: Number(parsedPresence.updatedAt || 0) };
+} catch {}
+function savePresence(status) {
+  if (!['online', 'idle', 'dnd', 'invisible'].includes(status)) throw new Error('Invalid Discord presence status.');
+  savedPresence = { status, updatedAt: Date.now() };
+  atomicWrite(PRESENCE_FILE, JSON.stringify(savedPresence, null, 2));
+  scheduleBackup();
+}
 let notificationHistory = [];
 try {
   const savedNotifications = JSON.parse(fs.readFileSync(NOTIFICATIONS_FILE, 'utf8'));
@@ -802,7 +814,7 @@ async function backupDataOnce() {
   }
 
   try {
-    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json'];
+    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json'];
     const files = [];
     for (const name of jsonNames) {
       const fp = path.join(DATA_DIR, name);
@@ -1575,6 +1587,7 @@ async function autoRestoreOnStartup() {
       'notifications.json': NOTIFICATIONS_FILE,
       'scheduled_sends.json': SEND_JOBS_FILE,
       'webhook_events.json': WEBHOOK_EVENTS_FILE,
+      'presence.json': PRESENCE_FILE,
     };
     const isValidJsonFor = (name, value) => {
       if (name === 'notifications.json' || name === 'download_history.json') return Array.isArray(value);
@@ -1921,6 +1934,13 @@ const onReady = async () => {
   }
 
   await autoRestoreOnStartup();
+  try {
+    const status = ['online', 'idle', 'dnd', 'invisible'].includes(savedPresence?.status) ? savedPresence.status : 'online';
+    await client.user.setPresence({ status, activities: [] });
+    console.log(`Restored saved bot presence: ${status}`);
+  } catch (error) {
+    console.error('Could not restore saved bot presence:', error);
+  }
   await reconcilePaidStripeDeliveries();
   restorePendingDeliveryRetries();
 
@@ -3611,8 +3631,14 @@ async function cmdBotAdmin(interaction) {
   if (sub === 'status') {
     const presence = interaction.options.getString('presence');
     await client.user.setPresence({ status: presence, activities: [] });
+    try {
+      savePresence(presence);
+    } catch (error) {
+      console.error('Could not persist bot presence:', error);
+      return interaction.editReply(`Presence changed to **${presence}**, but could not be saved for the next restart: ${short(error.message, 180)}`);
+    }
     const labels = { online: 'Online (green)', idle: 'Idle (yellow)', dnd: 'Do Not Disturb (red)', invisible: 'Invisible' };
-    return interaction.editReply(`Bot presence changed to **${labels[presence] || presence}**.`);
+    return interaction.editReply(`Bot presence changed to **${labels[presence] || presence}** and saved. It will be restored after restarts.`);
   }
 
   if (sub === 'restart' || sub === 'redeploy') {
