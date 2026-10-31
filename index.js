@@ -615,7 +615,6 @@ function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download i
 
 function makeDownloadLink(d, paymentIntentId) {
   if (!d?.path || !fs.existsSync(d.path)) throw new Error('The source file is no longer available.');
-  verifyZipIntegrity(d.path);
   const token = crypto.randomBytes(24).toString('hex');
   const safeName = path.basename(String(d.name || 'download.zip')).replace(/[^\w.\-]/g, '_');
   const downloadPath = path.join(FILES_DIR, `download_${token}_${safeName}`);
@@ -1016,16 +1015,11 @@ async function deliverFile(key, paymentIntentId) {
   await updateInvoicePaidMessage(d, key, paymentIntentId);
 
   const noFile = !d.link && !d.path;
-  if (d.path && fs.existsSync(d.path)) {
-    try {
-      verifyZipIntegrity(d.path);
-      if (d.sha256 && await sha256File(d.path) !== d.sha256) throw new Error('SHA-256 checksum does not match the saved file record.');
-    } catch (e) {
-      recordDownloadEvent('verification_failed',{file:d.name,customerId:d.customerId,agentId:d.agentId,detail:e.message});
-      d.deliveryError = `File verification failed: ${short(e.message,180)}`; saveDeliveries();
-      if(owner) await owner.send(`Download blocked: **${d.name}** failed integrity verification. The paid order has been retained for manual recovery. ${short(e.message,180)}`).catch(()=>{});
-      return;
-    }
+  if (d.path && fs.existsSync(d.path) && d.sha256 && await sha256File(d.path) !== d.sha256) {
+    recordDownloadEvent('verification_failed',{file:d.name,customerId:d.customerId,agentId:d.agentId,detail:'SHA-256 checksum does not match the saved file record.'});
+    d.deliveryError = 'File SHA-256 checksum does not match the saved file record.'; saveDeliveries();
+    if(owner) await owner.send(`Download warning: **${d.name}** has changed since it was saved. The paid order has been retained for manual recovery.`).catch(()=>{});
+    return;
   }
   let dlink = d.link || null;
   let hosted = false;
@@ -3720,13 +3714,16 @@ async function onGetFile(interaction) {
     }
   }
 
-  if (d.path && fs.existsSync(d.path)) {
-    try { verifyZipIntegrity(d.path); }
-    catch (e) {
-      recordDownloadEvent('verification_failed', { file: d.name, customerId: d.customerId, agentId: d.agentId, detail: e.message });
-      return interaction.reply({ content: `I stopped this delivery because the file failed its integrity check: ${short(e.message, 180)}. Please contact the seller.`, ephemeral: true });
-    }
-  }
+  // Payment has been confirmed above. Update the original invoice to PAID
+  // when the customer clicks the download button, before sending the file.
+  d.paid = true;
+  d.paymentConfirmed = true;
+  d.paidAt = d.paidAt || Date.now();
+  d.paymentConfirmedAt = d.paymentConfirmedAt || d.paidAt;
+  if (checkPi) d.paymentIntentId = checkPi;
+  saveDeliveries();
+  await updateInvoicePaidMessage(d, key, checkPi);
+
   let dlink = d.link || null;
   let hosted = false;
   if (d.fallbackLink) {
