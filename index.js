@@ -213,8 +213,15 @@ async function alertOwner(where, err) {
     await owner.send(`Bot error - ${msg}`);
   } catch {}
 }
-process.on('unhandledRejection', (e) => alertOwner('Unhandled error', e));
-process.on('uncaughtException', (e) => alertOwner('Crash avoided', e));
+process.on('unhandledRejection', (e) => {
+  console.error('UNHANDLED REJECTION STACK:', e?.stack || e);
+  void alertOwner('Unhandled error', e).catch((alertError) => console.error('Could not report unhandled rejection:', alertError?.stack || alertError));
+});
+process.on('uncaughtException', (e) => {
+  // Keep the complete stack in Render logs. The short owner DM alone hides the failing line.
+  console.error('UNCAUGHT EXCEPTION STACK:', e?.stack || e);
+  void alertOwner('Crash avoided', e).catch((alertError) => console.error('Could not report uncaught exception:', alertError?.stack || alertError));
+});
 
 // ---------- Helpers ----------
 
@@ -851,24 +858,32 @@ async function backupDataOnce() {
       let zipBuffer = null;
       let backupLink = null;
       const marker = { rel, size: st.size, sha256, entryName: path.basename(fp), originalName: path.basename(fp) };
-      try {
-        const zip = new AdmZip();
-        zip.addFile(path.basename(fp), fs.readFileSync(fp));
-        zipBuffer = zip.toBuffer();
-        const checkedBackup = new AdmZip(zipBuffer);
-        if (checkedBackup.test() === false) throw new Error('Generated backup ZIP failed its integrity check.');
-        backupLink = makeBackupDownloadLink(zipBuffer, `${path.basename(fp)}.backup.zip`);
-        await ch.send({
-          content: `datafilezip-v1:${JSON.stringify(marker)}`,
-          files: [new AttachmentBuilder(zipBuffer, { name: `${path.basename(fp)}.backup.zip` })],
-          ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
-          allowedMentions: { parse: [] },
-        });
-        blobBackedUp[rel] = signature;
-        lastBackupAt = Date.now();
-        continue;
-      } catch (zipError) {
-        console.error(`ZIP backup upload failed for ${rel}:`, zipError.message);
+      // AdmZip builds the complete archive in memory. Very large GTA/FiveM assets can
+      // exceed Node's maximum string/buffer limits and throw "Invalid string length".
+      // Keep small files as verified ZIPs; stream large originals through the hosted
+      // recovery endpoint instead of attempting a dangerous in-memory compression.
+      if (st.size <= 50 * 1024 * 1024) {
+        try {
+          const zip = new AdmZip();
+          zip.addFile(path.basename(fp), fs.readFileSync(fp));
+          zipBuffer = zip.toBuffer();
+          const checkedBackup = new AdmZip(zipBuffer);
+          if (checkedBackup.test() === false) throw new Error('Generated backup ZIP failed its integrity check.');
+          backupLink = makeBackupDownloadLink(zipBuffer, `${path.basename(fp)}.backup.zip`);
+          await ch.send({
+            content: `datafilezip-v1:${JSON.stringify(marker)}`,
+            files: [new AttachmentBuilder(zipBuffer, { name: `${path.basename(fp)}.backup.zip` })],
+            ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
+            allowedMentions: { parse: [] },
+          });
+          blobBackedUp[rel] = signature;
+          lastBackupAt = Date.now();
+          continue;
+        } catch (zipError) {
+          console.error(`ZIP backup upload failed for ${rel}:`, zipError?.stack || zipError);
+        }
+      } else {
+        console.warn(`Skipping in-memory ZIP for large file ${rel} (${(st.size / (1024 * 1024)).toFixed(1)} MB); using streamed hosted recovery instead.`);
       }
 
       if (BASE_URL) {
