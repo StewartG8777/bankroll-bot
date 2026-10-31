@@ -21,6 +21,9 @@ const {
   AttachmentBuilder,
   ChannelType,
   PermissionFlagsBits,
+  ContextMenuCommandBuilder,
+  ApplicationCommandType,
+  Routes,
 } = require('discord.js');
 
 const {
@@ -623,6 +626,197 @@ async function logInvoiceWithFile(embed, fileData, filePath) {
   }
 }
 const blobBackedUp = {}; // relative path -> size already in the backup channel
+
+// BEGIN backup helpers
+const backupFailures = {}; // relative path -> { count, nextTry, error }
+let backupRetryTimer = null;
+const shaCache = new Map();
+
+// Hashing a big file every backup cycle is slow on a free instance, so remember the hash until the file changes.
+async function cachedSha256(fp, st) {
+  const key = `${st.size}:${Math.floor(st.mtimeMs)}`;
+  const hit = shaCache.get(fp);
+  if (hit && hit.key === key) return hit.sha;
+  const sha = await sha256File(fp);
+  shaCache.set(fp, { key, sha });
+  return sha;
+}
+
+// How big one attachment may be in the backup channel (depends on the server's boost level).
+function uploadLimitBytes(ch) {
+  const g = ch?.guild;
+  const reported = Number(g?.maximumUploadLimit || 0);
+  if (reported > 0) return Math.min(Math.max(reported, 10 * 1024 * 1024), 100 * 1024 * 1024);
+  const tier = Number(g?.premiumTier || 0);
+  return (tier >= 3 ? 100 : tier === 2 ? 50 : 10) * 1024 * 1024;
+}
+
+// Reads one slice of a file without loading the whole file into memory.
+async function readChunk(fp, start, length) {
+  const fh = await fs.promises.open(fp, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(length);
+    let off = 0;
+    while (off < length) {
+      const { bytesRead } = await fh.read(buf, off, length - off, start + off);
+      if (!bytesRead) break;
+      off += bytesRead;
+    }
+    return off === length ? buf : buf.subarray(0, off);
+  } finally {
+    await fh.close();
+  }
+}
+
+// Files bigger than Discord's upload limit are posted as numbered parts. The startup restore
+// (datafile-v2) stitches them back together and checks size + SHA-256 before using the file.
+async function sendChunked(ch, fp, rel, st, sha256, limit) {
+  let chunkSize = Math.max(1024 * 1024, Math.min(limit, 25 * 1024 * 1024) - 512 * 1024);
+  for (;;) {
+    const total = Math.ceil(st.size / chunkSize);
+    if (total > 30) throw new Error(`file would need ${total} parts (max 30)`);
+    try {
+      for (let i = 0; i < total; i++) {
+        const start = i * chunkSize;
+        const buf = await readChunk(fp, start, Math.min(chunkSize, st.size - start));
+        await ch.send({
+          content: `datafile-v2:${rel}|${st.size}|${sha256}|${i + 1}/${total}`,
+          files: [new AttachmentBuilder(buf, { name: `${path.basename(fp)}.part${i + 1}of${total}` })],
+          allowedMentions: { parse: [] },
+        });
+      }
+      return total;
+    } catch (e) {
+      const tooBig = e?.code === 40005 || /too large|entity/i.test(String(e?.message || ''));
+      if (!tooBig || chunkSize <= 1024 * 1024) throw e;
+      chunkSize = Math.floor(chunkSize / 2); // Discord said no: retry with smaller parts
+    }
+  }
+}
+
+async function fetchRetry(url, { tries = 3, timeoutMs = 120000 } = {}) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (e) {
+      lastErr = e;
+      await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+// END backup helpers
+
+function backupSummary() {
+  const rels = dataFilePaths().map((fp) => safeBackupRel(relData(fp))).filter(Boolean);
+  return {
+    total: rels.length,
+    ok: rels.filter((r) => blobBackedUp[r]).length,
+    failing: rels.filter((r) => backupFailures[r]).length,
+  };
+}
+
+// Reads the whole history of a channel (newest first).
+async function fetchAllMessages(ch, max = 5000) {
+  const out = [];
+  let before;
+  while (out.length < max) {
+    const batch = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+    if (!batch.size) break;
+    out.push(...batch.values());
+    before = batch.last().id;
+    if (batch.size < 100) break;
+  }
+  return out;
+}
+
+async function deleteRawMessage(channelId, messageId) {
+  await client.rest.delete(Routes.channelMessage(channelId, messageId));
+}
+
+async function deleteMessages(msgs) {
+  let ok = 0;
+  let fail = 0;
+  for (let i = 0; i < msgs.length; i += 5) {
+    const res = await Promise.allSettled(msgs.slice(i, i + 5).map((m) => deleteRawMessage(m.channelId || m.channel_id, m.id)));
+    for (const r of res) (r.status === 'fulfilled' ? ok++ : fail++);
+  }
+  return { ok, fail };
+}
+
+// Decides which old backup messages are safe to delete. It never removes the newest complete copy of a file.
+async function planBackupPrune(ch) {
+  const all = await fetchAllMessages(ch);
+  const mine = all.filter((m) => m.author?.id === client.user.id);
+  const wantedRels = new Set(dataFilePaths().map((fp) => safeBackupRel(relData(fp))).filter(Boolean));
+  const plan = { scanned: all.length, snapshots: [], oldVersions: [], deadLinks: [], incomplete: [] };
+  let snaps = 0;
+  const units = new Map();
+  const links = [];
+  for (const m of mine) {
+    const c = String(m.content || '');
+    if (c.startsWith('BANKROLL_BACKUP_SNAPSHOT')) {
+      snaps += 1;
+      if (snaps > 3) plan.snapshots.push(m); // keep the 3 newest database snapshots
+    } else if (c.startsWith('datafilezip-v1:')) {
+      try {
+        const rel = safeBackupRel(JSON.parse(c.slice('datafilezip-v1:'.length)).rel);
+        if (rel) units.set(`zip|${m.id}`, { rel, msgs: [m], newest: m.createdTimestamp, total: 1, parts: new Set([1]) });
+      } catch {}
+    } else if (c.startsWith('datafile-v2:')) {
+      const bits = c.slice('datafile-v2:'.length).split('|');
+      if (bits.length < 4) continue;
+      const rel = safeBackupRel(bits[0]);
+      const [part, total] = bits[3].split('/').map(Number);
+      if (!rel || !part || !total) continue;
+      const key = `grp|${rel}|${bits[1]}|${bits[2]}|${total}`;
+      if (!units.has(key)) units.set(key, { rel, msgs: [], newest: 0, total, parts: new Set() });
+      const u = units.get(key);
+      u.msgs.push(m);
+      u.parts.add(part);
+      u.newest = Math.max(u.newest, m.createdTimestamp);
+    } else if (c.startsWith('datafilelink:')) {
+      links.push(m);
+    }
+  }
+  const byRel = new Map();
+  for (const u of units.values()) {
+    u.complete = u.parts.size === u.total;
+    if (!byRel.has(u.rel)) byRel.set(u.rel, []);
+    byRel.get(u.rel).push(u);
+  }
+  for (const [rel, list] of byRel) {
+    if (!wantedRels.has(rel)) continue; // files no longer in the vault/queue are left alone
+    const keep = list.filter((u) => u.complete).sort((a, b) => b.newest - a.newest)[0];
+    for (const u of list) {
+      if (u === keep) continue;
+      if (!u.complete) {
+        if (Date.now() - u.newest > 30 * 60 * 1000) plan.incomplete.push(...u.msgs);
+      } else {
+        plan.oldVersions.push(...u.msgs);
+      }
+    }
+  }
+  for (const m of links) {
+    const bits = String(m.content).slice('datafilelink:'.length).split('|');
+    const rel = safeBackupRel(bits.slice(0, -2).join('|'));
+    if (rel && (byRel.get(rel) || []).some((u) => u.complete)) plan.deadLinks.push(m);
+  }
+  return plan;
+}
+
+// Removes the previous "Bot is back online" DMs so a restart doesn't pile them up.
+async function cleanOldOnlineNotices() {
+  if (!OWNER_ID) return;
+  const owner = await client.users.fetch(OWNER_ID);
+  const dm = await owner.createDM();
+  const batch = await dm.messages.fetch({ limit: 50 });
+  const old = [...batch.values()].filter((m) => m.author?.id === client.user.id && /^Bot is back online/.test(m.content || ''));
+  for (const m of old) await deleteRawMessage(dm.id, m.id).catch(() => {});
+}
 function relData(p) {
   if (!p) return null;
   const rel = path.relative(DATA_DIR, path.resolve(String(p)));
@@ -717,58 +911,58 @@ async function backupDataOnce() {
       }
     }
 
-    // Back up each physical file as ONE ZIP attachment. If Discord rejects it,
-    // use the configured hosted-file route; never split a file into multipart messages.
+    // Small files go up as one ZIP. Files bigger than the channel's upload limit are split into numbered
+    // parts and verified on restore. A hosted link on this server is NOT a backup (the disk is wiped on
+    // every redeploy), so it is no longer used here.
+    const limit = uploadLimitBytes(ch);
+    const safeSingle = limit - 64 * 1024;
+    let retryLater = false;
     for (const fp of dataFilePaths()) {
       const rel = safeBackupRel(relData(fp));
       if (!rel) continue;
       let st;
       try { st = fs.statSync(fp); } catch { continue; }
       if (!st.isFile() || !st.size) continue;
-      const sha256 = await sha256File(fp);
+      const failed = backupFailures[rel];
+      if (failed && Date.now() < failed.nextTry) { retryLater = true; continue; }
+      const sha256 = await cachedSha256(fp, st);
       const signature = `${st.size}:${sha256}`;
       if (blobBackedUp[rel] === signature) continue;
 
       try {
-        const zip = new AdmZip();
-        zip.addFile(path.basename(fp), fs.readFileSync(fp));
-        const zipBuffer = zip.toBuffer();
-        const marker = {
-          rel,
-          size: st.size,
-          sha256,
-          entryName: path.basename(fp),
-          originalName: path.basename(fp),
-        };
-        await ch.send({
-          content: `datafilezip-v1:${JSON.stringify(marker)}`,
-          files: [new AttachmentBuilder(zipBuffer, { name: `${path.basename(fp)}.backup.zip` })],
-          allowedMentions: { parse: [] },
-        });
-        blobBackedUp[rel] = signature;
-        lastBackupAt = Date.now();
-        continue;
-      } catch (zipError) {
-        console.error(`ZIP backup upload failed for ${rel}:`, zipError.message);
-      }
-
-      if (BASE_URL) {
-        try {
-          const url = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
-          await ch.send({
-            content: `datafilelink:${rel}|${st.size}|${url}`,
-            allowedMentions: { parse: [] },
-          });
-          blobBackedUp[rel] = signature;
-          lastBackupAt = Date.now();
-          console.warn(`Stored hosted-link backup fallback for ${rel}. A link hosted on ephemeral storage is not durable across instance loss.`);
-          continue;
-        } catch (linkError) {
-          console.error(`Hosted-link backup failed for ${rel}:`, linkError.message);
+        let sentSingle = false;
+        if (st.size < safeSingle) {
+          const zip = new AdmZip();
+          zip.addFile(path.basename(fp), fs.readFileSync(fp));
+          const zipBuffer = zip.toBuffer();
+          if (zipBuffer.length < safeSingle) {
+            const marker = { rel, size: st.size, sha256, entryName: path.basename(fp), originalName: path.basename(fp) };
+            await ch.send({
+              content: `datafilezip-v1:${JSON.stringify(marker)}`,
+              files: [new AttachmentBuilder(zipBuffer, { name: `${path.basename(fp)}.backup.zip` })],
+              allowedMentions: { parse: [] },
+            });
+            sentSingle = true;
+          }
         }
+        if (!sentSingle) {
+          const parts = await sendChunked(ch, fp, rel, st, sha256, limit);
+          console.log(`Backed up ${rel} in ${parts} part(s).`);
+        }
+        blobBackedUp[rel] = signature;
+        delete backupFailures[rel];
+        lastBackupAt = Date.now();
+      } catch (e) {
+        const count = (failed?.count || 0) + 1;
+        backupFailures[rel] = { count, nextTry: Date.now() + Math.min(60 * 60 * 1000, 30 * 1000 * 2 ** count), error: e.message };
+        console.error(`Backup of ${rel} failed (attempt ${count}):`, e.message);
+        if (count === 3) alertOwner(`Backup of ${rel} keeps failing`, e);
+        retryLater = true; // keep going: one bad file must not block the others
       }
-      scheduleBackup();
-      break;
+    }
+    if (retryLater) {
+      clearTimeout(backupRetryTimer);
+      backupRetryTimer = setTimeout(() => backupData(), 2 * 60 * 1000);
     }
 
   } catch (e) {
@@ -1318,7 +1512,41 @@ const setupCmd = new SlashCommandBuilder()
   .setIntegrationTypes([ApplicationIntegrationType.GuildInstall])
   .setContexts([InteractionContextType.Guild]);
 
-const commands = [bankrollCmd, monzoCmd, vaultCmd, sendfileCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
+const purgeCmd = common(
+  new SlashCommandBuilder()
+    .setName('purge')
+    .setDescription('Delete messages the bot sent (only its own messages)')
+    .addSubcommand((sub) =>
+      sub
+        .setName('recent')
+        .setDescription("Delete the bot's latest messages in this channel")
+        .addIntegerOption((o) => o.setName('count').setDescription('How many of my messages to delete (1-100)').setMinValue(1).setMaxValue(100).setRequired(true))
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('message')
+        .setDescription('Delete one bot message by ID or message link')
+        .addStringOption((o) => o.setName('message').setDescription('Message ID or "Copy Message Link"').setRequired(true))
+    )
+);
+
+const deleteMsgCmd = common(new ContextMenuCommandBuilder().setName('Delete bot message').setType(ApplicationCommandType.Message));
+
+const backupCmd = common(
+  new SlashCommandBuilder()
+    .setName('backup')
+    .setDescription('Check, run or tidy the data backups (owner only)')
+    .addSubcommand((sub) => sub.setName('status').setDescription('Show what is backed up and what is failing'))
+    .addSubcommand((sub) => sub.setName('now').setDescription('Run a backup right now and retry anything failing'))
+    .addSubcommand((sub) =>
+      sub
+        .setName('prune')
+        .setDescription('Delete old backup messages (keeps the newest copy of everything)')
+        .addBooleanOption((o) => o.setName('confirm').setDescription('Actually delete (default: just show what would be deleted)'))
+    )
+);
+
+const commands = [bankrollCmd, monzoCmd, vaultCmd, sendfileCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, purgeCmd, deleteMsgCmd, backupCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -1511,7 +1739,7 @@ async function autoRestoreOnStartup() {
       for (let i = 1; i <= g.total; i++) {
         const partAtt = g.parts.get(i);
         if (!partAtt) throw new Error(`missing part ${i}/${g.total}`);
-        const res = await fetch(partAtt.url);
+        const res = await fetchRetry(partAtt.url);
         if (!res.ok) throw new Error(`HTTP ${res.status} downloading part ${i}`);
         chunks.push(Buffer.from(await res.arrayBuffer()));
       }
@@ -1521,7 +1749,7 @@ async function autoRestoreOnStartup() {
       return buf;
     };
     const downloadZipBackup = async (z) => {
-      const res = await fetch(z.att.url);
+      const res = await fetchRetry(z.att.url);
       if (!res.ok) throw new Error(`HTTP ${res.status} downloading ZIP backup`);
       const zipBuffer = Buffer.from(await res.arrayBuffer());
       const zip = new AdmZip(zipBuffer);
@@ -1531,6 +1759,35 @@ async function autoRestoreOnStartup() {
       if (buf.length !== z.size) throw new Error(`ZIP file size mismatch (${buf.length}/${z.size})`);
       if (z.sha && crypto.createHash('sha256').update(buf).digest('hex') !== z.sha) throw new Error('ZIP file SHA-256 mismatch');
       return buf;
+    };
+
+    // Streams the parts to a temp file and verifies size + SHA-256 before the file replaces anything.
+    const restoreGroup = async (g, fp) => {
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      const tmp = path.join(TMP_DIR, `${crypto.randomBytes(8).toString('hex')}.restore`);
+      const h = crypto.createHash('sha256');
+      let total = 0;
+      try {
+        const fd = fs.openSync(tmp, 'w');
+        try {
+          for (let i = 1; i <= g.total; i++) {
+            const partAtt = g.parts.get(i);
+            if (!partAtt) throw new Error(`missing part ${i}/${g.total}`);
+            const buf = Buffer.from(await (await fetchRetry(partAtt.url)).arrayBuffer());
+            fs.writeFileSync(fd, buf);
+            h.update(buf);
+            total += buf.length;
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
+        if (total !== g.size) throw new Error(`size mismatch (${total}/${g.size})`);
+        if (g.sha && h.digest('hex') !== g.sha) throw new Error('SHA-256 mismatch');
+        fs.renameSync(tmp, fp);
+      } catch (e) {
+        try { fs.unlinkSync(tmp); } catch {}
+        throw e;
+      }
     };
 
     // Recreate old vault indexes from legacy vaultfile:key posts if the JSON index is absent.
@@ -1553,7 +1810,13 @@ async function autoRestoreOnStartup() {
     for (const fp of wanted) {
       const rel = safeBackupRel(relData(fp));
       if (!rel) continue;
-      const candidates = completeGroupsFor(rel);
+      const rec = Object.values(vault).find((item) => item?.path && path.resolve(String(item.path)) === path.resolve(fp));
+      const prefer = (arr) => {
+        if (!rec?.sha256) return arr;
+        const match = arr.filter((x) => x.sha === rec.sha256);
+        return match.length ? match : arr; // prefer the exact version the vault index expects
+      };
+      const candidates = prefer(completeGroupsFor(rel));
       let existingOk = false;
       if (fs.existsSync(fp)) {
         try {
@@ -1582,7 +1845,7 @@ async function autoRestoreOnStartup() {
 
       let restored = false;
       let lastError = null;
-      for (const z of (zipBackups.get(rel) || [])) {
+      for (const z of prefer(zipBackups.get(rel) || [])) {
         try {
           const buf = await downloadZipBackup(z);
           fs.mkdirSync(path.dirname(fp), { recursive: true });
@@ -1595,9 +1858,7 @@ async function autoRestoreOnStartup() {
       }
       if (!restored) for (const g of candidates) {
         try {
-          const buf = await downloadGroup(g);
-          fs.mkdirSync(path.dirname(fp), { recursive: true });
-          atomicWrite(fp, buf);
+          await restoreGroup(g, fp);
           if (g.sha) blobBackedUp[rel] = `${g.size}:${g.sha}`;
           recovered += 1;
           restored = true;
@@ -1625,7 +1886,7 @@ async function autoRestoreOnStartup() {
         try {
           const link = backupLinks.get(rel);
           const res = await fetch(link.url, { signal: AbortSignal.timeout(120000) });
-          if (!res.ok) throw new Error(`backup link HTTP ${res.status}`);
+          if (!res.ok) throw new Error(`old link-only backup is gone (HTTP ${res.status}); re-upload this file`);
           const buf = Buffer.from(await res.arrayBuffer());
           if (buf.length !== link.size) throw new Error('backup link size mismatch');
           fs.mkdirSync(path.dirname(fp), { recursive: true });
@@ -1659,8 +1920,17 @@ async function autoRestoreOnStartup() {
     } catch {}
     lastBackupAt = msgs.find((m) => trusted(m) && String(m.content || '').startsWith('BANKROLL_BACKUP_SNAPSHOT'))?.createdTimestamp || lastBackupAt;
     recoveryInfo = { ready: wanted.length - lost.length, total: wanted.length, restored: recovered, lost: [...lost], scannedMessages: msgs.length, jsonRestored };
+    const lostVaultKeys = [];
+    for (const l of lost) {
+      const lrel = l.split(' (')[0];
+      const vk = Object.keys(vault).find((k) => relData(vault[k]?.path) === lrel);
+      if (vk) lostVaultKeys.push(vk);
+    }
     recoveryNote = ` Scanned ${msgs.length} messages in #${ch.name}; restored ${jsonRestored} database file(s) and ${recovered} stored file(s); ${alreadyPresent} file(s) were already present.` +
-      (lost.length ? ` Could not recover: ${lost.join(', ')}.` : ' All indexed files are available.');
+      (lost.length
+        ? ` Could not recover: ${lost.join(', ')}.` +
+          (lostVaultKeys.length ? ` Re-upload with /vault add: ${lostVaultKeys.map((k) => `\`${k}\``).join(', ')}.` : '')
+        : ' All indexed files are available.');
     console.log(`Backup restore finished. JSON restored: ${jsonRestored}; files restored: ${recovered}; already present: ${alreadyPresent}; missing: ${lost.length}.`);
   } catch (e) {
     console.error('Auto-restore on startup failed:', e.message);
@@ -1693,6 +1963,7 @@ const onReady = async () => {
 
   await autoRestoreOnStartup();
 
+  await cleanOldOnlineNotices().catch((e) => console.error('Could not clean old online notices:', e.message));
   backfillMonzoLedger();
   const monzoRebuilt = restoreMonzoReminders();
   restoreReminders().then((n) => {
@@ -2497,7 +2768,7 @@ async function cmdVault(interaction) {
         interaction.followUp({
           content: blobBackedUp[relData(filePath)]
             ? `Backup copy of \`${key}\` is saved in the backup channel.`
-            : `Backup copy of \`${key}\` is not saved yet. The bot will keep retrying, check /vault list.`,
+            : `Backup copy of \`${key}\` is not saved yet${backupFailures[relData(filePath)] ? ` (${short(backupFailures[relData(filePath)].error, 120)})` : ''}. The bot will keep retrying, check /backup status.`,
           ephemeral: true,
         })
       )
@@ -2575,7 +2846,13 @@ async function cmdVault(interaction) {
     const lines = keys.map(
       (k) =>
         `• \`${k}\` — **${vault[k].originalName}** (${(vault[k].size / (1024 * 1024)).toFixed(1)} MB)` +
-        (fs.existsSync(vault[k].path) ? (blobBackedUp[relData(vault[k].path)] ? ' - backed up' : ' - backup pending') : ' - file missing, re-add it')
+        (fs.existsSync(vault[k].path)
+          ? blobBackedUp[relData(vault[k].path)]
+            ? ' - backed up'
+            : backupFailures[relData(vault[k].path)]
+              ? ` - backup failing: ${short(backupFailures[relData(vault[k].path)].error, 60)}`
+              : ' - backup pending'
+          : ' - file missing, re-add it with /vault add')
     );
     const embed = new EmbedBuilder()
       .setColor(GREEN)
@@ -2887,7 +3164,16 @@ async function cmdStatus(interaction) {
       { name: 'Last Stripe notice', value: lastWebhookAt ? `${when(lastWebhookAt)} (${lastWebhookType})` : 'None since start', inline: true },
       { name: 'Open Monzo invoices', value: String(monzoOpen().length), inline: true },
       { name: 'Last Monzo notice', value: lastMonzoAt ? when(lastMonzoAt) : 'None since start', inline: true },
-      { name: 'Last data backup', value: when(lastBackupAt), inline: true }
+      { name: 'Last data backup', value: when(lastBackupAt), inline: true },
+      (() => {
+        const s = backupSummary();
+        return { name: 'Files backed up', value: `${s.ok}/${s.total}${s.failing ? ` (${s.failing} failing - see /backup status)` : ''}`, inline: true };
+      })(),
+      {
+        name: 'Last startup recovery',
+        value: recoveryInfo ? short(`${recoveryInfo.ready}/${recoveryInfo.total} files ready, ${recoveryInfo.restored} restored${recoveryInfo.lost.length ? `, lost: ${recoveryInfo.lost.join(', ')}` : ''}`, 200) : 'Not run yet',
+        inline: false,
+      }
     );
   return interaction.editReply({ embeds: [embed] });
 }
@@ -3787,11 +4073,150 @@ async function onDisputeClosed(d) {
   await notifyOwner({ embeds: [embed] });
 }
 
+// ---------- Delete bot messages / backup tools ----------
+const BACKUP_PROTECT_MSG =
+  'That is the backup channel. Deleting messages there can break auto-recovery, so I will not do it here. Use `/backup prune` to clear out only the old copies.';
+
+async function isBackupChannelId(channelId) {
+  const bc = await resolveBackupChannel().catch(() => null);
+  return !!bc && bc.id === channelId;
+}
+
+function parseMessageRef(input, fallbackChannelId) {
+  const s = String(input || '').trim();
+  const link = s.match(/channels\/(?:@me|\d+)\/(\d+)\/(\d+)/);
+  if (link) return { channelId: link[1], messageId: link[2] };
+  if (/^\d{15,25}$/.test(s)) return { channelId: fallbackChannelId, messageId: s };
+  return null;
+}
+
+// Right-click a message > Apps > "Delete bot message"
+async function cmdDeleteBotMessage(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+  if (!allowed.has(interaction.user.id)) return interaction.editReply('Only authorized users can do this.');
+  const msg = interaction.targetMessage;
+  if (msg?.author?.id !== client.user.id) return interaction.editReply('I can only delete messages that I sent.');
+  if (await isBackupChannelId(interaction.channelId)) return interaction.editReply(BACKUP_PROTECT_MSG);
+  try {
+    await deleteRawMessage(interaction.channelId, interaction.targetId);
+    return interaction.editReply('Deleted.');
+  } catch (e) {
+    return interaction.editReply(`Could not delete it: ${e.message}`);
+  }
+}
+
+async function cmdPurge(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+  if (!allowed.has(interaction.user.id)) return interaction.editReply('Only authorized users can do this.');
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === 'message') {
+    const ref = parseMessageRef(interaction.options.getString('message'), interaction.channelId);
+    if (!ref) return interaction.editReply('Give me a message ID or a "Copy Message Link" link.');
+    if (await isBackupChannelId(ref.channelId)) return interaction.editReply(BACKUP_PROTECT_MSG);
+    let msg;
+    try {
+      msg = await client.rest.get(Routes.channelMessage(ref.channelId, ref.messageId));
+    } catch (e) {
+      return interaction.editReply(`I could not find that message (${e.message}).`);
+    }
+    if (msg.author?.id !== client.user.id) return interaction.editReply('That message was not sent by me, so I cannot delete it.');
+    try {
+      await deleteRawMessage(ref.channelId, ref.messageId);
+      return interaction.editReply('Deleted.');
+    } catch (e) {
+      return interaction.editReply(`Could not delete it: ${e.message}`);
+    }
+  }
+
+  // recent
+  const count = interaction.options.getInteger('count');
+  const chId = interaction.channelId;
+  if (await isBackupChannelId(chId)) return interaction.editReply(BACKUP_PROTECT_MSG);
+  const found = [];
+  try {
+    let before;
+    for (let page = 0; page < 5 && found.length < count; page++) {
+      const q = new URLSearchParams({ limit: '100' });
+      if (before) q.set('before', before);
+      const batch = await client.rest.get(Routes.channelMessages(chId), { query: q });
+      if (!batch.length) break;
+      for (const m of batch) {
+        if (m.author?.id === client.user.id && !m.pinned && found.length < count) found.push({ id: m.id, channelId: chId });
+      }
+      before = batch[batch.length - 1].id;
+      if (batch.length < 100) break;
+    }
+  } catch (e) {
+    return interaction.editReply(`I cannot read this channel's history (${e.message}). I need View Channel + Read Message History here.`);
+  }
+  if (!found.length) return interaction.editReply('I found no messages of mine to delete in the latest 500 messages here.');
+  const { ok, fail } = await deleteMessages(found);
+  return interaction.editReply(`Deleted ${ok} of my message(s).${fail ? ` ${fail} could not be deleted.` : ''} Pinned messages are skipped.`);
+}
+
+function backupStatusEmbed(ch) {
+  const rows = [];
+  for (const fp of dataFilePaths()) {
+    const rel = safeBackupRel(relData(fp));
+    if (!rel) continue;
+    const mb = (() => { try { return (fs.statSync(fp).size / (1024 * 1024)).toFixed(1) + ' MB'; } catch { return 'missing'; } })();
+    let state = 'pending';
+    if (!fs.existsSync(fp)) state = 'FILE MISSING - re-upload it';
+    else if (blobBackedUp[rel]) state = 'backed up';
+    else if (backupFailures[rel]) state = `FAILING x${backupFailures[rel].count}: ${short(backupFailures[rel].error, 80)}`;
+    rows.push(`• \`${rel}\` (${mb}) - ${state}`);
+  }
+  const sum = backupSummary();
+  return new EmbedBuilder()
+    .setColor(sum.failing ? RED : GREEN)
+    .setTitle('Backup status')
+    .setDescription(short(rows.join('\n') || 'No stored files to back up.', 3800))
+    .addFields(
+      { name: 'Files backed up', value: `${sum.ok}/${sum.total}`, inline: true },
+      { name: 'Failing', value: String(sum.failing), inline: true },
+      { name: 'Backup channel', value: ch ? `#${ch.name}` : 'Not found', inline: true },
+      { name: 'Upload limit per message', value: ch ? `${Math.round(uploadLimitBytes(ch) / (1024 * 1024))} MB (bigger files are split into parts)` : '-', inline: true },
+      { name: 'Last backup', value: lastBackupAt ? `<t:${Math.floor(lastBackupAt / 1000)}:R>` : 'Not yet', inline: true },
+      { name: 'Storage', value: short(DATA_DIR_STATUS, 100), inline: true }
+    );
+}
+
+async function cmdBackup(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the owner can run this.');
+  const sub = interaction.options.getSubcommand();
+  const ch = await resolveBackupChannel();
+  if (!ch) return interaction.editReply('I cannot find #bankroll-backup. Create it (or set BACKUP_CHANNEL_ID) and give me View Channel, Send Messages, Attach Files and Read Message History.');
+
+  if (sub === 'status') return interaction.editReply({ embeds: [backupStatusEmbed(ch)] });
+
+  if (sub === 'now') {
+    clearTimeout(backupTimer);
+    for (const k of Object.keys(backupFailures)) delete backupFailures[k];
+    await backupData();
+    return interaction.editReply({ embeds: [backupStatusEmbed(ch)] });
+  }
+
+  // prune
+  const confirm = interaction.options.getBoolean('confirm') === true;
+  const plan = await planBackupPrune(ch);
+  const all = [...plan.snapshots, ...plan.oldVersions, ...plan.deadLinks, ...plan.incomplete];
+  const summary =
+    `Scanned ${plan.scanned} messages. Old database snapshots: ${plan.snapshots.length}, old file versions: ${plan.oldVersions.length}, ` +
+    `dead link backups: ${plan.deadLinks.length}, unfinished uploads: ${plan.incomplete.length}.`;
+  if (!all.length) return interaction.editReply(`${summary}\nNothing to clean up.`);
+  if (!confirm) return interaction.editReply(`${summary}\nThe newest 3 snapshots and the newest complete copy of every file are always kept. Run \`/backup prune confirm:True\` to delete these ${all.length} message(s).`);
+  const { ok, fail } = await deleteMessages(all);
+  return interaction.editReply(`${summary}\nDeleted ${ok} message(s)${fail ? `, ${fail} failed` : ''}.`);
+}
+
 // ---------- Interaction router ----------
 client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.isAutocomplete()) return await onAutocomplete(interaction);
     if (interaction.isButton()) return await onButton(interaction);
+    if (interaction.isMessageContextMenuCommand()) return await cmdDeleteBotMessage(interaction);
     if (!interaction.isChatInputCommand()) return;
     if (!commands.some((c) => c.name === interaction.commandName)) return;
 
@@ -3834,6 +4259,10 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdRefund(interaction);
       case 'setup':
         return await cmdSetup(interaction);
+      case 'purge':
+        return await cmdPurge(interaction);
+      case 'backup':
+        return await cmdBackup(interaction);
       default:
         await interaction.deferReply({ ephemeral: true });
         if (interaction.commandName === 'payments') return await cmdPayments(interaction);
@@ -4085,6 +4514,9 @@ app.get('/:name/:token', (req, res) => {
   stream.pipe(res);
 });
 
+app.get('/health', (_, res) =>
+  res.json({ ok: true, discordReady: client.isReady(), pingMs: client.ws.ping, uptimeSec: Math.floor(process.uptime()), lastBackupAt })
+);
 app.get('/', (_, res) => res.send('Bankroll bot running'));
 app.listen(PORT, () => console.log(`Webhook server listening on :${PORT}`));
 
