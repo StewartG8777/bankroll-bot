@@ -17,6 +17,8 @@ const {
   ButtonStyle,
   StringSelectMenuBuilder,
   SlashCommandBuilder,
+  ContextMenuCommandBuilder,
+  ApplicationCommandType,
   InteractionContextType,
   ApplicationIntegrationType,
   AttachmentBuilder,
@@ -1461,14 +1463,20 @@ const botAdminCmd = common(
     .addSubcommand((sub) => sub.setName('redeploy').setDescription('Trigger a new deployment from the latest GitHub commit on Render'))
     .addSubcommand((sub) => sub.setName('restart').setDescription('Restart the running Render service'))
     .addSubcommand((sub) => sub.setName('avatar').setDescription('Change the bot profile picture').addAttachmentOption((o) => o.setName('image').setDescription('PNG, JPG or GIF image').setRequired(true)))
-    .addSubcommand((sub) => sub.setName('status').setDescription('Change the bot online presence')
-    .addSubcommand((sub) => sub.setName('clear-dm').setDescription('Delete the bot\'s recent messages in this DM').addIntegerOption((o) => o.setName('count').setDescription('Maximum bot messages to delete (default 500)').setMinValue(1).setMaxValue(1000))).addStringOption((o) => o.setName('presence').setDescription('Discord presence colour/status').setRequired(true).addChoices(
+    .addSubcommand((sub) => sub.setName('status').setDescription('Change the bot online presence').addStringOption((o) => o.setName('presence').setDescription('Discord presence colour/status').setRequired(true).addChoices(
       { name: 'Online (green)', value: 'online' },
       { name: 'Idle (yellow)', value: 'idle' },
       { name: 'Do Not Disturb (red)', value: 'dnd' },
       { name: 'Invisible', value: 'invisible' }
     )))
+    .addSubcommand((sub) => sub.setName('clear-dm').setDescription('Delete the bot\'s recent messages in this DM').addIntegerOption((o) => o.setName('count').setDescription('Maximum bot messages to delete (default 500)').setMinValue(1).setMaxValue(1000)))
 );
+
+const deleteBotMessageCmd = new ContextMenuCommandBuilder()
+  .setName('Delete Bankroll Message')
+  .setType(ApplicationCommandType.Message)
+  .setIntegrationTypes([ApplicationIntegrationType.UserInstall])
+  .setContexts([InteractionContextType.BotDM, InteractionContextType.PrivateChannel]);
 
 const refundCmd = common(
   new SlashCommandBuilder()
@@ -1512,7 +1520,7 @@ const downloadsCmd = common(new SlashCommandBuilder().setName('downloads').setDe
   .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate data and file backup'))
   .addSubcommand((sub) => sub.setName('verify').setDescription('Verify a vault ZIP archive and checksum').addStringOption((o) => o.setName('vault_key').setDescription('Exact vault key').setRequired(true))));
 
-const commands = [bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd];
+const commands = [deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -4347,6 +4355,20 @@ async function onDisputeClosed(d) {
 // ---------- Interaction router ----------
 client.on('interactionCreate', async (interaction) => {
   try {
+    if (interaction.isMessageContextMenuCommand()) {
+      if (!allowed.has(interaction.user.id) || interaction.user.id !== OWNER_ID) {
+        return interaction.reply({ content: 'Only the bot owner can delete Bankroll messages.', ephemeral: true });
+      }
+      const target = interaction.targetMessage;
+      if (!interaction.channel?.isDMBased?.()) {
+        return interaction.reply({ content: 'Use this in a direct message with Bankroll.', ephemeral: true });
+      }
+      if (!target || target.author?.id !== client.user.id) {
+        return interaction.reply({ content: 'You can only delete messages sent by Bankroll.', ephemeral: true });
+      }
+      await target.delete();
+      return interaction.reply({ content: 'Bankroll message deleted.', ephemeral: true });
+    }
     if (interaction.isAutocomplete()) return await onAutocomplete(interaction);
     if (interaction.isButton()) return await onButton(interaction);
     if (interaction.isStringSelectMenu() && interaction.customId === 'customer_preview_select') return await onCustomerPreviewSelect(interaction);
