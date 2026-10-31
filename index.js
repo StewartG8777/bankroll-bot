@@ -4,7 +4,8 @@ const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const Stripe = require('stripe');
-const AdmZip = require('adm-zip'); // npm install adm-zip (used by /vault edit)
+const AdmZip = require('adm-zip'); // Used for archive editing and small archive inspection.
+const yauzl = require('yauzl'); // Streaming ZIP reader for large archives.
 const { pipeline } = require('stream/promises');
 const { Readable, Transform } = require('stream');
 const { monitorEventLoopDelay } = require('perf_hooks');
@@ -284,8 +285,10 @@ const FILES_DIR = path.join(DATA_DIR, 'files');
 const DELIVERIES_FILE = path.join(DATA_DIR, 'deliveries.json');
 const MONZO_FILE = path.join(DATA_DIR, 'monzo_payments.json');
 const WEBHOOK_EVENTS_FILE = path.join(DATA_DIR, 'webhook_events.json');
+const WIPED_CUSTOMERS_FILE = path.join(DATA_DIR, 'wiped_customers.json');
 let processedWebhookEvents = {};
 try { processedWebhookEvents = JSON.parse(fs.readFileSync(WEBHOOK_EVENTS_FILE, 'utf8')); } catch {}
+    try { const ids = JSON.parse(fs.readFileSync(WIPED_CUSTOMERS_FILE, 'utf8')); if (Array.isArray(ids)) wipedCustomers = new Set(ids.map(String)); } catch {}
 function hasProcessedWebhook(id) { return !!(id && processedWebhookEvents[id]); }
 function markWebhookProcessed(id, type) {
   if (!id) return;
@@ -388,9 +391,10 @@ function scheduleBackup() {
 
 // Monzo ledger: every Monzo invoice (open / paid / cancelled / expired) so history and totals survive.
 let monzoLedger = {};
-try {
-  monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8'));
-} catch {}
+try { monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8')); } catch {}
+let wipedCustomers = new Set();
+try { const ids = JSON.parse(fs.readFileSync(WIPED_CUSTOMERS_FILE, 'utf8')); if (Array.isArray(ids)) wipedCustomers = new Set(ids.map(String)); } catch {}
+function saveWipedCustomers() { atomicWrite(WIPED_CUSTOMERS_FILE, JSON.stringify([...wipedCustomers], null, 2)); }
 const saveMonzo = () => {
   try {
     atomicWrite(MONZO_FILE, JSON.stringify(monzoLedger));
@@ -615,13 +619,65 @@ function cleanDownloads() {
 cleanDownloads();
 setInterval(cleanDownloads, 60 * 60 * 1000);
 
-function verifyZipIntegrity(filePath) {
+// CRC-32 table used while reading ZIP entries sequentially from disk.
+const ZIP_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+// Validate ZIP structure, entry sizes and CRCs using streams. Large archives are
+// processed one entry at a time without loading the archive or entry into RAM.
+async function verifyZipIntegrity(filePath) {
   if (!/\.zip$/i.test(String(filePath || ''))) return { isZip: false, entries: 0 };
   if (!filePath || !fs.existsSync(filePath)) throw new Error('ZIP file is missing.');
-  const zip = new AdmZip(filePath); const entries = zip.getEntries();
-  if (!entries.length) throw new Error('The ZIP archive is empty or invalid.');
-  if (typeof zip.test === 'function' && zip.test() === false) throw new Error('ZIP integrity check failed (CRC/checksum error).');
-  return { isZip: true, entries: entries.length };
+  return new Promise((resolve, reject) => {
+    yauzl.open(filePath, { lazyEntries: true, autoClose: true, decodeStrings: true }, (openError, zip) => {
+      if (openError) return reject(openError);
+      let entries = 0;
+      let settled = false;
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        try { zip.close(); } catch {}
+        reject(error);
+      };
+      zip.on('error', fail);
+      zip.on('end', () => {
+        if (settled) return;
+        settled = true;
+        if (!entries) return reject(new Error('The ZIP archive is empty or invalid.'));
+        resolve({ isZip: true, entries, streamed: true });
+      });
+      zip.on('entry', (entry) => {
+        const entryName = String(entry.fileName || '').replace(/\\/g, '/');
+        if (entryName.startsWith('/') || entryName.split('/').includes('..')) return fail(new Error('The ZIP contains an unsafe file path.'));
+        if (entryName.endsWith('/')) return zip.readEntry();
+        entries++;
+        zip.openReadStream(entry, (streamError, stream) => {
+          if (streamError) return fail(streamError);
+          let crc = 0xffffffff;
+          let size = 0;
+          stream.on('data', (chunk) => {
+            size += chunk.length;
+            for (let i = 0; i < chunk.length; i++) crc = ZIP_CRC_TABLE[(crc ^ chunk[i]) & 0xff] ^ (crc >>> 8);
+          });
+          stream.on('error', fail);
+          stream.on('end', () => {
+            const actualCrc = (crc ^ 0xffffffff) >>> 0;
+            if (size !== Number(entry.uncompressedSize)) return fail(new Error(`ZIP entry size mismatch: ${entry.fileName}`));
+            if (actualCrc !== (Number(entry.crc32) >>> 0)) return fail(new Error(`ZIP CRC/checksum error: ${entry.fileName}`));
+            zip.readEntry();
+          });
+        });
+      });
+      zip.readEntry();
+    });
+  });
 }
 function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download is ready') {
   const isZip = /\.zip$/i.test(String(name || ''));
@@ -814,7 +870,7 @@ async function backupDataOnce() {
   }
 
   try {
-    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json'];
+    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json'];
     const files = [];
     for (const name of jsonNames) {
       const fp = path.join(DATA_DIR, name);
@@ -842,20 +898,16 @@ async function backupDataOnce() {
           files: files.map((f) => ({ name: f.name, size: f.buffer.length, sha256: crypto.createHash('sha256').update(f.buffer).digest('hex') })),
         };
         const manifestBuffer = Buffer.from(JSON.stringify(manifest, null, 2));
-        const backupZip = new AdmZip();
-        for (const f of files) backupZip.addFile(f.name, f.buffer);
-        backupZip.addFile('bankroll-backup-manifest.json', manifestBuffer);
-        const backupZipBuffer = backupZip.toBuffer();
-        const backupLink = makeBackupDownloadLink(backupZipBuffer, 'bankroll-database-backup.zip');
+        // Keep each database file and its manifest as separate Discord attachments.
+        // Building a combined ZIP with AdmZip is synchronous and can stall the
+        // Discord gateway/event loop when the backup grows.
         const attachments = [
           ...files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })),
           new AttachmentBuilder(manifestBuffer, { name: 'bankroll-backup-manifest.json' }),
-          new AttachmentBuilder(backupZipBuffer, { name: 'bankroll-database-backup.zip' }),
         ];
         await ch.send({
-          content: `BANKROLL_BACKUP_SNAPSHOT v2 | ${new Date().toISOString()} | ${files.length} database files | complete ZIP archive attached`,
+          content: `BANKROLL_BACKUP_SNAPSHOT v2 | ${new Date().toISOString()} | ${files.length} database files | individual files and manifest attached`,
           files: attachments,
-          ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
           allowedMentions: { parse: [] },
         });
         lastBackupHash = hash;
@@ -873,49 +925,19 @@ async function backupDataOnce() {
       const signature = `${st.size}:${sha256}`;
       if (blobBackedUp[rel] === signature) continue;
 
-      let zipBuffer = null;
-      let backupLink = null;
-      const marker = { rel, size: st.size, sha256, entryName: path.basename(fp), originalName: path.basename(fp) };
-      // AdmZip builds the complete archive in memory. Very large GTA/FiveM assets can
-      // exceed Node's maximum string/buffer limits and throw "Invalid string length".
-      // Keep small files as verified ZIPs; stream large originals through the hosted
-      // recovery endpoint instead of attempting a dangerous in-memory compression.
-      if (st.size <= 50 * 1024 * 1024) {
-        try {
-          const zip = new AdmZip();
-          zip.addFile(path.basename(fp), fs.readFileSync(fp));
-          zipBuffer = zip.toBuffer();
-          const checkedBackup = new AdmZip(zipBuffer);
-          if (checkedBackup.test() === false) throw new Error('Generated backup ZIP failed its integrity check.');
-          backupLink = makeBackupDownloadLink(zipBuffer, `${path.basename(fp)}.backup.zip`);
-          await ch.send({
-            content: `datafilezip-v1:${JSON.stringify(marker)}`,
-            files: [new AttachmentBuilder(zipBuffer, { name: `${path.basename(fp)}.backup.zip` })],
-            ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
-            allowedMentions: { parse: [] },
-          });
-          blobBackedUp[rel] = signature;
-          lastBackupAt = Date.now();
-          continue;
-        } catch (zipError) {
-          console.error(`ZIP backup upload failed for ${rel}:`, zipError?.stack || zipError);
-        }
-      } else {
-        console.warn(`Skipping in-memory ZIP for large file ${rel} (${(st.size / (1024 * 1024)).toFixed(1)} MB); using streamed hosted recovery instead.`);
-      }
-
+      // Keep original files intact and serve them through the hosted recovery route.
+      // AdmZip compression is synchronous and can block Discord interactions for
+      // many seconds, especially when the source file is already a ZIP archive.
       if (BASE_URL) {
         try {
           const recoveryUrl = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
-          backupLink = backupLink || (zipBuffer ? makeBackupDownloadLink(zipBuffer, `${path.basename(fp)}.backup.zip`) : null);
           await ch.send({
             content: `datafilelink:${rel}|${st.size}|${recoveryUrl}`,
-            ...(backupLink ? { components: [downloadLinkRow(backupLink, 'Download ZIP')] } : {}),
             allowedMentions: { parse: [] },
           });
           blobBackedUp[rel] = signature;
           lastBackupAt = Date.now();
-          console.warn(`Stored hosted recovery fallback for ${rel}. The Download ZIP button is a separate one-time convenience link.`);
+          console.log(`Stored original file for recovery without recompression: ${rel} (${(st.size / (1024 * 1024)).toFixed(1)} MB).`);
           continue;
         } catch (linkError) {
           console.error(`Hosted-link backup failed for ${rel}:`, linkError.message);
@@ -1387,6 +1409,15 @@ const cancelCmd = common(
     )
 );
 
+const spamCmd = common(
+  new SlashCommandBuilder().setName('spam').setDescription('Send a timed, opt-in message sequence')
+    .addSubcommand((sub) => sub.setName('start').setDescription('Send a DM request with your chosen message')
+      .addUserOption((o) => o.setName('user').setDescription('Person receiving the messages').setRequired(true))
+      .addStringOption((o) => o.setName('message').setDescription('Text or emoji to repeat').setMaxLength(1800).setRequired(true))
+      .addIntegerOption((o) => o.setName('interval').setDescription('Seconds between messages (minimum 60)').setMinValue(60).setMaxValue(3600).setRequired(true))
+      .addIntegerOption((o) => o.setName('duration').setDescription('Duration in minutes (maximum 15)').setMinValue(1).setMaxValue(15).setRequired(true)))
+    .addSubcommand((sub) => sub.setName('stop').setDescription('Stop your active message sessions'))
+);
 const remindCmd = common(
   new SlashCommandBuilder()
     .setName('remind')
@@ -1556,7 +1587,11 @@ const deliveryCmd = common(new SlashCommandBuilder().setName('delivery').setDesc
   .addSubcommand((sub) => sub.setName('status').setDescription('Check a payment order delivery status').addStringOption((o) => o.setName('order').setDescription('Checkout session ID or Monzo invoice ID').setRequired(true)))
   .addSubcommand((sub) => sub.setName('resend').setDescription('Resend a paid customer file without charging again').addStringOption((o) => o.setName('order').setDescription('Checkout session ID or Monzo invoice ID').setRequired(true))));
 
-const commands = [deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd];
+const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription('Remove a customer from Bankroll transaction records and logs (owner only)')
+  .addUserOption((o) => o.setName('user').setDescription('Customer whose Bankroll records should be wiped').setRequired(true))
+  .addStringOption((o) => o.setName('confirm').setDescription('Type WIPE to confirm this permanent action').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' })));
+
+const commands = [spamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -1605,9 +1640,10 @@ async function autoRestoreOnStartup() {
       'scheduled_sends.json': SEND_JOBS_FILE,
       'webhook_events.json': WEBHOOK_EVENTS_FILE,
       'presence.json': PRESENCE_FILE,
+      'wiped_customers.json': WIPED_CUSTOMERS_FILE,
     };
     const isValidJsonFor = (name, value) => {
-      if (name === 'notifications.json' || name === 'download_history.json') return Array.isArray(value);
+      if (name === 'notifications.json' || name === 'download_history.json' || name === 'wiped_customers.json') return Array.isArray(value);
       return !!value && typeof value === 'object' && !Array.isArray(value);
     };
     const localNeedsRestore = (name, fp) => {
@@ -1764,13 +1800,47 @@ async function autoRestoreOnStartup() {
       return buf;
     };
     const downloadZipBackup = async (z) => {
-      const res = await fetch(z.att.url);
+      const res = await fetch(z.att.url, { signal: AbortSignal.timeout(120000) });
       if (!res.ok) throw new Error(`HTTP ${res.status} downloading ZIP backup`);
       const zipBuffer = Buffer.from(await res.arrayBuffer());
-      const zip = new AdmZip(zipBuffer);
-      const entry = zip.getEntry(z.entryName);
-      if (!entry || entry.isDirectory) throw new Error('ZIP does not contain the expected file');
-      const buf = entry.getData();
+
+      // Read legacy backup ZIPs with yauzl's streaming inflater. AdmZip.getData()
+      // inflates the whole entry synchronously and was causing long gateway stalls.
+      const buf = await new Promise((resolve, reject) => {
+        yauzl.fromBuffer(zipBuffer, { lazyEntries: true, autoClose: true, decodeStrings: true }, (openError, zip) => {
+          if (openError) return reject(openError);
+          let settled = false;
+          const fail = (error) => {
+            if (settled) return;
+            settled = true;
+            try { zip.close(); } catch {}
+            reject(error);
+          };
+          zip.on('error', fail);
+          zip.on('end', () => {
+            if (!settled) fail(new Error('ZIP does not contain the expected file'));
+          });
+          zip.on('entry', (entry) => {
+            if (entry.fileName !== z.entryName || entry.fileName.endsWith('/')) {
+              zip.readEntry();
+              return;
+            }
+            zip.openReadStream(entry, (streamError, stream) => {
+              if (streamError) return fail(streamError);
+              const chunks = [];
+              stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+              stream.on('error', fail);
+              stream.on('end', () => {
+                if (settled) return;
+                settled = true;
+                resolve(Buffer.concat(chunks));
+                try { zip.close(); } catch {}
+              });
+            });
+          });
+          zip.readEntry();
+        });
+      });
       if (buf.length !== z.size) throw new Error(`ZIP file size mismatch (${buf.length}/${z.size})`);
       if (z.sha && crypto.createHash('sha256').update(buf).digest('hex') !== z.sha) throw new Error('ZIP file SHA-256 mismatch');
       return buf;
@@ -1986,7 +2056,8 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
   });
 }
 
-client.once('ready', onReady);
+// clientReady is the supported ready event in current discord.js versions.
+// Register only once so startup recovery and scheduled jobs cannot run twice.
 client.once('clientReady', onReady);
 
 // ---------- Reminder ----------
@@ -2725,13 +2796,13 @@ async function cmdDownloads(interaction) {
   const key = interaction.options.getString('vault_key').trim(); const item = vault[key];
   if (!item?.path || !fs.existsSync(item.path)) return interaction.editReply(`Vault file \`${key}\` is missing.`);
   if (sub === 'verify') {
-    try { const actualHash=await sha256File(item.path); const size=fs.statSync(item.path).size; const zipInfo=verifyZipIntegrity(item.path); const hashMatches=!item.sha256||item.sha256===actualHash; if(!item.sha256){item.sha256=actualHash;saveVault();}
+    try { const actualHash=await sha256File(item.path); const size=fs.statSync(item.path).size; const zipInfo=await verifyZipIntegrity(item.path); const hashMatches=!item.sha256||item.sha256===actualHash; if(!item.sha256){item.sha256=actualHash;saveVault();}
       return interaction.editReply({ embeds:[new EmbedBuilder().setColor(hashMatches?GREEN:RED).setTitle(`Download integrity: ${key}`).setDescription(hashMatches?'File exists and the SHA-256 checksum matches.':'Checksum mismatch: do not send this file until checked.').addFields({name:'File',value:short(item.originalName||key,100),inline:true},{name:'Size',value:`${(size/(1024*1024)).toFixed(2)} MB`,inline:true},{name:'ZIP entries',value:zipInfo.isZip?String(zipInfo.entries):'Not a ZIP',inline:true},{name:'SHA-256',value:actualHash}).setTimestamp()] });
     } catch(e) { recordDownloadEvent('verification_failed',{file:item.originalName||key,detail:e.message}); return interaction.editReply(`ZIP/file verification failed: ${e.message}`); }
   }
   if (sub === 'regenerate') {
     if(!BASE_URL) return interaction.editReply('PUBLIC_URL is not configured, so Bankroll cannot create hosted download links.');
-    try { const zipInfo=verifyZipIntegrity(item.path); const size=fs.statSync(item.path).size; const url=await makeDownloadLink({path:item.path,name:item.originalName||path.basename(item.path),customerId:interaction.user.id,agentId:interaction.user.id,vaultKey:key,description:'admin-regenerated-download'},null); const token=url.split('/').pop(); const expiresAt=downloads[token]?.expiresAt;
+    try { const zipInfo=await verifyZipIntegrity(item.path); const size=fs.statSync(item.path).size; const url=await makeDownloadLink({path:item.path,name:item.originalName||path.basename(item.path),customerId:interaction.user.id,agentId:interaction.user.id,vaultKey:key,description:'admin-regenerated-download'},null); const token=url.split('/').pop(); const expiresAt=downloads[token]?.expiresAt;
       recordDownloadEvent('link_regenerated',{file:item.originalName||key,customerId:interaction.user.id,agentId:interaction.user.id,token,detail:`Admin regenerated a link for vault key ${key}; ZIP entries ${zipInfo.entries||0}.`});
       return interaction.editReply({embeds:[buildDownloadEmbed(item.originalName||key,expiresAt,size,'Fresh download link generated')],components:[downloadLinkRow(url,/\.zip$/i.test(item.originalName||'')?'Download ZIP':'Download File')]});
     } catch(e) { recordDownloadEvent('link_regeneration_failed',{file:item.originalName||key,customerId:interaction.user.id,detail:e.message}); return interaction.editReply(`Could not regenerate the link: ${e.message}`); }
@@ -2772,7 +2843,7 @@ async function cmdVault(interaction) {
       );
     }
 
-    if (/\.zip$/i.test(att.name)) { try { verifyZipIntegrity(filePath); } catch (zipError) { try { fs.unlinkSync(filePath); } catch {} return interaction.editReply(`That ZIP failed its integrity check and was not added: ${short(zipError.message, 220)}`); } }
+    if (/\.zip$/i.test(att.name)) { try { await verifyZipIntegrity(filePath); } catch (zipError) { try { fs.unlinkSync(filePath); } catch {} return interaction.editReply(`That ZIP failed its integrity check and was not added: ${short(zipError.message, 220)}`); } }
     vault[key] = {
       path: filePath,
       originalName: att.name,
@@ -2785,7 +2856,7 @@ async function cmdVault(interaction) {
     recordNotification('vault.add', 'Vault file added', `${key}: ${att.name}`, 'success');
 
     let codeNote = '';
-    if (/\.zip$/i.test(att.name)) {
+    if (/\.zip$/i.test(att.name) && info.size <= 50 * 1024 * 1024) {
       try {
         const codes = zipSpawnCodes(new AdmZip(filePath));
         if (codes.length) {
@@ -2953,6 +3024,9 @@ async function cmdVault(interaction) {
     if (!item || !fs.existsSync(item.path)) return interaction.editReply(`Vault item \`${key}\` was not found.`);
     if (!/\.zip$/i.test(item.originalName)) return interaction.editReply('Only .zip vault files can be edited.');
 
+    const archiveSize = fs.statSync(item.path).size;
+    if (archiveSize > 50 * 1024 * 1024) return interaction.editReply('This ZIP is larger than 50 MB. Bankroll can stream-verify and deliver it safely, but the current spawn-code editor rewrites archives in memory. Edit this archive locally to avoid a high-memory operation.');
+
     const newCode = interaction.options.getString('spawncode').trim().toLowerCase();
     if (!/^[a-z0-9_]{1,32}$/.test(newCode)) {
       return interaction.editReply('The spawn code can only use letters, numbers and underscores (max 32).');
@@ -3039,29 +3113,28 @@ async function cmdVault(interaction) {
 
 // ---------- /cancel ----------
 async function cmdCancel(interaction) {
-  if (!allowed.has(interaction.user.id)) {
-    return interaction.reply({ content: 'Only authorized users can cancel invoices.', ephemeral: true });
-  }
-  await interaction.deferReply({ ephemeral: true });
-
-  const input = interaction.options.getString('order').trim();
+  if (!allowed.has(interaction.user.id)) return interaction.reply({ content: 'Only authorized users can cancel invoices.', flags: 64 });
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ flags: 64 });
+  const input = String(interaction.options.getString('order') || '').trim();
 
   if (input.startsWith('monzo_')) {
-    const e = monzoLedger[input];
+    const ledgerEntry = Object.entries(monzoLedger).find(([key, entry]) => key === input || entry.key === input);
+    const ledgerKey = ledgerEntry?.[0] || input;
+    const e = ledgerEntry?.[1] || monzoLedger[input];
     if (!e) return interaction.editReply('I could not find that Monzo invoice.');
     if (e.status !== 'open') return interaction.editReply(`That Monzo invoice is already ${e.status} (cannot be cancelled).`);
     e.status = 'cancelled';
     e.cancelledAt = Date.now();
     e.cancelledBy = interaction.user.id;
     saveMonzo();
-    const hadPending = discardPending(input);
+    const hadPending = discardPending(ledgerKey);
     const embed = new EmbedBuilder()
       .setColor(GREY)
       .setTitle('Monzo Invoice Cancelled / Removed')
       .addFields(
-        { name: 'Reference', value: e.reference, inline: true },
-        { name: 'Description', value: short(e.description, 100), inline: true },
-        { name: 'Amount', value: money(e.amount, e.currency), inline: true },
+        { name: 'Reference', value: String(e.reference || ledgerKey || 'Not recorded'), inline: true },
+        { name: 'Description', value: short(e.description || 'Monzo invoice', 100), inline: true },
+        { name: 'Amount', value: money(Number(e.amount || 0), e.currency || 'gbp'), inline: true },
         { name: 'Pending File/Link Cleaned', value: hadPending ? 'Yes' : 'None attached', inline: true },
         { name: 'Cancelled By', value: `<@${interaction.user.id}>`, inline: true }
       )
@@ -3100,7 +3173,8 @@ async function cmdCancel(interaction) {
     await logToServer({ embeds: [embed] });
   } catch (err) {
     console.error('Cancel failed:', err);
-    await interaction.editReply(`Failed to cancel invoice: ${err.message}`);
+    if (interaction.deferred || interaction.replied) await interaction.editReply({ content: `Failed to cancel invoice: ${err.message}`, embeds: [] }).catch(() => {});
+    else await interaction.reply({ content: `Failed to cancel invoice: ${err.message}`, flags: 64 }).catch(() => {});
   }
 }
 
@@ -3472,7 +3546,7 @@ async function succeededPayments(sinceUnix) {
   const params = { limit: 100, expand: ['data.latest_charge.balance_transaction'] };
   if (sinceUnix) params.created = { gte: sinceUnix };
   const all = await stripe.paymentIntents.list(params).autoPagingToArray({ limit: 2000 });
-  return all.filter((pi) => pi.status === 'succeeded' && pi.metadata?.agent_id);
+  return all.filter((pi) => pi.status === 'succeeded' && pi.metadata?.agent_id && !wipedCustomers.has(String(pi.metadata?.customer_id || '')));
 }
 
 async function cmdPayments(interaction) {
@@ -3703,7 +3777,7 @@ async function onCustomerPreviewSelect(interaction) {
   let sessions = [];
   try {
     sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 });
-    sessions = sessions.filter((x) => String(x.metadata?.customer_id || '') === customerId);
+    sessions = sessions.filter((x) => String(x.metadata?.customer_id || '') === customerId && !wipedCustomers.has(String(x.metadata?.customer_id || '')));
   } catch (e) { console.error('Customer preview session lookup failed:', e.message); }
   const localOrders = Object.entries(deliveries).filter(([, d]) => String(d?.customerId || '') === customerId);
   const monzo = Object.entries(monzoLedger).filter(([, m]) => String(m?.customerId || '') === customerId);
@@ -3772,6 +3846,105 @@ async function cmdDelivery(interaction) {
     : 'The resend attempt did not complete. The paid order remains saved for recovery.');
 }
 
+async function cmdWipe(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can wipe customer records.');
+  const user = interaction.options.getUser('user', true);
+  if (user.bot) return interaction.editReply('Choose a real customer account, not a bot.');
+  if (interaction.options.getString('confirm') !== 'WIPE') return interaction.editReply('Wipe cancelled. Choose WIPE to confirm.');
+
+  const id = String(user.id);
+  let monzoCount = 0, deliveryCount = 0, downloadCount = 0, historyCount = 0, logCount = 0;
+  const removedDeliveryKeys = Object.entries(deliveries).filter(([, d]) => String(d?.customerId || '') === id).map(([key]) => key);
+  const removedDownloadTokens = Object.entries(downloads).filter(([, d]) => !d?.backupDownload && String(d?.customerId || '') === id).map(([token]) => token);
+  const removedDownloadPaths = removedDownloadTokens.map((token) => downloads[token]?.path).filter(Boolean);
+
+  for (const key of removedDeliveryKeys) {
+    const timer = deliveryRetryTimers.get(key);
+    if (timer) clearTimeout(timer);
+    deliveryRetryTimers.delete(key);
+    liveInteractions.delete(key);
+    delete deliveries[key];
+    deliveryCount++;
+  }
+  for (const key of Object.keys(monzoLedger)) {
+    if (String(monzoLedger[key]?.customerId || '') !== id) continue;
+    for (const pct of CHECKIN_PCTS) {
+      const timerKey = key + ':' + pct;
+      const timer = monzoReminderTimers.get(timerKey);
+      if (timer) clearTimeout(timer);
+      monzoReminderTimers.delete(timerKey);
+    }
+    delete monzoLedger[key];
+    monzoCount++;
+  }
+  for (const token of removedDownloadTokens) { delete downloads[token]; downloadCount++; }
+  const oldHistoryLength = downloadHistory.length;
+  downloadHistory = downloadHistory.filter((entry) => String(entry?.customerId || '') !== id);
+  historyCount = oldHistoryLength - downloadHistory.length;
+
+  const referencedPaths = new Set([
+    ...Object.values(vault).map((v) => path.resolve(String(v?.path || ''))),
+    ...Object.values(deliveries).map((d) => path.resolve(String(d?.path || ''))),
+    ...Object.values(downloads).map((d) => path.resolve(String(d?.path || ''))),
+  ]);
+  for (const oldPath of removedDownloadPaths) {
+    const resolved = path.resolve(String(oldPath));
+    if (resolved.startsWith(path.resolve(FILES_DIR) + path.sep) && !referencedPaths.has(resolved)) {
+      try { await fs.promises.unlink(resolved); } catch {}
+    }
+  }
+
+  wipedCustomers.add(id);
+  saveWipedCustomers();
+  saveMonzo();
+  saveDeliveries();
+  saveDownloads();
+  atomicWrite(DOWNLOAD_HISTORY_FILE, JSON.stringify(downloadHistory, null, 2));
+
+  // Remove only Bankroll-authored log messages that contain the selected customer's ID.
+  try {
+    const channel = await getLogChannel();
+    if (channel?.messages?.fetch) {
+      let before;
+      for (let page = 0; page < 10; page++) {
+        const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+        if (!batch.size) break;
+        for (const message of batch.values()) {
+          if (message.author?.id !== client.user.id) continue;
+          const parts = [message.content || '', ...message.embeds.flatMap((e) => [
+            e.title || '', e.description || '', e.footer?.text || '',
+            ...(e.fields || []).flatMap((field) => [field.name || '', field.value || '']),
+          ])];
+          const body = parts.join(' ');
+          if (body.includes(id) || body.includes('<@' + id + '>') || body.includes('<@!' + id + '>')) {
+            if (await message.delete().then(() => true).catch(() => false)) logCount++;
+          }
+        }
+        before = batch.last()?.id;
+        if (batch.size < 100) break;
+      }
+    }
+  } catch (error) { console.error('Customer log cleanup failed:', error.message); }
+
+  recordNotification('customer.wipe', 'Customer records wiped',
+    'Removed Bankroll-local Monzo, delivery, download and audit records for customer ' + id + '. Provider-side payment records are not deleted.', 'warning');
+  await backupData();
+  return interaction.editReply({
+    content: [
+      '**Customer records wiped**',
+      'Customer: <@' + id + '> (' + id + ')',
+      'Monzo records removed: **' + monzoCount + '**',
+      'Delivery/order records removed: **' + deliveryCount + '**',
+      'Download links removed: **' + downloadCount + '**',
+      'Download history entries removed: **' + historyCount + '**',
+      'Bot-authored log messages deleted: **' + logCount + '**',
+      '',
+      'Their card payments are now hidden from Bankroll reports. Actual Stripe payments and Monzo bank statements remain unchanged.',
+    ].join('\n'),
+    allowedMentions: { users: [id] },
+  });
+}
+
 async function cmdCustomer(interaction) {
   const user = interaction.options.getUser('user');
   let card = [];
@@ -3780,11 +3953,11 @@ async function cmdCustomer(interaction) {
       query: `status:'succeeded' AND metadata['customer_id']:'${user.id}'`,
       limit: 100,
     });
-    card = res.data;
+    card = res.data.filter((pi) => !wipedCustomers.has(String(pi.metadata?.customer_id || '')));
   } catch (e) {
     console.error('Stripe customer lookup failed:', e.message);
   }
-  const monzo = monzoPaid().filter((m) => m.customerId === user.id);
+  const monzo = monzoPaid().filter((m) => m.customerId === user.id && !wipedCustomers.has(String(m.customerId || '')));
   const deliveryState = (d) => !d ? 'delivery record unavailable' : d.deliveryComplete ? 'delivered' : d.deliveryError ? 'delivery needs attention' : 'delivery pending';
   const all = [
     ...card.map((pi) => {
@@ -3815,7 +3988,7 @@ async function cmdHistory(interaction) {
   let card = [];
   try {
     const sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 });
-    card = sessions.filter((s) => s.metadata?.customer_id === user.id);
+    card = sessions.filter((s) => s.metadata?.customer_id === user.id && !wipedCustomers.has(String(s.metadata?.customer_id || '')));
   } catch (e) {
     console.error('Stripe history lookup failed:', e.message);
   }
@@ -3968,11 +4141,12 @@ async function onAutocomplete(interaction) {
           name: `[Card] ${money((s.amount_total ?? 0) / 100, s.currency)} - ${short(s.metadata.description, 50)} - ID: ${s.id}`.slice(0, 100),
           value: s.id,
         }));
-      const monzo = monzoOpen()
-        .filter((m) => !typed || `${m.description} ${m.reference} ${m.key}`.toLowerCase().includes(typed))
-        .map((m) => ({
-          name: `[Monzo] ${money(m.amount, m.currency)} - ${short(m.description, 50)} - ${m.reference}`.slice(0, 100),
-          value: m.key,
+      const monzo = Object.entries(monzoLedger)
+        .filter(([key, m]) => m.status === 'open' && Date.now() < (m.expiresAt ?? m.createdAt + MONZO_OPEN_MS))
+        .filter(([key, m]) => !typed || `${m.description ?? ''} ${m.reference ?? ''} ${key}`.toLowerCase().includes(typed))
+        .map(([key, m]) => ({
+          name: `[Monzo] ${money(m.amount ?? 0, m.currency || 'gbp')} - ${short(m.description || m.reference || 'Monzo invoice', 50)} - ${m.reference || key}`.slice(0, 100),
+          value: key,
         }));
       return await interaction.respond([...monzo, ...card].slice(0, 25));
     }
@@ -3992,10 +4166,12 @@ async function onAutocomplete(interaction) {
       }));
     await interaction.respond(choices);
   } catch (e) {
-    console.error('Autocomplete failed:', e.message);
-    try {
-      await interaction.respond([]);
-    } catch {}
+    if (!interaction.responded) {
+      console.error('Autocomplete failed:', e.message);
+      try { await interaction.respond([]); } catch (responseError) {
+        if (!/already been acknowledged|already responded/i.test(responseError.message)) console.error('Autocomplete fallback response failed:', responseError.message);
+      }
+    }
   }
 }
 
@@ -4353,7 +4529,7 @@ async function onScheduledSendButton(interaction) {
   if (!item?.path || !fs.existsSync(item.path)) {
     return interaction.update({ content: `The scheduled time has arrived, but vault file \`${job.vaultKey}\` is missing. Re-add it, then contact the bot owner.`, components: [sendfileButton(jobId)] });
   }
-  try{verifyZipIntegrity(item.path);}catch(e){recordDownloadEvent('verification_failed',{file:job.originalName,customerId:interaction.user.id,detail:e.message});return interaction.update({content:`I stopped this delivery because the ZIP failed its integrity check: ${short(e.message,180)}. Please contact the bot owner.`,components:[]});}
+  try{await verifyZipIntegrity(item.path);}catch(e){recordDownloadEvent('verification_failed',{file:job.originalName,customerId:interaction.user.id,detail:e.message});return interaction.update({content:`I stopped this delivery because the ZIP failed its integrity check: ${short(e.message,180)}. Please contact the bot owner.`,components:[]});}
 
   job.status = 'sending';
   await interaction.update({ content: `${sendfileProgress(job)}\n\nPreparing your complete ZIP now...`, components: [], allowedMentions: { parse: [] } });
@@ -4461,6 +4637,130 @@ async function onDisputeClosed(d) {
   await notifyOwner({ embeds: [embed] });
 }
 
+// ---------- Opt-in timed message sessions ----------
+const spamSessions = new Map();
+const spamRequests = new Map();
+
+async function cmdSpam(interaction) {
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'stop') {
+    const active = [...spamSessions.entries()].filter(([, session]) => session.ownerId === interaction.user.id);
+    if (!active.length) return interaction.reply({ content: 'You do not have an active message session.', ephemeral: true });
+    for (const [id, session] of active) {
+      clearTimeout(session.timeout);
+      spamSessions.delete(id);
+      session.target.send('The message session has been stopped.').catch(() => {});
+    }
+    return interaction.reply({ content: 'Stopped ' + active.length + ' message session(s).', ephemeral: true });
+  }
+
+  const target = interaction.options.getUser('user', true);
+  const message = interaction.options.getString('message', true);
+  const intervalSeconds = interaction.options.getInteger('interval', true);
+  const durationMinutes = interaction.options.getInteger('duration', true);
+  if (target.bot || target.id === interaction.user.id) return interaction.reply({ content: 'Choose another person, not a bot or yourself.', ephemeral: true });
+
+  const requestId = crypto.randomBytes(8).toString('hex');
+  const request = { ownerId: interaction.user.id, targetId: target.id, message, intervalSeconds, durationMinutes, expiresAt: Date.now() + 10 * 60 * 1000 };
+  spamRequests.set(requestId, request);
+  const expiry = setTimeout(() => spamRequests.delete(requestId), 10 * 60 * 1000);
+  expiry.unref?.();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('spam:accept:' + requestId).setLabel('Start').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('spam:decline:' + requestId).setLabel('No thanks').setStyle(ButtonStyle.Secondary)
+  );
+  try {
+    await target.send({
+      embeds: [new EmbedBuilder().setColor(GREY).setTitle('Message request')
+        .setDescription('<@' + interaction.user.id + '> wants to send you a repeated message.')
+        .addFields(
+          { name: 'Message', value: message.slice(0, 1024) },
+          { name: 'Interval', value: intervalSeconds + ' seconds', inline: true },
+          { name: 'Duration', value: durationMinutes + ' minute(s)', inline: true }
+        )
+        .setFooter({ text: 'Nothing will be sent unless you press Start.' })],
+      components: [row],
+      allowedMentions: { parse: [] }
+    });
+    return interaction.reply({ content: 'Start request sent to <@' + target.id + '>. They must accept it first.', ephemeral: true });
+  } catch (error) {
+    spamRequests.delete(requestId);
+    console.error('Could not send spam request DM:', error.message);
+    return interaction.reply({ content: 'I could not DM that person. They may have DMs disabled or block the bot.', ephemeral: true });
+  }
+}
+
+async function handleSpamConsent(interaction) {
+  const parts = interaction.customId.split(':');
+  const action = parts[1];
+  const requestId = parts[2];
+  const request = spamRequests.get(requestId);
+  if (!request || request.expiresAt < Date.now()) return interaction.reply({ content: 'This message request has expired. Run /spam start again.', ephemeral: true });
+  if (interaction.user.id !== request.targetId) return interaction.reply({ content: 'Only the recipient can respond to this request.', ephemeral: true });
+  spamRequests.delete(requestId);
+  if (action === 'decline') return interaction.update({ content: 'Request declined.', embeds: [], components: [] });
+
+  const sessionId = crypto.randomBytes(8).toString('hex');
+  const target = interaction.user;
+  const session = {
+    ownerId: request.ownerId,
+    target,
+    sourceMessage: interaction.message,
+    message: request.message,
+    endAt: Date.now() + request.durationMinutes * 60000,
+    intervalMs: request.intervalSeconds * 1000,
+    sent: 0,
+    timeout: null
+  };
+  spamSessions.set(sessionId, session);
+  await interaction.update({
+    content: 'You started this message session. You can stop it at any time.',
+    embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Spam initiated')
+      .setDescription('The message below will be posted as replies to this embed.')
+      .addFields({ name: 'Repeated message', value: request.message.slice(0, 1024) })
+      .setFooter({ text: 'Maximum 15 messages; press Stop reminders to end early.' })],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('spam:stop:' + sessionId).setLabel('Stop').setStyle(ButtonStyle.Danger)
+    )]
+  });
+
+  const sendNext = async () => {
+    if (!spamSessions.has(sessionId)) return;
+    if (Date.now() >= session.endAt || session.sent >= 15) {
+      spamSessions.delete(sessionId);
+      await session.sourceMessage.reply({ content: 'Message session finished.', allowedMentions: { parse: [] } }).catch(() => {});
+      return;
+    }
+    try {
+      await session.sourceMessage.reply({ content: session.message, allowedMentions: { parse: [] } });
+      session.sent += 1;
+    } catch (error) {
+      spamSessions.delete(sessionId);
+      console.error('Timed message reply failed:', error.message);
+      return;
+    }
+    if (session.sent >= 15 || Date.now() >= session.endAt) {
+      spamSessions.delete(sessionId);
+      return;
+    }
+    session.timeout = setTimeout(sendNext, session.intervalMs);
+    session.timeout.unref?.();
+  };
+
+  // Send the first reply immediately after the recipient presses Start.
+  await sendNext();
+}
+
+async function handleSpamStopButton(interaction) {
+  const id = interaction.customId.split(':')[2];
+  const session = spamSessions.get(id);
+  if (!session) return interaction.reply({ content: 'This message session has already ended.', ephemeral: true });
+  if (interaction.user.id !== session.target.id) return interaction.reply({ content: 'Only the recipient can stop this session.', ephemeral: true });
+  clearTimeout(session.timeout);
+  spamSessions.delete(id);
+  return interaction.update({ content: 'Message session stopped.', embeds: [], components: [] });
+}
 // ---------- Interaction router ----------
 client.on('interactionCreate', async (interaction) => {
   try {
@@ -4479,6 +4779,10 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply({ content: 'Bankroll message deleted.', ephemeral: true });
     }
     if (interaction.isAutocomplete()) return await onAutocomplete(interaction);
+    if (interaction.isButton() && interaction.customId.startsWith('spam:')) {
+      if (interaction.customId.startsWith('spam:stop:')) return await handleSpamStopButton(interaction);
+      return await handleSpamConsent(interaction);
+    }
     if (interaction.isButton()) return await onButton(interaction);
     if (interaction.isStringSelectMenu() && interaction.customId === 'customer_preview_select') return await onCustomerPreviewSelect(interaction);
     if (!interaction.isChatInputCommand()) return;
@@ -4510,8 +4814,13 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdDelivery(interaction);
       case 'cancel':
         return await cmdCancel(interaction);
+      case 'wipe':
+        await interaction.deferReply({ flags: 64 });
+        return await cmdWipe(interaction);
       case 'remind':
         return await cmdRemind(interaction);
+      case 'spam':
+        return await cmdSpam(interaction);
       case 'restore':
         await interaction.deferReply({ ephemeral: true });
         return await cmdRestore(interaction);
@@ -4543,12 +4852,12 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.commandName === 'preview') return await cmdCustomerPreview(interaction);
     }
   } catch (err) {
-    alertOwner(`/${interaction.commandName ?? interaction.customId?.split(':')[0]} failed`, err);
+    void alertOwner(`/${interaction.commandName ?? interaction.customId?.split(':')[0]} failed`, err);
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content: `Something went wrong: ${err.message}` });
       } else {
-        await interaction.reply({ content: `Something went wrong: ${err.message}`, ephemeral: true });
+        await interaction.reply({ content: `Something went wrong: ${err.message}`, flags: 64 });
       }
     } catch {}
   }
@@ -4598,7 +4907,7 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
     }
     if (tx.decline_reason) return res.status(200).send('Declined');
 
-    const amountPaid = Math.round(Number(tx.amount)) / 100;
+    const amountPaid = Math.round(Number(tx.amount ?? data.amount ?? 0)) / 100;
     if (!(amountPaid > 0)) return res.status(200).send('No incoming amount');
     console.log(`Monzo incoming payment: ${amountPaid}`);
     lastMonzoAt = Date.now();
@@ -4629,8 +4938,8 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
           { name: 'Amount Paid', value: money(amountPaid, 'gbp'), inline: true },
           { name: 'Payment Status', value: 'PAID', inline: true },
           { name: 'Paid At', value: `<t:${Math.floor(Date.now()/1000)}:F>`, inline: true },
-          { name: 'Payment reference', value: d.reference ? `\`${d.reference}\`` : 'None', inline: true },
-          { name: 'Transaction ID', value: String(data.id ?? 'Unknown') }
+          { name: 'Payment reference', value: String(d.reference || key || 'Not recorded'), inline: true },
+          { name: 'Transaction ID', value: String(tx.id || data.id || key || 'Not supplied by Monzo') }
         );
       await notifyOwner({ embeds: [paidEmbed] });
 
@@ -4842,9 +5151,11 @@ app.get('/', (_, res) => res.send('Bankroll bot running'));
 app.listen(PORT, () => console.log(`Webhook server listening on :${PORT}`));
 
 // Monitor process memory and event-loop stalls. Configure MEMORY_WARN_MB in Render if needed.
-const eventLoopMonitor = monitorEventLoopDelay({ resolution: 20000 });
+// Resolution is milliseconds; 20,000 would make the monitor itself report a ~20-second baseline.
+const eventLoopMonitor = monitorEventLoopDelay({ resolution: 20 });
 eventLoopMonitor.enable();
-const MEMORY_WARN_MB = Math.max(128, Number(process.env.MEMORY_WARN_MB || 384));
+const configuredMemoryWarnMb = Number(process.env.MEMORY_WARN_MB || 384);
+const MEMORY_WARN_MB = Number.isFinite(configuredMemoryWarnMb) ? Math.max(128, configuredMemoryWarnMb) : 384;
 let memoryWarningActive = false;
 let lastMemorySampleAt = 0;
 function sampleRuntimeHealth() {
