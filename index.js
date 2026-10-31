@@ -1461,7 +1461,8 @@ const botAdminCmd = common(
     .addSubcommand((sub) => sub.setName('redeploy').setDescription('Trigger a new deployment from the latest GitHub commit on Render'))
     .addSubcommand((sub) => sub.setName('restart').setDescription('Restart the running Render service'))
     .addSubcommand((sub) => sub.setName('avatar').setDescription('Change the bot profile picture').addAttachmentOption((o) => o.setName('image').setDescription('PNG, JPG or GIF image').setRequired(true)))
-    .addSubcommand((sub) => sub.setName('status').setDescription('Change the bot online presence').addStringOption((o) => o.setName('presence').setDescription('Discord presence colour/status').setRequired(true).addChoices(
+    .addSubcommand((sub) => sub.setName('status').setDescription('Change the bot online presence')
+    .addSubcommand((sub) => sub.setName('clear-dm').setDescription('Delete the bot\'s recent messages in this DM').addIntegerOption((o) => o.setName('count').setDescription('Maximum bot messages to delete (default 500)').setMinValue(1).setMaxValue(1000))).addStringOption((o) => o.setName('presence').setDescription('Discord presence colour/status').setRequired(true).addChoices(
       { name: 'Online (green)', value: 'online' },
       { name: 'Idle (yellow)', value: 'idle' },
       { name: 'Do Not Disturb (red)', value: 'dnd' },
@@ -3535,6 +3536,35 @@ async function cmdBotAdmin(interaction) {
     return interaction.editReply('Bot profile picture updated successfully.');
   }
 
+  if (sub === 'clear-dm') {
+    if (interaction.guild || !interaction.channel?.isDMBased?.()) {
+      return interaction.editReply('Run this command inside your direct message conversation with Bankroll.');
+    }
+    const limit = interaction.options.getInteger('count') || 500;
+    let deleted = 0;
+    let scanned = 0;
+    let before;
+    while (deleted < limit && scanned < 2000) {
+      const batch = await interaction.channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      if (!batch.size) break;
+      const ordered = [...batch.values()].sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+      before = ordered[ordered.length - 1]?.id;
+      scanned += ordered.length;
+      for (const message of ordered) {
+        if (deleted >= limit) break;
+        if (message.author?.id !== client.user.id || message.id === interaction.id) continue;
+        try {
+          await message.delete();
+          deleted++;
+        } catch (error) {
+          console.warn('Could not delete a Bankroll DM message:', error.message);
+        }
+      }
+      if (batch.size < 100) break;
+    }
+    return interaction.editReply(`Deleted **${deleted}** Bankroll message(s) from this DM. Your messages were left untouched.`);
+  }
+
   if (sub === 'status') {
     const presence = interaction.options.getString('presence');
     await client.user.setPresence({ status: presence, activities: [] });
@@ -3781,7 +3811,7 @@ async function onAutocomplete(interaction) {
     
     // Vault remove/info autocomplete
     if (
-      (interaction.commandName === 'vault' && ['remove', 'info', 'edit', 'verify', 'rename'].includes(interaction.options.getSubcommand())) ||
+      (interaction.commandName === 'vault' && ['remove', 'info', 'edit', 'verify', 'rename', 'export'].includes(interaction.options.getSubcommand())) ||
       interaction.commandName === 'bankroll' ||
       interaction.commandName === 'bankroll-monzo' ||
       interaction.commandName === 'sendfile'
