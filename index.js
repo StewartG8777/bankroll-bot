@@ -630,12 +630,12 @@ function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download i
     .setFooter({ text: 'Bankroll secure delivery • One-time download • No time expiry' }).setTimestamp();
 }
 
-function makeDownloadLink(d, paymentIntentId) {
+async function makeDownloadLink(d, paymentIntentId) {
   if (!d?.path || !fs.existsSync(d.path)) throw new Error('The source file is no longer available.');
   const token = crypto.randomBytes(24).toString('hex');
   const safeName = path.basename(String(d.name || 'download.zip')).replace(/[^\w.\-]/g, '_');
   const downloadPath = path.join(FILES_DIR, `download_${token}_${safeName}`);
-  fs.copyFileSync(d.path, downloadPath);
+  await fs.promises.copyFile(d.path, downloadPath);
   downloads[token] = {
     path: downloadPath,
     name: safeName,
@@ -1025,9 +1025,18 @@ async function updateInvoicePaidMessage(d, key, paymentIntentId = null) {
   } catch (e) { console.log('Could not update paid invoice embed:', e.message); return false; }
 }
 
-async function deliverFile(key, paymentIntentId) {
+const activeDeliveryJobs = new Set();
+async function deliverFile(key, paymentIntentId, options = {}) {
+  if (activeDeliveryJobs.has(key)) return false;
+  const current = deliveries[key];
+  if (!current || (current.deliveryComplete && !options.force)) return false;
+  activeDeliveryJobs.add(key);
+  try { return await deliverFileUnlocked(key, paymentIntentId, !!options.force); }
+  finally { activeDeliveryJobs.delete(key); }
+}
+async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   const d = deliveries[key];
-  if (!d) return;
+  if (!d || (d.deliveryComplete && !force)) return false;
 
   let owner = null;
   try { owner = await client.users.fetch(OWNER_ID); } catch {}
@@ -1062,7 +1071,7 @@ async function deliverFile(key, paymentIntentId) {
   if (!dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
     const size = fs.statSync(d.path).size;
     if (size > MAX_FILE_BYTES) {
-      dlink = makeDownloadLink(d, paymentIntentId);
+      dlink = await makeDownloadLink(d, paymentIntentId);
       hosted = true;
       d.fallbackLink = dlink;
       saveDeliveries();
@@ -1099,7 +1108,7 @@ async function deliverFile(key, paymentIntentId) {
       return await send(payload());
     } catch (attachmentError) {
       if (noFile || dlink || !BASE_URL || !d.path || !fs.existsSync(d.path)) throw attachmentError;
-      dlink = makeDownloadLink(d, paymentIntentId);
+      dlink = await makeDownloadLink(d, paymentIntentId);
       hosted = true;
       d.fallbackLink = dlink;
       saveDeliveries();
@@ -1159,8 +1168,11 @@ async function deliverFile(key, paymentIntentId) {
       d.paid = true;
       saveDeliveries();
     } else {
-      if (d.path && !d.vaultKey) { try { fs.unlinkSync(d.path); } catch {} }
-      delete deliveries[key];
+      d.deliveryComplete = true;
+      d.deliveredAt = Date.now();
+      d.deliveryMessageUrl = msgUrl || null;
+      d.deliveryMethod = sentTo;
+      delete d.deliveryError;
       saveDeliveries();
     }
   }
@@ -1539,7 +1551,11 @@ const downloadsCmd = common(new SlashCommandBuilder().setName('downloads').setDe
   .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate data and file backup'))
   .addSubcommand((sub) => sub.setName('verify').setDescription('Verify a vault ZIP archive and checksum').addStringOption((o) => o.setName('vault_key').setDescription('Exact vault key').setRequired(true))));
 
-const commands = [deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd];
+const deliveryCmd = common(new SlashCommandBuilder().setName('delivery').setDescription('Track and resend customer deliveries')
+  .addSubcommand((sub) => sub.setName('status').setDescription('Check a payment order delivery status').addStringOption((o) => o.setName('order').setDescription('Checkout session ID or Monzo invoice ID').setRequired(true)))
+  .addSubcommand((sub) => sub.setName('resend').setDescription('Resend a paid customer file without charging again').addStringOption((o) => o.setName('order').setDescription('Checkout session ID or Monzo invoice ID').setRequired(true))));
+
+const commands = [deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -1897,17 +1913,21 @@ async function autoRestoreOnStartup() {
 }
 
 async function reconcilePaidStripeDeliveries() {
-  let count = 0;
-  for (const [key,d] of Object.entries(deliveries)) {
-    if (!key.startsWith('cs_') || !d || d.paymentConfirmed || d.paid) continue;
-    try {
-      const session = await stripe.checkout.sessions.retrieve(key);
-      if (session.payment_status !== 'paid') continue;
-      d.paymentConfirmed = true; d.paid = true; d.paymentConfirmedAt = session.created ? session.created*1000 : Date.now();
-      d.amount = (session.amount_total || 0)/100; d.currency = String(session.currency || CURRENCY).toLowerCase(); d.paymentIntentId = session.payment_intent || null;
-      saveDeliveries(); await deliverFile(key, session.payment_intent || null); count++;
-    } catch (e) { console.error(`Could not reconcile Stripe order ${key}:`,e.message); }
-  }
+  const pending = Object.entries(deliveries).filter(([key,d]) => key.startsWith('cs_') && d && !d.paymentConfirmed && !d.paid);
+  let count = 0; let cursor = 0;
+  const workers = Array.from({ length: Math.min(3, pending.length) }, async () => {
+    while (cursor < pending.length) {
+      const [key,d] = pending[cursor++];
+      try {
+        const session = await stripe.checkout.sessions.retrieve(key);
+        if (session.payment_status !== 'paid') continue;
+        d.paymentConfirmed = true; d.paid = true; d.paymentConfirmedAt = session.created ? session.created*1000 : Date.now();
+        d.amount = (session.amount_total || 0)/100; d.currency = String(session.currency || CURRENCY).toLowerCase(); d.paymentIntentId = session.payment_intent || null;
+        saveDeliveries(); await deliverFile(key, session.payment_intent || null); count++;
+      } catch (e) { console.error(`Could not reconcile Stripe order ${key}:`,e.message); }
+    }
+  });
+  await Promise.all(workers);
   if (count) console.log(`Recovered ${count} paid Stripe order(s) during startup reconciliation.`);
   return count;
 }
@@ -1916,23 +1936,7 @@ const onReady = async () => {
   if (started) return;
   started = true;
   console.log(`Logged in as ${client.user.tag}`);
-  try {
-    // Register EVERYTHING globally so every command works in the server, bot DMs and private DMs.
-    await client.application.commands.set(commands.map((c) => c.toJSON()));
-    console.log('Global slash commands registered');
-
-    // Clear the old server-only copies so you don't see every command twice in your server.
-    if (DISCORD_GUILD_ID) {
-      const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
-      if (guild) {
-        await guild.commands.set([]);
-        console.log(`Cleared old guild commands in ${DISCORD_GUILD_ID}`);
-      }
-    }
-  } catch (e) {
-    console.error('Command registration failed:', e);
-  }
-
+  // Slash commands are refreshed explicitly with /bot refresh-commands, not on every restart.
   await autoRestoreOnStartup();
   try {
     const status = ['online', 'idle', 'dnd', 'invisible'].includes(savedPresence?.status) ? savedPresence.status : 'online';
@@ -2725,7 +2729,7 @@ async function cmdDownloads(interaction) {
   }
   if (sub === 'regenerate') {
     if(!BASE_URL) return interaction.editReply('PUBLIC_URL is not configured, so Bankroll cannot create hosted download links.');
-    try { const zipInfo=verifyZipIntegrity(item.path); const size=fs.statSync(item.path).size; const url=makeDownloadLink({path:item.path,name:item.originalName||path.basename(item.path),customerId:interaction.user.id,agentId:interaction.user.id,vaultKey:key,description:'admin-regenerated-download'},null); const token=url.split('/').pop(); const expiresAt=downloads[token]?.expiresAt;
+    try { const zipInfo=verifyZipIntegrity(item.path); const size=fs.statSync(item.path).size; const url=await makeDownloadLink({path:item.path,name:item.originalName||path.basename(item.path),customerId:interaction.user.id,agentId:interaction.user.id,vaultKey:key,description:'admin-regenerated-download'},null); const token=url.split('/').pop(); const expiresAt=downloads[token]?.expiresAt;
       recordDownloadEvent('link_regenerated',{file:item.originalName||key,customerId:interaction.user.id,agentId:interaction.user.id,token,detail:`Admin regenerated a link for vault key ${key}; ZIP entries ${zipInfo.entries||0}.`});
       return interaction.editReply({embeds:[buildDownloadEmbed(item.originalName||key,expiresAt,size,'Fresh download link generated')],components:[downloadLinkRow(url,/\.zip$/i.test(item.originalName||'')?'Download ZIP':'Download File')]});
     } catch(e) { recordDownloadEvent('link_regeneration_failed',{file:item.originalName||key,customerId:interaction.user.id,detail:e.message}); return interaction.editReply(`Could not regenerate the link: ${e.message}`); }
@@ -2927,7 +2931,7 @@ async function cmdVault(interaction) {
 
     if (!BASE_URL) return interaction.editReply({ content: 'Discord could not accept the full file as an attachment, and PUBLIC_URL is not configured for a hosted download link. Set PUBLIC_URL and try again.', embeds: [], files: [], components: [] });
     try {
-      const url = makeDownloadLink({ path: item.path, name: fileName, customerId: interaction.user.id, agentId: interaction.user.id, vaultKey: key, description: 'vault-export', multiUse: true }, null);
+      const url = await makeDownloadLink({ path: item.path, name: fileName, customerId: interaction.user.id, agentId: interaction.user.id, vaultKey: key, description: 'vault-export', multiUse: true }, null);
       const token = url.split('/').pop();
       const fallbackEmbed = EmbedBuilder.from(readyEmbed)
         .setDescription('Discord could not accept the full file as an attachment, so a secure download button is ready instead.\n\n**' + short(fileName, 180) + '** — ' + (size / (1024 * 1024)).toFixed(2) + ' MB.')
@@ -3204,7 +3208,7 @@ async function cmdPaymentTest(interaction) {
     ));
     testZip.writeZip(sourcePath);
 
-    const testUrl = makeDownloadLink({
+    const testUrl = await makeDownloadLink({
       path: sourcePath,
       name: fileName,
       customerId: selectedCustomer.id,
@@ -3723,6 +3727,46 @@ async function onCustomerPreviewSelect(interaction) {
   return interaction.update({ content: '', embeds: [embed], components: [] });
 }
 
+async function cmdDelivery(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage paid deliveries.');
+  const sub = interaction.options.getSubcommand();
+  const key = interaction.options.getString('order').trim();
+  const d = deliveries[key];
+  if (!d) return interaction.editReply('Order not found in saved delivery records. Use the full Checkout Session ID (cs_...) or Monzo invoice ID.');
+  const paid = !!(d.paymentConfirmed || d.paid || d.status === 'paid');
+  if (sub === 'status') {
+    const completed = downloadHistory.find((e) => e.type === 'download_completed' && e.customerId === d.customerId && e.file === d.name);
+    const state = !paid ? 'AWAITING PAYMENT' : d.deliveryComplete ? (completed ? 'DOWNLOADED' : 'DELIVERED — AWAITING DOWNLOAD') : d.deliveryError ? 'DELIVERY FAILED / NEEDS ATTENTION' : 'PAID — DELIVERY PENDING';
+    const lines = [
+      '**Order:** ' + key,
+      '**Customer:** ' + (d.customerId ? '<@' + d.customerId + '>' : 'Unknown'),
+      '**Payment:** ' + (paid ? 'Paid' : 'Not confirmed'),
+      '**Delivery:** ' + state,
+      '**Amount:** ' + money(Number(d.amount || 0), d.currency || CURRENCY),
+      '**Paid at:** ' + (d.paymentConfirmedAt ? '<t:' + Math.floor(d.paymentConfirmedAt / 1000) + ':F>' : '—'),
+      '**Delivered at:** ' + (d.deliveredAt ? '<t:' + Math.floor(d.deliveredAt / 1000) + ':F>' : '—'),
+      '**Download completed:** ' + (completed ? '<t:' + Math.floor(completed.at / 1000) + ':F>' : 'Not recorded'),
+      '**Last error:** ' + short(d.deliveryError || 'None', 500),
+      d.deliveryMessageUrl ? '**Delivery message:** ' + d.deliveryMessageUrl : ''
+    ].filter(Boolean);
+    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(!paid ? GREY : d.deliveryComplete ? GREEN : RED).setTitle('Delivery status • ' + short(d.name || key, 150)).setDescription(lines.join('\n')).setTimestamp()] });
+  }
+  if (!paid) return interaction.editReply('This order is not marked as paid. Bankroll will not resend unpaid orders.');
+  if (!d.path || !fs.existsSync(d.path)) return interaction.editReply('The original file is no longer available in storage. Restore it before resending.');
+  if (activeDeliveryJobs.has(key)) return interaction.editReply('This order is already being delivered. Wait for the current attempt to finish.');
+  d.deliveryComplete = false;
+  d.deliveryAttempts = 0;
+  delete d.nextDeliveryRetryAt;
+  delete d.deliveryError;
+  delete d.fallbackLink;
+  saveDeliveries();
+  await interaction.editReply('Resending the paid file now. No new payment will be created.');
+  await deliverFile(key, d.paymentIntentId || null, { force: true });
+  return interaction.editReply(deliveries[key] && deliveries[key].deliveryComplete
+    ? 'Resend completed for <@' + d.customerId + '>. The original payment record has been kept.'
+    : 'The resend attempt did not complete. The paid order remains saved for recovery.');
+}
+
 async function cmdCustomer(interaction) {
   const user = interaction.options.getUser('user');
   let card = [];
@@ -3736,17 +3780,16 @@ async function cmdCustomer(interaction) {
     console.error('Stripe customer lookup failed:', e.message);
   }
   const monzo = monzoPaid().filter((m) => m.customerId === user.id);
+  const deliveryState = (d) => !d ? 'delivery record unavailable' : d.deliveryComplete ? 'delivered' : d.deliveryError ? 'delivery needs attention' : 'delivery pending';
   const all = [
-    ...card.map((pi) => ({
-      at: pi.created,
-      amount: pi.amount_received / 100,
-      text: `${money(pi.amount_received / 100, pi.currency)} - ${short(pi.metadata.description, 40)} - <t:${pi.created}:d> (Card)`,
-    })),
-    ...monzo.map((m) => ({
-      at: tsec(m.paidAt),
-      amount: m.amount,
-      text: `${money(m.amount, m.currency)} - ${short(m.description, 40)} - <t:${tsec(m.paidAt)}:d> (Monzo)`,
-    })),
+    ...card.map((pi) => {
+      const d = Object.entries(deliveries).find(([key, x]) => (key === pi.id || x?.paymentIntentId === pi.id) && String(x?.customerId) === user.id)?.[1];
+      return { at: pi.created, amount: pi.amount_received / 100, text: `${money(pi.amount_received / 100, pi.currency)} - ${short(pi.metadata.description, 40)} - <t:${pi.created}:d> (Card) • ${deliveryState(d)}` };
+    }),
+    ...monzo.map((m) => {
+      const d = Object.values(deliveries).find((x) => x?.type === 'monzo' && x.customerId === user.id && (x.txId === m.txId || x.reference === m.reference || x.description === m.description));
+      return { at: tsec(m.paidAt), amount: m.amount, text: `${money(m.amount, m.currency)} - ${short(m.description, 40)} - <t:${tsec(m.paidAt)}:d> (Monzo) • ${deliveryState(d)}` };
+    }),
   ].sort((a, b) => b.at - a.at);
   if (!all.length) return interaction.editReply(`<@${user.id}> hasn't paid you anything yet.`);
 
@@ -4139,7 +4182,7 @@ async function onGetFile(interaction) {
   if (!dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
     const size = fs.statSync(d.path).size;
     if (size > MAX_FILE_BYTES) {
-      dlink = makeDownloadLink(d, checkPi);
+      dlink = await makeDownloadLink(d, checkPi);
       hosted = true;
       d.fallbackLink = dlink;
       saveDeliveries();
@@ -4176,7 +4219,7 @@ async function onGetFile(interaction) {
       return interaction.followUp({ content: `Discord could not send the file (${short(attachmentError.message, 180)}). Your paid file is still saved; please contact the seller.`, ephemeral: true });
     }
     try {
-      dlink = makeDownloadLink(d, checkPi);
+      dlink = await makeDownloadLink(d, checkPi);
       hosted = true;
       d.fallbackLink = dlink;
       saveDeliveries();
@@ -4318,7 +4361,7 @@ async function onScheduledSendButton(interaction) {
   };
 
   const sendHostedLink = async () => {
-    const link = makeDownloadLink({
+    const link = await makeDownloadLink({
       path: item.path,
       name: path.basename(job.originalName || item.originalName || item.path),
       customerId: interaction.user.id,
@@ -4457,6 +4500,9 @@ client.on('interactionCreate', async (interaction) => {
       case 'downloads':
         await interaction.deferReply({ ephemeral: true });
         return await cmdDownloads(interaction);
+      case 'delivery':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdDelivery(interaction);
       case 'cancel':
         return await cmdCancel(interaction);
       case 'remind':
