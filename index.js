@@ -588,7 +588,7 @@ function cleanDownloads() {
   for (const [token, dl] of Object.entries(downloads)) {
     const expired = !dl || (dl.expiresAt != null && Number.isFinite(Number(dl.expiresAt)) && now > Number(dl.expiresAt));
     const missing = !dl?.path || !fs.existsSync(dl.path);
-    if ((expired || missing || dl.used) && !activeDownloadTokens.has(token)) {
+    if ((expired || missing || (dl.used && !dl.multiUse)) && !activeDownloadTokens.has(token)) {
       if (dl?.path) { try { fs.unlinkSync(dl.path); } catch {} }
       delete downloads[token]; removed++;
       if (expired) recordDownloadEvent('expired', { file: dl?.name, customerId: dl?.customerId, token, detail: 'Expired link/file removed by cleanup.' });
@@ -633,10 +633,11 @@ function makeDownloadLink(d, paymentIntentId) {
     paymentIntentId: paymentIntentId ?? null,
     expiresAt: null,
     used: false,
+    multiUse: !!d.multiUse,
     testMode: !!d.testMode,
   };
   saveDownloads();
-  recordDownloadEvent('link_created', { file: safeName, customerId: d.customerId || OWNER_ID, agentId: d.agentId || OWNER_ID, token, detail: 'One-time download link; no time expiry. Link is invalidated after a successful download.' });
+  recordDownloadEvent('link_created', { file: safeName, customerId: d.customerId || OWNER_ID, agentId: d.agentId || OWNER_ID, token, detail: d.multiUse ? 'Public multi-use vault export link; no time expiry.' : 'One-time download link; no time expiry. Link is invalidated after a successful download.' });
   const slug = (d.description || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '') || 'order';
   return `${BASE_URL}/bankroll-${slug}-download/${token}`;
 }
@@ -2710,8 +2711,8 @@ async function cmdVault(interaction) {
     return interaction.reply({ content: 'Only authorized users can manage the vault.', ephemeral: true });
   }
 
-  await interaction.deferReply({ ephemeral: true });
   const sub = interaction.options.getSubcommand();
+  await interaction.deferReply({ ephemeral: sub !== 'export' });
 
   if (sub === 'add') {
     const att = interaction.options.getAttachment('file');
@@ -2900,7 +2901,7 @@ async function cmdVault(interaction) {
 
     if (!BASE_URL) return interaction.editReply({ content: 'Discord could not accept the full file as an attachment, and PUBLIC_URL is not configured for a hosted download link. Set PUBLIC_URL and try again.', embeds: [], files: [], components: [] });
     try {
-      const url = makeDownloadLink({ path: item.path, name: fileName, customerId: interaction.user.id, agentId: interaction.user.id, vaultKey: key, description: 'vault-export' }, null);
+      const url = makeDownloadLink({ path: item.path, name: fileName, customerId: interaction.user.id, agentId: interaction.user.id, vaultKey: key, description: 'vault-export', multiUse: true }, null);
       const token = url.split('/').pop();
       const fallbackEmbed = EmbedBuilder.from(readyEmbed)
         .setDescription('Discord could not accept the full file as an attachment, so a secure download button is ready instead.\n\n**' + short(fileName, 180) + '** — ' + (size / (1024 * 1024)).toFixed(2) + ' MB.')
@@ -4671,13 +4672,13 @@ app.get('/:name/:token', (req, res) => {
   if(downloadAttempts.size>5000){for(const [ip,value] of downloadAttempts)if(Date.now()>value.resetAt)downloadAttempts.delete(ip);}
   if(!/^[a-f0-9]{48,64}$/i.test(token)){recordDownloadEvent('access_denied',{detail:'Malformed download token.'});return res.status(404).send('Not found');}
   const t=downloads[token]; const filesRoot=path.resolve(FILES_DIR)+path.sep; const safePath=t?.path&&path.resolve(String(t.path)).startsWith(filesRoot);
-  if(!t||t.used||activeDownloadTokens.has(token)||(t.expiresAt != null && Date.now()>Number(t.expiresAt))||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
+  if(!t||(t.used&&!t.multiUse)||activeDownloadTokens.has(token)||(t.expiresAt != null && Date.now()>Number(t.expiresAt))||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
 
   const ua = req.headers['user-agent'] || '';
   if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) {
     return res.status(200).send('Download link');
   }
-  t.used = true; activeDownloadTokens.add(token); saveDownloads();
+  if (!t.multiUse) t.used = true; activeDownloadTokens.add(token); saveDownloads();
   const downloadStartedAt = Date.now();
   const expectedBytes = fs.statSync(t.path).size;
   res.setHeader('Content-Type', 'application/octet-stream');
