@@ -628,6 +628,7 @@ function makeDownloadLink(d, paymentIntentId) {
     paymentIntentId: paymentIntentId ?? null,
     expiresAt: null,
     used: false,
+    testMode: !!d.testMode,
   };
   saveDownloads();
   recordDownloadEvent('link_created', { file: safeName, customerId: d.customerId || OWNER_ID, agentId: d.agentId || OWNER_ID, token, detail: 'One-time download link; no time expiry. Link is invalidated after a successful download.' });
@@ -1031,7 +1032,7 @@ async function deliverFile(key, paymentIntentId) {
   if (d.fallbackLink) {
     const token = d.fallbackLink.split('/').pop();
     const savedLink = downloads[token];
-    if (savedLink && !savedLink.used && Date.now() < savedLink.expiresAt && fs.existsSync(savedLink.path)) {
+    if (savedLink && !savedLink.used && (savedLink.expiresAt == null || Date.now() < Number(savedLink.expiresAt)) && fs.existsSync(savedLink.path)) {
       dlink = d.fallbackLink;
       hosted = true;
     } else {
@@ -1222,6 +1223,14 @@ const bankrollCmd = common(
         .setName('expires')
         .setDescription('Expiration time, e.g. 30m, 2h, 24h, or 7d (default: no expiry)')
     )
+);
+
+const testCmd = common(
+  new SlashCommandBuilder()
+    .setName('test')
+    .setDescription('Run a fake payment and secure-download test (owner only)')
+    .addSubcommand((sub) => sub.setName('bankroll').setDescription('Simulate a paid Bankroll card invoice'))
+    .addSubcommand((sub) => sub.setName('monzo').setDescription('Simulate a paid Monzo invoice'))
 );
 
 const monzoCmd = common(
@@ -1472,7 +1481,7 @@ const downloadsCmd = common(new SlashCommandBuilder().setName('downloads').setDe
   .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate data and file backup'))
   .addSubcommand((sub) => sub.setName('verify').setDescription('Verify a vault ZIP archive and checksum').addStringOption((o) => o.setName('vault_key').setDescription('Exact vault key').setRequired(true))));
 
-const commands = [bankrollCmd, monzoCmd, vaultCmd, sendfileCmd, downloadsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
+const commands = [bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -3058,6 +3067,99 @@ async function cmdUnpaid(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
+async function cmdPaymentTest(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: 'Only the bot owner can run payment simulations.', ephemeral: true });
+  }
+  if (!BASE_URL) {
+    return interaction.reply({
+      content: 'Payment test needs PUBLIC_URL configured so the test ZIP can use the real hosted-download route. No test data or invoices were created.',
+      ephemeral: true,
+    });
+  }
+
+  const method = interaction.options.getSubcommand();
+  await interaction.deferReply({ ephemeral: true });
+  let sourcePath = null;
+  let token = null;
+  try {
+    const testId = crypto.randomBytes(5).toString('hex').toUpperCase();
+    const fileName = 'Bankroll_' + method.toUpperCase() + '_TEST.zip';
+    sourcePath = path.join(FILES_DIR, 'bankroll_test_source_' + testId + '.zip');
+    const testZip = new AdmZip();
+    testZip.addFile('BANKROLL_TEST.txt', Buffer.from(
+      'Bankroll ' + method.toUpperCase() + ' delivery test\nTest ID: ' + testId + '\nThis is a fake test file. No payment was taken.\n',
+      'utf8'
+    ));
+    testZip.writeZip(sourcePath);
+
+    const stat = fs.statSync(sourcePath);
+    const testUrl = makeDownloadLink({
+      path: sourcePath,
+      name: fileName,
+      customerId: OWNER_ID,
+      agentId: OWNER_ID,
+      description: 'test-' + method,
+      testMode: true,
+    }, null);
+    token = testUrl.split('/').pop();
+    try { fs.unlinkSync(sourcePath); } catch {}
+    sourcePath = null;
+
+    const owner = await client.users.fetch(OWNER_ID);
+    const paidAt = Date.now();
+    const reference = 'TEST-' + method.toUpperCase() + '-' + testId;
+    const paidEmbed = new EmbedBuilder()
+      .setColor(GREEN)
+      .setTitle('[TEST] PAID | ' + (method === 'monzo' ? 'MONZO PAYMENT RECEIVED' : 'BANKROLL PAYMENT RECEIVED'))
+      .setDescription('Simulated successful ' + (method === 'monzo' ? 'Monzo' : 'Bankroll card') + ' payment. No real payment was made.')
+      .addFields(
+        { name: 'Customer', value: '<@' + OWNER_ID + '>', inline: true },
+        { name: 'Sales Agent', value: '<@' + OWNER_ID + '>', inline: true },
+        { name: 'Amount Paid', value: money(1.23, 'gbp'), inline: true },
+        { name: 'Payment Status', value: 'PAID (TEST)', inline: true },
+        { name: 'Paid At', value: '<t:' + Math.floor(paidAt / 1000) + ':F>', inline: true },
+        { name: 'Transaction Reference', value: reference }
+      )
+      .setFooter({ text: 'TEST MODE • No Stripe charge or Monzo transaction' })
+      .setTimestamp();
+
+    await owner.send({ embeds: [paidEmbed] });
+    recordNotification('test.payment_paid', paidEmbed.data.title, 'Simulated ' + method + ' payment ' + reference, 'success');
+
+    const readyEmbed = buildDownloadEmbed(fileName, null, stat.size, '[TEST] Your download is ready');
+    readyEmbed.addFields({ name: 'Payment method', value: method === 'monzo' ? 'Monzo (simulated)' : 'Bankroll / card (simulated)', inline: true });
+    const readyPayload = {
+      content: '[TEST] Payment received. Your complete ZIP is ready. This is a simulation; no payment was taken.',
+      embeds: [readyEmbed],
+      components: [downloadLinkRow(testUrl, 'Download Test ZIP')],
+      allowedMentions: { parse: [] },
+    };
+    await owner.send(readyPayload);
+    recordNotification('test.delivery_ready', 'Test ZIP ready', fileName + ' is ready; the one-time hosted link is waiting for a download.', 'success');
+    recordDownloadEvent('test_payment_simulated', {
+      file: fileName,
+      customerId: OWNER_ID,
+      agentId: OWNER_ID,
+      token: token,
+      detail: 'Simulated ' + method + ' payment. No live invoice, Stripe payment, Monzo transaction, delivery record or vault item was created.',
+    });
+
+    return interaction.editReply(
+      'Test started for **' + (method === 'monzo' ? 'Monzo' : 'Bankroll') + '**. I sent you two DMs: the fake **PAID** embed and the **ZIP ready** message. Click **Download Test ZIP** in the second DM to trigger the third DM confirming the completed download. No real payment was taken and no live invoice or vault data was changed.'
+    );
+  } catch (err) {
+    if (token && downloads[token]) {
+      try { fs.unlinkSync(downloads[token].path); } catch {}
+      delete downloads[token];
+      saveDownloads();
+    }
+    if (sourcePath) { try { fs.unlinkSync(sourcePath); } catch {} }
+    console.error('Payment test failed:', err);
+    return interaction.editReply('Payment test failed: ' + err.message);
+  }
+}
+
 async function cmdNotifications(interaction) {
   const sub = interaction.options.getSubcommand();
   if (sub === 'test') {
@@ -3733,7 +3835,7 @@ async function onGetFile(interaction) {
   if (d.fallbackLink) {
     const token = d.fallbackLink.split('/').pop();
     const savedLink = downloads[token];
-    if (savedLink && !savedLink.used && Date.now() < savedLink.expiresAt && fs.existsSync(savedLink.path)) {
+    if (savedLink && !savedLink.used && (savedLink.expiresAt == null || Date.now() < Number(savedLink.expiresAt)) && fs.existsSync(savedLink.path)) {
       dlink = d.fallbackLink;
       hosted = true;
     } else {
@@ -4038,6 +4140,8 @@ client.on('interactionCreate', async (interaction) => {
         return await sendStripeCheckout(interaction);
       case 'bankroll-monzo':
         return await sendMonzoInvoice(interaction);
+      case 'test':
+        return await cmdPaymentTest(interaction);
       case 'vault':
         return await cmdVault(interaction);
       case 'sendfile':
@@ -4339,10 +4443,10 @@ app.get('/:name/:token', (req, res) => {
     delete downloads[token]; activeDownloadTokens.delete(token); saveDownloads();
     recordDownloadEvent('download_completed', {
       file:t.name, customerId:t.customerId, agentId:t.agentId, token,
-      detail:`Completed file transfer: ${expectedBytes} bytes in ${elapsedMs} ms at ${new Date(downloadedAt).toISOString()}.`
+      detail:`${t.testMode ? '[TEST] ' : ''}Completed file transfer: ${expectedBytes} bytes in ${elapsedMs} ms at ${new Date(downloadedAt).toISOString()}.`
     });
     notifyOwner({
-      content: `<@${t.customerId}> successfully downloaded **${t.name}**.\nCompleted: <t:${Math.floor(downloadedAt/1000)}:F>\nFile size: ${(expectedBytes/(1024*1024)).toFixed(2)} MB.`
+      content: `${t.testMode ? '[TEST] ' : ''}<@${t.customerId}> successfully downloaded **${t.name}**.\nCompleted: <t:${Math.floor(downloadedAt/1000)}:F>\nFile size: ${(expectedBytes/(1024*1024)).toFixed(2)} MB.`
     });
     recordInStripe(t.paymentIntentId, {
       downloaded_at: new Date(downloadedAt).toISOString(),
