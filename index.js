@@ -66,6 +66,10 @@ const money = (amount, cur) =>
   `${symbols[cur.toLowerCase()] ?? cur.toUpperCase() + ' '}${amount.toFixed(2)}`;
 const short = (text, n) => (text && text.length > n ? text.slice(0, n - 1) + '…' : text || '—');
 
+// Initialise notification state before registering process error handlers.
+// Early rejected promises can otherwise trigger alertOwner during module startup.
+let notificationHistory = [];
+
 // Posts a copy of important events to a private server channel (via a channel webhook).
 async function getLogChannel() {
   if (LOG_CHANNEL_ID) return client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
@@ -145,7 +149,13 @@ let recoveryInfo = null;
 async function alertOwner(where, err) {
   const msg = `${where}: ${err?.message ?? err}`.slice(0, 500);
   console.error(msg);
-  recordNotification('system.error', where, msg, 'error');
+  try {
+    if (typeof recordNotification === 'function') {
+      recordNotification('system.error', where, msg, 'error');
+    }
+  } catch (notificationError) {
+    console.error('Could not record error notification:', notificationError?.message ?? notificationError);
+  }
   if (Date.now() - (lastAlert.get(msg) ?? 0) < 60 * 1000) return;
   lastAlert.set(msg, Date.now());
   try {
@@ -227,7 +237,6 @@ const saveVault = () => {
 
 // Persistent notification/audit history. Kept in JSON to match the existing deployment.
 const NOTIFICATIONS_FILE = path.join(DATA_DIR, 'notifications.json');
-let notificationHistory = [];
 try {
   const saved = JSON.parse(fs.readFileSync(NOTIFICATIONS_FILE, 'utf8'));
   notificationHistory = Array.isArray(saved) ? saved.slice(-100) : [];
