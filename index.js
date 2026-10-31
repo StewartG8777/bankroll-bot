@@ -1359,7 +1359,7 @@ const restoreCmd = common(
     .addAttachmentOption((o) =>
       o
         .setName('file')
-        .setDescription('deliveries.json, downloads.json, download_history.json, vault.json, monzo_payments.json or notifications.json')
+        .setDescription('JSON backup file to restore (database or notification data)')
         .setRequired(true)
     )
 );
