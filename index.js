@@ -1170,10 +1170,10 @@ const sendfileCmd = new SlashCommandBuilder()
   .setDescription('Schedule a vault ZIP for delivery in this private DM')
   .setIntegrationTypes([ApplicationIntegrationType.UserInstall])
   .setContexts([InteractionContextType.PrivateChannel])
-  .addStringOption((o) => o.setName('file').setDescription('Choose a file from your vault').setAutocomplete(true).setRequired(true))
   .addIntegerOption((o) => o.setName('size').setDescription('How long to wait before sending').setMinValue(1).setMaxValue(720).setRequired(true))
   .addStringOption((o) => o.setName('disk').setDescription('M = minutes, H = hours').setRequired(true)
-    .addChoices({ name: 'M', value: 'm' }, { name: 'H', value: 'h' }));
+    .addChoices({ name: 'M', value: 'm' }, { name: 'H', value: 'h' }))
+  .addStringOption((o) => o.setName('file').setDescription('Vault ZIP to send (default: newest ZIP in your vault)').setAutocomplete(true));
 
 const cancelCmd = common(
   new SlashCommandBuilder()
@@ -1675,15 +1675,17 @@ const onReady = async () => {
   started = true;
   console.log(`Logged in as ${client.user.tag}`);
   try {
+    // Register EVERYTHING globally so every command works in the server, bot DMs and private DMs.
+    await client.application.commands.set(commands.map((c) => c.toJSON()));
+    console.log('Global slash commands registered');
+
+    // Clear the old server-only copies so you don't see every command twice in your server.
     if (DISCORD_GUILD_ID) {
-      // /sendfile must be global for a user-installed app in a private two-person DM.
-      await client.application.commands.set([sendfileCmd.toJSON()]);
-      const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
-      await guild.commands.set(commands.filter((c) => c.name !== 'sendfile').map((c) => c.toJSON()));
-      console.log(`Global /sendfile and guild commands registered to ${DISCORD_GUILD_ID}`);
-    } else {
-      await client.application.commands.set(commands.map((c) => c.toJSON()));
-      console.log('Global slash commands registered');
+      const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
+      if (guild) {
+        await guild.commands.set([]);
+        console.log(`Cleared old guild commands in ${DISCORD_GUILD_ID}`);
+      }
     }
   } catch (e) {
     console.error('Command registration failed:', e);
@@ -3585,17 +3587,26 @@ async function onGetFile(interaction) {
   await notifyOwner({ content: `"${d.name}" was sent to <@${d.customerId}>.` });
 }
 
+// Random but natural-looking "disk size" for a scheduled send: roughly scales with the wait time,
+// with some noise so it gives numbers like 162 or 201 GB. It is picked once per job, so it stays the same on refresh.
+function randomSearchGb(durationMinutes) {
+  const center = Math.max(2, 2 + ((durationMinutes - 2) * 198) / 118);
+  const jitter = 0.82 + Math.random() * 0.36;
+  return Math.max(2, Math.round(center * jitter));
+}
 function sendfileProgress(job, now = Date.now()) {
   const total = Math.max(1, job.dueAt - job.createdAt);
   const pct = Math.max(0, Math.min(100, Math.floor(((now - job.createdAt) / total) * 100)));
   const filled = Math.round(pct / 10);
   const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
   const eta = Math.floor(job.dueAt / 1000);
-  const durationMinutes = total / 60000;
-  // Match the requested display examples: 2 minutes = 2 GB; 2 hours = 200 GB.
-  const searchGb = Math.max(2, Math.round(2 + ((durationMinutes - 2) * 198 / 118)));
-  const state = now >= job.dueAt ? 'Search complete — ready to retrieve' : `Searching through approximately **${searchGb} GB** of disk space`;
-  return `**Scheduled file: ${job.originalName}**\n${bar} **${pct}%**\n${state}\nEstimated completion: <t:${eta}:F> (<t:${eta}:R>)\nUse **Check progress / Get File** to refresh this status. When it reaches 100%, the button attempts the ZIP first and a download link second.`;
+  const totalGb = job.searchGb || randomSearchGb(total / 60000);
+  const scannedGb = Math.min(totalGb, Math.round((totalGb * pct) / 100));
+  const done = now >= job.dueAt;
+  const state = done
+    ? `Search complete - **${totalGb} GB** scanned, file located`
+    : `Searching through **${scannedGb} GB** of **${totalGb} GB** of disk space`;
+  return `**Scheduled file: ${job.originalName}**\n${bar} **${pct}%**\n${state}\nEstimated completion: <t:${eta}:F> (<t:${eta}:R>)\nPress **Check progress / Get File** to refresh. At 100% the same button sends your file.`;
 }
 function sendfileButton(jobId) {
   return new ActionRowBuilder().addComponents(
@@ -3606,7 +3617,17 @@ async function startScheduledSend(interaction) {
   if (interaction.inGuild() || interaction.channel?.type !== ChannelType.DM) {
     return interaction.reply({ content: 'Run /sendfile inside a one-to-one private DM, not in a server or group DM.', ephemeral: true });
   }
-  const key = interaction.options.getString('file', true);
+  let key = interaction.options.getString('file');
+  if (!key) {
+    // No file picked: use the newest ZIP in the vault.
+    const newest = Object.entries(vault)
+      .filter(([, v]) => v?.path && /\.zip$/i.test(String(v.originalName || v.path)) && fs.existsSync(v.path))
+      .sort((a, b) => (b[1].addedAt || 0) - (a[1].addedAt || 0))[0];
+    if (!newest) {
+      return interaction.reply({ content: 'There is no ZIP in your vault yet. Add one with /vault add first.', ephemeral: true });
+    }
+    key = newest[0];
+  }
   const item = vault[key];
   if (!item || !item.path || !fs.existsSync(item.path)) {
     return interaction.reply({ content: `Vault file \`${key}\` is unavailable. Check it with /vault verify.`, ephemeral: true });
@@ -3633,6 +3654,7 @@ async function startScheduledSend(interaction) {
     channelId: interaction.channelId,
     createdAt: now,
     dueAt: now + durationMs,
+    searchGb: randomSearchGb(durationMs / 60000),
     status: 'waiting',
   };
   sendJobs[jobId] = job;
@@ -3653,6 +3675,9 @@ async function onScheduledSendButton(interaction) {
   if (job.status === 'sent' || job.status === 'link_sent') {
     return interaction.reply({ content: job.status === 'sent' ? 'This ZIP has already been sent.' : 'The download link has already been sent.', ephemeral: true });
   }
+  if (job.status === 'sending') {
+    return interaction.reply({ content: 'Your file is being sent right now, one moment.', ephemeral: true });
+  }
   if (Date.now() < job.dueAt) {
     return interaction.update({ content: sendfileProgress(job), components: [sendfileButton(jobId)], allowedMentions: { parse: [] } });
   }
@@ -3662,13 +3687,29 @@ async function onScheduledSendButton(interaction) {
     return interaction.update({ content: `The scheduled time has arrived, but vault file \`${job.vaultKey}\` is missing. Re-add it, then contact the bot owner.`, components: [sendfileButton(jobId)] });
   }
 
-  try {
-    await interaction.reply({ content: `**${job.originalName}** — scheduled delivery complete.`, files: [new AttachmentBuilder(item.path, { name: path.basename(job.originalName) })], allowedMentions: { parse: [] } });
-    job.status = 'sent';
+  // Answer Discord within 3 seconds (this is what used to make the button "fail" and send nothing),
+  // then upload the file as a follow-up, which is allowed to take much longer.
+  job.status = 'sending';
+  await interaction.update({
+    content: `${sendfileProgress(job)}\n\nSending your file now...`,
+    components: [],
+    allowedMentions: { parse: [] },
+  });
+
+  const finish = async (status, note) => {
+    job.status = status;
     job.completedAt = Date.now();
     saveSendJobs();
-    await interaction.message.edit({ components: [] }).catch(() => {});
-    return;
+    await interaction.editReply({ content: `${sendfileProgress(job)}\n\n${note}`, components: [], allowedMentions: { parse: [] } }).catch(() => {});
+  };
+
+  try {
+    await interaction.followUp({
+      content: `**${job.originalName}** - scheduled delivery complete.`,
+      files: [new AttachmentBuilder(item.path, { name: path.basename(job.originalName) })],
+      allowedMentions: { parse: [] },
+    });
+    return await finish('sent', 'File sent below.');
   } catch (uploadError) {
     console.error('Scheduled ZIP upload failed; trying link fallback:', uploadError.message);
   }
@@ -3678,25 +3719,23 @@ async function onScheduledSendButton(interaction) {
       const rel = relData(item.path);
       if (!rel) throw new Error('Vault file is outside the configured data directory.');
       const link = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
-      const content = `Discord could not attach **${job.originalName}**. Here is the download link instead:\n${link}`;
-      if (interaction.deferred || interaction.replied) await interaction.followUp({ content, allowedMentions: { parse: [] } });
-      else await interaction.reply({ content, allowedMentions: { parse: [] } });
-      job.status = 'link_sent';
-      job.completedAt = Date.now();
-      saveSendJobs();
-      await interaction.message.edit({ components: [] }).catch(() => {});
-      return;
+      await interaction.followUp({
+        content: `Discord could not attach **${job.originalName}**. Here is the download link instead:\n${link}`,
+        allowedMentions: { parse: [] },
+      });
+      return await finish('link_sent', 'Download link sent below.');
     } catch (linkError) {
       console.error('Scheduled file link fallback failed:', linkError.message);
     }
   }
 
-  const retryRow = sendfileButton(jobId);
-  const failure = `I couldn't send **${job.originalName}** as a ZIP${BASE_URL ? ' or create its download link' : '. No PUBLIC_URL is configured, so a link cannot be created'}. You can press **Check progress / Get File** to retry.`;
-  try {
-    if (interaction.deferred || interaction.replied) await interaction.followUp({ content: failure, components: [retryRow], allowedMentions: { parse: [] } });
-    else await interaction.reply({ content: failure, components: [retryRow], allowedMentions: { parse: [] } });
-  } catch (e) { console.error('Could not report scheduled send failure:', e.message); }
+  // Both failed: put the button back so it can be retried.
+  job.status = 'waiting';
+  saveSendJobs();
+  const failure = `I couldn't send **${job.originalName}** as a ZIP${BASE_URL ? ' or create its download link' : '. No PUBLIC_URL is configured, so a link cannot be created (the file is probably over Discord\'s upload limit)'}. Press **Check progress / Get File** to retry.`;
+  await interaction.editReply({ content: `${sendfileProgress(job)}\n\n${failure}`, components: [sendfileButton(jobId)], allowedMentions: { parse: [] } }).catch((e) =>
+    console.error('Could not report scheduled send failure:', e.message)
+  );
 }
 
 async function onButton(interaction) {
