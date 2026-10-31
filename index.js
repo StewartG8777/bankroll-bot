@@ -4689,10 +4689,12 @@ app.get('/:name/:token', (req, res) => {
     finished = true;
     const downloadedAt = Date.now();
     const elapsedMs = downloadedAt - downloadStartedAt;
-    try {
-      fs.unlinkSync(t.path);
-    } catch {}
-    delete downloads[token]; activeDownloadTokens.delete(token); saveDownloads();
+    if (!t.multiUse) {
+      try { fs.unlinkSync(t.path); } catch {}
+      delete downloads[token];
+    }
+    activeDownloadTokens.delete(token);
+    saveDownloads();
     recordDownloadEvent('download_completed', {
       file:t.name, customerId:t.customerId, agentId:t.agentId, token,
       detail:`${t.testMode ? '[TEST] ' : ''}Completed file transfer: ${expectedBytes} bytes in ${elapsedMs} ms at ${new Date(downloadedAt).toISOString()}.`
