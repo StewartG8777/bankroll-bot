@@ -1613,10 +1613,10 @@ async function autoRestoreOnStartup() {
       return;
     }
 
-    // Read the ENTIRE channel history, not an arbitrary recent-message window.
+    // Read recent channel history (capped at 10 pages = 1000 messages so startup stays fast).
     let before;
     let pages = 0;
-    while (!exhausted) {
+    while (!exhausted && pages < 10) {
       const batch = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
       if (!batch.size) { exhausted = true; break; }
       msgs.push(...batch.values());
@@ -1733,7 +1733,7 @@ async function autoRestoreOnStartup() {
     rebaseFileRecords(deliveries);
     rebaseFileRecords(downloads);
 
-    // Index every backed-up file part across the full channel history.
+    // Index every backed-up file part across the scanned channel history.
     const groups = new Map();
     const zipBackups = new Map();
     const legacyVaultAttachments = new Map();
@@ -1936,7 +1936,7 @@ async function autoRestoreOnStartup() {
       if (!restored && backupLinks.has(rel)) {
         try {
           const link = backupLinks.get(rel);
-          const res = await fetch(link.url, { signal: AbortSignal.timeout(120000) });
+          const res = await fetch(link.url, { signal: AbortSignal.timeout(30000) });
           if (!res.ok) throw new Error(`backup link HTTP ${res.status}`);
           const buf = Buffer.from(await res.arrayBuffer());
           if (buf.length !== link.size) throw new Error('backup link size mismatch');
@@ -2007,7 +2007,14 @@ const onReady = async () => {
   started = true;
   console.log(`Logged in as ${client.user.tag}`);
   // Slash commands are refreshed explicitly with /bot refresh-commands, not on every restart.
-  await autoRestoreOnStartup();
+  // The restore runs in the background so the bot is responsive immediately.
+  autoRestoreOnStartup()
+    .catch((e) => console.error('Startup restore error:', e.message))
+    .then(() => postRestoreStartup())
+    .catch((e) => console.error('Post-restore startup error:', e));
+};
+
+async function postRestoreStartup() {
   try {
     const status = ['online', 'idle', 'dnd', 'invisible'].includes(savedPresence?.status) ? savedPresence.status : 'online';
     await client.user.setPresence({ status, activities: [] });
@@ -2042,7 +2049,7 @@ const onReady = async () => {
       }
     } catch (e) { await alertOwner('Bankroll storage health check failed',e); }
   },5*60*1000);
-};
+}
 let shuttingDown = false;
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, async () => {
@@ -2050,7 +2057,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     shuttingDown = true;
     console.log(`${sig} received: saving a last backup before exit`);
     clearTimeout(backupTimer);
-    await Promise.race([backupData().catch(() => {}), new Promise((r) => setTimeout(r, 20000))]);
+    await Promise.race([backupData().catch(() => {}), new Promise((r) => setTimeout(r, 5000))]);
     process.exit(0);
   });
 }
