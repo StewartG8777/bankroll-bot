@@ -581,7 +581,7 @@ const activeDownloadTokens = new Set();
 function cleanDownloads() {
   const now = Date.now(); let removed = 0;
   for (const [token, dl] of Object.entries(downloads)) {
-    const expired = !dl || !Number.isFinite(Number(dl.expiresAt)) || now > Number(dl.expiresAt);
+    const expired = !dl || (dl.expiresAt != null && Number.isFinite(Number(dl.expiresAt)) && now > Number(dl.expiresAt));
     const missing = !dl?.path || !fs.existsSync(dl.path);
     if ((expired || missing || dl.used) && !activeDownloadTokens.has(token)) {
       if (dl?.path) { try { fs.unlinkSync(dl.path); } catch {} }
@@ -609,8 +609,8 @@ function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download i
   const isZip = /\.zip$/i.test(String(name || ''));
   return new EmbedBuilder().setColor(GREEN).setTitle(label)
     .setDescription(`Your complete **${short(String(name || 'file'), 180)}** is ready. ${isZip ? 'This is one original ZIP archive — no split parts or joining steps.' : 'Your original file is ready to download.'}`)
-    .addFields({ name: 'File type', value: isZip ? 'ZIP archive' : 'File', inline: true }, ...(Number.isFinite(sizeBytes) ? [{ name: 'Size', value: `${(sizeBytes/(1024*1024)).toFixed(2)} MB`, inline: true }] : []), ...(expiresAt ? [{ name: 'Link expires', value: `<t:${Math.floor(expiresAt/1000)}:R>`, inline: true }] : []))
-    .setFooter({ text: expiresAt ? 'Bankroll secure delivery • One-time download link' : 'Bankroll secure delivery' }).setTimestamp();
+    .addFields({ name: 'File type', value: isZip ? 'ZIP archive' : 'File', inline: true }, ...(Number.isFinite(sizeBytes) ? [{ name: 'Size', value: `${(sizeBytes/(1024*1024)).toFixed(2)} MB`, inline: true }] : []), )
+    .setFooter({ text: 'Bankroll secure delivery • One-time download • No time expiry' }).setTimestamp();
 }
 
 function makeDownloadLink(d, paymentIntentId) {
@@ -626,11 +626,11 @@ function makeDownloadLink(d, paymentIntentId) {
     agentId: d.agentId || OWNER_ID,
     vaultKey: d.vaultKey ?? null,
     paymentIntentId: paymentIntentId ?? null,
-    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    expiresAt: null,
     used: false,
   };
   saveDownloads();
-  recordDownloadEvent('link_created', { file: safeName, customerId: d.customerId || OWNER_ID, agentId: d.agentId || OWNER_ID, token, detail: 'One-time link created; expires in 24 hours.' });
+  recordDownloadEvent('link_created', { file: safeName, customerId: d.customerId || OWNER_ID, agentId: d.agentId || OWNER_ID, token, detail: 'One-time download link; no time expiry. Link is invalidated after a successful download.' });
   const slug = (d.description || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '') || 'order';
   return `${BASE_URL}/bankroll-${slug}-download/${token}`;
 }
@@ -3160,7 +3160,7 @@ async function cmdRestore(interaction) {
       already += 1;
       continue;
     }
-    if (target === 'downloads' && (v.used || Date.now() > v.expiresAt)) {
+    if (target === 'downloads' && (v.used || (v.expiresAt != null && Date.now() > Number(v.expiresAt)))) {
       skipped += 1;
       continue;
     }
@@ -4316,7 +4316,7 @@ app.get('/:name/:token', (req, res) => {
   if(downloadAttempts.size>5000){for(const [ip,value] of downloadAttempts)if(Date.now()>value.resetAt)downloadAttempts.delete(ip);}
   if(!/^[a-f0-9]{48,64}$/i.test(token)){recordDownloadEvent('access_denied',{detail:'Malformed download token.'});return res.status(404).send('Not found');}
   const t=downloads[token]; const filesRoot=path.resolve(FILES_DIR)+path.sep; const safePath=t?.path&&path.resolve(String(t.path)).startsWith(filesRoot);
-  if(!t||t.used||activeDownloadTokens.has(token)||Date.now()>t.expiresAt||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
+  if(!t||t.used||activeDownloadTokens.has(token)||(t.expiresAt != null && Date.now()>Number(t.expiresAt))||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
 
   const ua = req.headers['user-agent'] || '';
   if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) {
