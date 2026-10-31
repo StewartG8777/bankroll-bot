@@ -1300,6 +1300,12 @@ const vaultCmd = common(
     )
     .addSubcommand((sub) =>
       sub
+        .setName('export')
+        .setDescription('Export a vault file to this Discord chat')
+        .addStringOption((o) => o.setName('name').setDescription('The vault file to export').setAutocomplete(true).setRequired(true))
+    )
+    .addSubcommand((sub) =>
+      sub
         .setName('remove')
         .setDescription('Remove a file from the vault')
         .addStringOption((o) => o.setName('name').setDescription('The vault key to remove').setAutocomplete(true).setRequired(true))
@@ -2829,6 +2835,50 @@ async function cmdVault(interaction) {
         { name: 'Added At', value: `<t:${Math.floor(item.addedAt / 1000)}:f>`, inline: true }
       );
     return interaction.editReply({ embeds: [embed] });
+  }
+
+  if (sub === 'export') {
+    const key = interaction.options.getString('name');
+    const item = vault[key];
+    if (!item) return interaction.editReply('Vault item `' + key + '` not found.');
+    if (!item.path || !fs.existsSync(item.path)) return interaction.editReply('Vault file `' + key + '` is missing from storage. Re-add it before exporting.');
+
+    const fileName = path.basename(item.originalName || path.basename(item.path));
+    const size = fs.statSync(item.path).size;
+    const readyEmbed = new EmbedBuilder()
+      .setColor(GREEN)
+      .setTitle('Vault export ready')
+      .setDescription('**' + short(fileName, 180) + '** is ready to download.')
+      .addFields(
+        { name: 'Vault key', value: '`' + short(key, 80) + '`', inline: true },
+        { name: 'File size', value: (size / (1024 * 1024)).toFixed(2) + ' MB', inline: true }
+      )
+      .setTimestamp();
+
+    // Try the complete file as a normal Discord attachment first.
+    try {
+      await interaction.editReply({ embeds: [readyEmbed], files: [new AttachmentBuilder(item.path, { name: fileName })], components: [] });
+      recordDownloadEvent('vault_export_attached', { file: fileName, customerId: interaction.user.id, agentId: interaction.user.id, detail: 'Vault key ' + key + '; delivered as a direct Discord attachment.' });
+      recordNotification('vault.export', 'Vault file exported', key + ' exported as a direct Discord attachment.', 'success');
+      return;
+    } catch (attachmentError) {
+      console.warn('Direct vault export attachment failed for ' + key + '; falling back to hosted download: ' + attachmentError.message);
+    }
+
+    if (!BASE_URL) return interaction.editReply({ content: 'Discord could not accept the full file as an attachment, and PUBLIC_URL is not configured for a hosted download link. Set PUBLIC_URL and try again.', embeds: [], files: [], components: [] });
+    try {
+      const url = makeDownloadLink({ path: item.path, name: fileName, customerId: interaction.user.id, agentId: interaction.user.id, vaultKey: key, description: 'vault-export' }, null);
+      const token = url.split('/').pop();
+      const fallbackEmbed = EmbedBuilder.from(readyEmbed)
+        .setDescription('Discord could not accept the full file as an attachment, so a secure download button is ready instead.\n\n**' + short(fileName, 180) + '** — ' + (size / (1024 * 1024)).toFixed(2) + ' MB.')
+        .setFooter({ text: 'The download link is one-time-use and does not expire by time.' });
+      recordDownloadEvent('vault_export_link', { file: fileName, customerId: interaction.user.id, agentId: interaction.user.id, token, detail: 'Vault key ' + key + '; direct attachment failed, hosted link supplied.' });
+      recordNotification('vault.export', 'Vault export link created', key + ' exported using a hosted one-time download link.', 'success');
+      return interaction.editReply({ embeds: [fallbackEmbed], components: [downloadLinkRow(url, /\.zip$/i.test(fileName) ? 'Download ZIP' : 'Download File')], files: [] });
+    } catch (error) {
+      console.error('Vault export fallback failed:', error);
+      return interaction.editReply({ content: 'Could not export `' + key + '`: ' + short(error.message, 250), embeds: [], components: [], files: [] });
+    }
   }
 
   if (sub === 'edit') {
