@@ -15,6 +15,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
   SlashCommandBuilder,
   InteractionContextType,
   ApplicationIntegrationType,
@@ -1445,6 +1446,10 @@ const historyCmd = common(
     .addUserOption((o) => o.setName('user').setDescription('The customer').setRequired(true))
 );
 
+const previewCmd = common(
+  new SlashCommandBuilder().setName('preview').setDescription('Select a customer and preview their Bankroll experience')
+);
+
 const refundCmd = common(
   new SlashCommandBuilder()
     .setName('refund')
@@ -1487,7 +1492,7 @@ const downloadsCmd = common(new SlashCommandBuilder().setName('downloads').setDe
   .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate data and file backup'))
   .addSubcommand((sub) => sub.setName('verify').setDescription('Verify a vault ZIP archive and checksum').addStringOption((o) => o.setName('vault_key').setDescription('Exact vault key').setRequired(true))));
 
-const commands = [bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
+const commands = [bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -3475,6 +3480,68 @@ async function cmdTotal(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
+async function cmdCustomerPreview(interaction) {
+  const ids = new Set();
+  for (const d of Object.values(deliveries)) if (d?.customerId) ids.add(String(d.customerId));
+  for (const m of Object.values(monzoLedger)) if (m?.customerId) ids.add(String(m.customerId));
+  for (const d of Object.values(downloads)) if (d?.customerId && !d.backupDownload) ids.add(String(d.customerId));
+  let sessions = [];
+  try { sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 }); }
+  catch (e) { console.error('Customer preview Stripe lookup failed:', e.message); }
+  for (const x of sessions) if (x.metadata?.customer_id) ids.add(String(x.metadata.customer_id));
+  const choices = [];
+  for (const id of [...ids].slice(0, 25)) {
+    let label = 'Customer';
+    try { const u = await client.users.fetch(id); label = u.username; } catch {}
+    const count = Object.values(deliveries).filter((d) => String(d?.customerId) === id).length +
+      Object.values(monzoLedger).filter((m) => String(m?.customerId) === id).length +
+      sessions.filter((x) => String(x.metadata?.customer_id) === id).length;
+    choices.push({ label: short(label, 65), description: `${count} invoice/order record(s) • ID ${id.slice(-8)}`.slice(0, 100), value: id });
+  }
+  if (!choices.length) return interaction.editReply('No customers found yet. Customers appear here after an invoice or order has been created.');
+  const menu = new StringSelectMenuBuilder().setCustomId('customer_preview_select').setPlaceholder('Choose a customer to preview').addOptions(choices);
+  const row = new ActionRowBuilder().addComponents(menu);
+  return interaction.editReply({ content: `**Customer preview**\nSelect someone below to see their invoice history, payment state, delivery message and the buttons they would see. This is a private, read-only preview.`, components: [row] });
+}
+
+async function onCustomerPreviewSelect(interaction) {
+  if (!allowed.has(interaction.user.id)) return interaction.reply({ content: 'You are not allowed to use this preview.', ephemeral: true });
+  const customerId = interaction.values?.[0];
+  if (!/^\d{17,20}$/.test(String(customerId || ''))) return interaction.update({ content: 'Invalid customer selection.', embeds: [], components: [] });
+  let customer;
+  try { customer = await client.users.fetch(customerId); } catch { customer = { username: 'Unknown customer', id: customerId }; }
+  let sessions = [];
+  try {
+    sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 });
+    sessions = sessions.filter((x) => String(x.metadata?.customer_id || '') === customerId);
+  } catch (e) { console.error('Customer preview session lookup failed:', e.message); }
+  const localOrders = Object.entries(deliveries).filter(([, d]) => String(d?.customerId || '') === customerId);
+  const monzo = Object.entries(monzoLedger).filter(([, m]) => String(m?.customerId || '') === customerId);
+  const links = Object.values(downloads).filter((d) => String(d?.customerId || '') === customerId && !d.backupDownload);
+  const status = (x) => x.payment_status === 'paid' ? 'PAID' : x.status === 'expired' ? 'EXPIRED' : 'AWAITING PAYMENT';
+  const rows = [
+    ...sessions.map((x) => ({ at: x.created, text: `**${status(x)}** • ${money((x.amount_total || 0) / 100, x.currency)} • ${short(x.metadata?.description || 'Bankroll order', 65)} • Card` })),
+    ...monzo.map(([key, x]) => ({ at: tsec(x.createdAt || x.paidAt), text: `**${String(x.status || 'open').toUpperCase()}** • ${money(x.amount, x.currency || 'gbp')} • ${short(x.description || 'Monzo invoice', 65)} • Monzo` })),
+    ...localOrders.filter(([key, d]) => d.type !== 'monzo' && !sessions.some((x) => x.id === key)).map(([key, d]) => ({ at: tsec(d.savedAt || Date.now()), text: `**${d.paid || d.paymentConfirmed ? 'PAID' : 'AWAITING PAYMENT'}** • ${money(d.amount || 0, d.currency || CURRENCY)} • ${short(d.description || d.name || 'Order', 65)} • Card` })),
+  ].sort((a, b) => b.at - a.at);
+  const activeLinks = links.filter((d) => !d.used && (d.expiresAt == null || Date.now() < Number(d.expiresAt))).length;
+  const completed = downloadHistory.filter((e) => e.type === 'download_completed' && String(e.customerId || '') === customerId).length;
+  const latestDelivery = localOrders.map(([, d]) => d).sort((a, b) => Number(b.deliveredAt || b.paymentConfirmedAt || b.savedAt || 0) - Number(a.deliveredAt || a.paymentConfirmedAt || a.savedAt || 0))[0];
+  const embed = new EmbedBuilder().setColor(GREEN).setTitle(`Customer view • ${short(customer.username, 180)}`)
+    .setDescription(rows.length ? rows.slice(0, 15).map((x) => x.text).join('\n') : 'No invoice records found for this customer.')
+    .addFields(
+      { name: 'Customer', value: `<@${customerId}>\n\`${customerId}\``, inline: true },
+      { name: 'Orders / invoices', value: String(rows.length), inline: true },
+      { name: 'Active download links', value: String(activeLinks), inline: true },
+      { name: 'Completed downloads', value: String(completed), inline: true },
+      { name: 'Customer-facing experience', value: latestDelivery?.paid || latestDelivery?.paymentConfirmed
+        ? (latestDelivery?.fallbackLink || links.length ? 'After payment: **Your download is ready** embed with a one-time **Download ZIP / Download File** button.\n\nIf sent as a Discord attachment, they receive the file directly instead of a hosted-link button.' : 'After payment: a **Your download is ready** embed with the ZIP/file attached directly in the DM.')
+        : 'Before payment: invoice details and payment instructions/buttons (depending on card or Monzo method).', inline: false },
+      { name: 'Download status', value: activeLinks ? 'A hosted one-time link is available.' : completed ? 'A download has completed; no active hosted link remains.' : 'No active hosted download link recorded.', inline: false }
+    ).setFooter({ text: 'Private read-only preview • No customer messages sent • No payment or download actions performed' }).setTimestamp();
+  return interaction.update({ content: '', embeds: [embed], components: [] });
+}
+
 async function cmdCustomer(interaction) {
   const user = interaction.options.getUser('user');
   let card = [];
@@ -4170,6 +4237,7 @@ client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.isAutocomplete()) return await onAutocomplete(interaction);
     if (interaction.isButton()) return await onButton(interaction);
+    if (interaction.isStringSelectMenu() && interaction.customId === 'customer_preview_select') return await onCustomerPreviewSelect(interaction);
     if (!interaction.isChatInputCommand()) return;
     if (!commands.some((c) => c.name === interaction.commandName)) return;
 
