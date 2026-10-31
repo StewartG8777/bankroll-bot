@@ -302,9 +302,15 @@ function scheduleDeliveryRetry(key, paymentIntentId, delayMs) {
   const d = deliveries[key];
   if (!d || d.deliveryComplete || deliveryRetryTimers.has(key)) return false;
   const attempts = Number(d.deliveryAttempts || 0);
-  if (attempts >= 8) { alertOwner('Automatic delivery retry limit reached', new Error(`Order ${key} still needs manual delivery.`)); return false; }
-  const delays = [15000, 60000, 300000, 900000, 1800000];
-  const delay = Math.max(1000, Number(delayMs || delays[Math.min(attempts, delays.length - 1)]));
+  // Never abandon a confirmed payment. Back off to a maximum of six hours instead
+  // of stopping after eight attempts; alert the owner at most once every six hours.
+  const delays = [15000, 60000, 300000, 900000, 1800000, 3600000, 7200000, 14400000, 21600000];
+  const retryDelay = delays[Math.min(attempts, delays.length - 1)];
+  const delay = Math.max(1000, Number(delayMs || retryDelay));
+  if (attempts >= 8 && Date.now() - Number(d.lastDeliveryRetryAlertAt || 0) >= 6 * 60 * 60 * 1000) {
+    d.lastDeliveryRetryAlertAt = Date.now();
+    alertOwner('Paid delivery still pending', new Error(`Order ${key} has not delivered after ${attempts} attempts. Bankroll will keep retrying every six hours. If the file is present, use /delivery resend with order ${key}; if it is missing, restore it to the vault first.`));
+  }
   d.nextDeliveryRetryAt = Date.now() + delay;
   if (paymentIntentId) d.paymentIntentId = paymentIntentId;
   try { atomicWrite(DELIVERIES_FILE, JSON.stringify(deliveries)); } catch {}
@@ -314,7 +320,11 @@ function scheduleDeliveryRetry(key, paymentIntentId, delayMs) {
     if (!current || current.deliveryComplete) return;
     current.deliveryAttempts = Number(current.deliveryAttempts || 0) + 1;
     current.lastDeliveryAttemptAt = Date.now(); delete current.nextDeliveryRetryAt; saveDeliveries();
-    try { await deliverFile(key, paymentIntentId || current.paymentIntentId || null); } catch (e) { alertOwner('Automatic delivery retry failed', e); }
+    try { await deliverFile(key, paymentIntentId || current.paymentIntentId || null); }
+    catch (e) {
+      console.error(`Automatic delivery retry failed for ${key}:`, e);
+      scheduleDeliveryRetry(key, paymentIntentId || current.paymentIntentId || null);
+    }
   }, delay);
   timer.unref?.(); deliveryRetryTimers.set(key, timer); return true;
 }
@@ -925,26 +935,36 @@ async function backupDataOnce() {
       const signature = `${st.size}:${sha256}`;
       if (blobBackedUp[rel] === signature) continue;
 
-      // Keep original files intact and serve them through the hosted recovery route.
-      // AdmZip compression is synchronous and can block Discord interactions for
-      // many seconds, especially when the source file is already a ZIP archive.
-      if (BASE_URL) {
-        try {
-          const recoveryUrl = `${BASE_URL}/bankroll-backup-file/${backupToken(rel)}`;
+      // Back up the actual file bytes in Discord, not a URL to the running web
+      // instance. Hosted URLs can become stale after a restart/redeploy and return 404.
+      // 8 MiB parts stay below Discord's common attachment limits; the restore
+      // parser verifies the original size and SHA-256 before writing the file.
+      const MAX_DISCORD_BACKUP_FILE = 150 * 1024 * 1024;
+      const PART_BYTES = 8 * 1024 * 1024;
+      if (st.size > MAX_DISCORD_BACKUP_FILE) {
+        console.error(`Vault file exceeds the 150 MiB Discord backup limit and was not marked backed up: ${rel} (${st.size} bytes).`);
+        continue;
+      }
+      try {
+        const buffer = fs.readFileSync(fp);
+        const total = Math.ceil(buffer.length / PART_BYTES);
+        for (let part = 1; part <= total; part++) {
+          const start = (part - 1) * PART_BYTES;
+          const piece = buffer.subarray(start, Math.min(start + PART_BYTES, buffer.length));
           await ch.send({
-            content: `datafilelink:${rel}|${st.size}|${recoveryUrl}`,
+            content: `datafile-v2:${rel}|${st.size}|${sha256}|${part}/${total}`,
+            files: [new AttachmentBuilder(piece, { name: `bankroll-backup-part-${part}-of-${total}.bin` })],
             allowedMentions: { parse: [] },
           });
-          blobBackedUp[rel] = signature;
-          lastBackupAt = Date.now();
-          console.log(`Stored original file for recovery without recompression: ${rel} (${(st.size / (1024 * 1024)).toFixed(1)} MB).`);
-          continue;
-        } catch (linkError) {
-          console.error(`Hosted-link backup failed for ${rel}:`, linkError.message);
         }
+        blobBackedUp[rel] = signature;
+        lastBackupAt = Date.now();
+        console.log(`Backed up ${rel} to Discord as ${total} verified part(s).`);
+      } catch (attachmentError) {
+        console.error(`Discord attachment backup failed for ${rel}:`, attachmentError.message);
+        scheduleBackup();
+        break;
       }
-      scheduleBackup();
-      break;
     }
   } catch (e) {
     console.error('Backup failed:', e.message);
@@ -1102,7 +1122,8 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
 
   if (!noFile && !dlink && (!d.path || !fs.existsSync(d.path))) {
     d.deliveryError = 'The paid file is missing from storage.'; d.paymentConfirmed = true; d.paid = true; saveDeliveries();
-    if (owner) await owner.send(`Payment received for ${key}, but the file "${d.name}" is missing. The paid order has been retained for recovery; please restore the file or send it manually to <@${d.customerId}>.`).catch(() => {});
+    if (owner) await owner.send(`Payment received for ${key}, but the file "${d.name}" is missing. The paid order is retained and automatic checks will continue. Restore the original file to the vault, then use /delivery resend with order ${key}.`).catch(() => {});
+    scheduleDeliveryRetry(key, paymentIntentId, 6 * 60 * 60 * 1000);
     return;
   }
 
@@ -2042,9 +2063,11 @@ const onReady = async () => {
       fs.accessSync(DATA_DIR, fs.constants.W_OK);
       if (restoreDone && lastBackupAt && Date.now() - lastBackupAt > 18*60*60*1000) await alertOwner('Backup health warning', new Error('No successful backup has been recorded in over 18 hours.'));
       for (const [key,d] of Object.entries(deliveries)) {
-        if ((d?.paymentConfirmed || d?.paid) && !deliveryRetryTimers.has(key) && !d.deliveryComplete && Number(d.deliveryAttempts || 0) < 8) {
+        if ((d?.paymentConfirmed || d?.paid) && !deliveryRetryTimers.has(key) && !d.deliveryComplete) {
           if (d.deliveryError && d.deliveryError.includes('missing from storage') && d.path && fs.existsSync(d.path)) delete d.deliveryError;
-          if (!d.deliveryError) scheduleDeliveryRetry(key,d.paymentIntentId || null,Math.max(1000,Number(d.nextDeliveryRetryAt || Date.now())-Date.now()));
+          if (!d.deliveryError || (d.deliveryError.includes('missing from storage') && (!d.path || !fs.existsSync(d.path)))) {
+            scheduleDeliveryRetry(key, d.paymentIntentId || null, Math.max(1000, Number(d.nextDeliveryRetryAt || Date.now()) - Date.now()));
+          }
         }
       }
     } catch (e) { await alertOwner('Bankroll storage health check failed',e); }
@@ -4179,13 +4202,12 @@ async function onAutocomplete(interaction) {
     if (interaction.commandName === 'cancel') {
       const typed = String(interaction.options.getFocused() || '').toLowerCase();
       const page = interaction.options.getInteger('page') || 1;
-      const [openResult, completeResult, expiredResult] = await Promise.allSettled([
+      const [openResult, completeResult] = await Promise.allSettled([
         stripe.checkout.sessions.list({ limit: 100, status: 'open' }),
         stripe.checkout.sessions.list({ limit: 100, status: 'complete' }),
-        stripe.checkout.sessions.list({ limit: 100, status: 'expired' }),
       ]);
       const sessions = [];
-      for (const [label, result] of [['open', openResult], ['complete', completeResult], ['expired', expiredResult]]) {
+      for (const [label, result] of [['open', openResult], ['complete', completeResult]]) {
         if (result.status === 'fulfilled') {
           sessions.push(...result.value.data.map((session) => ({ ...session, _listStatus: label })));
         } else {
@@ -4196,33 +4218,33 @@ async function onAutocomplete(interaction) {
       const card = sessions
         .filter((session) => session.metadata?.agent_id)
         .map((session) => {
-          const status = session._listStatus === 'open'
-            ? 'UNPAID'
-            : session._listStatus === 'expired'
-              ? 'EXPIRED'
-              : session.payment_status === 'paid' || session.payment_status === 'no_payment_required'
-                ? 'PAID'
-                : 'UNPAID';
+          const paid = session._listStatus === 'complete' &&
+            (session.payment_status === 'paid' || session.payment_status === 'no_payment_required');
+          const status = paid ? 'PAID' : 'UNPAID';
           return {
             at: Number(session.created || 0) * 1000,
             value: session.id,
             search: `${session.metadata?.description || ''} ${session.id} ${session.metadata?.customer_id || ''}`.toLowerCase(),
             name: `[Card] [${status}] ${money((session.amount_total ?? 0) / 100, session.currency || CURRENCY)} - ${short(String(session.metadata?.description || 'Purchase'), 32)} - ${session.id}`.slice(0, 100),
           };
-        });
+        })
+        .filter((purchase) => purchase.name.includes('[PAID]') || purchase.name.includes('[UNPAID]'));
 
       const monzo = Object.entries(monzoLedger).map(([key, entry]) => {
         const delivery = deliveries[key];
-        let status = String(entry.status || (delivery?.paid ? 'paid' : 'open')).toLowerCase();
-        if (status === 'open' && Date.now() >= (entry.expiresAt ?? (entry.createdAt || Date.now()) + MONZO_OPEN_MS)) status = 'expired';
-        const displayStatus = status === 'paid' ? 'PAID' : status === 'open' ? 'UNPAID' : status.toUpperCase();
+        const rawStatus = String(entry.status || (delivery?.paid ? 'paid' : 'open')).toLowerCase();
+        const expired = rawStatus === 'open' &&
+          Date.now() >= (entry.expiresAt ?? (entry.createdAt || Date.now()) + MONZO_OPEN_MS);
+        const paid = rawStatus === 'paid' || !!delivery?.paid || !!delivery?.paymentConfirmed;
+        if (expired || (!paid && rawStatus !== 'open')) return null;
+        const status = paid ? 'PAID' : 'UNPAID';
         return {
-          at: Number(entry.paidAt || entry.cancelledAt || entry.createdAt || delivery?.savedAt || 0),
+          at: Number(entry.paidAt || entry.createdAt || delivery?.savedAt || 0),
           value: key,
           search: `${entry.description || ''} ${entry.reference || ''} ${key} ${entry.customerId || ''}`.toLowerCase(),
-          name: `[Monzo] [${displayStatus}] ${money(Number(entry.amount || 0), entry.currency || 'gbp')} - ${short(String(entry.description || 'Purchase'), 24)} - ${entry.reference || key}`.slice(0, 100),
+          name: `[Monzo] [${status}] ${money(Number(entry.amount || 0), entry.currency || 'gbp')} - ${short(String(entry.description || 'Purchase'), 24)} - ${entry.reference || key}`.slice(0, 100),
         };
-      });
+      }).filter(Boolean);
 
       const purchases = [...monzo, ...card]
         .filter((purchase) => !typed || purchase.search.includes(typed) || purchase.name.toLowerCase().includes(typed))
