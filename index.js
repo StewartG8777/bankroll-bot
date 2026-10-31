@@ -777,18 +777,8 @@ async function deliverFile(key, paymentIntentId) {
     console.log('Could not post in original channel:', e.message);
   }
 
-  if (!sentTo) {
-    try {
-      const u = await client.users.fetch(d.customerId);
-      const msg = await u.send(payload());
-      msgUrl = msg.url;
-      reachedCustomer = true;
-      sentTo = "the customer's DMs";
-    } catch (e) {
-      console.log('Could not DM customer:', e.message);
-    }
-  }
-
+  // The customer is never DMed. If neither of the above worked, only the owner gets the link/file,
+  // and the customer can still press "Get my file" on the invoice message.
   if (!sentTo && owner) {
     try {
       await owner.send(
@@ -807,27 +797,33 @@ async function deliverFile(key, paymentIntentId) {
   }
 
   if (sentTo) {
-    if (d.path && !hosted) {
-      try {
-        fs.unlinkSync(d.path);
-      } catch {}
-    }
-    delete deliveries[key];
-    saveDeliveries();
-    if (reachedCustomer && paymentIntentId) {
-      await recordInStripe(paymentIntentId, {
-        delivered_at: new Date().toISOString(),
-        delivered_to: sentTo.slice(0, 200),
-        delivered_file: d.name.slice(0, 100),
-        delivery_message: msgUrl ?? '',
-      });
-    }
-    if (owner && !ownerGotIt) {
-      await notifyOwner({
-        content: noFile
-          ? `Payment confirmed for "${d.description || 'invoice'}" and <@${d.customerId}> was told (${sentTo}).`
-          : `"${d.name}" was sent to ${sentTo}.`,
-      });
+    if (!reachedCustomer) {
+      // Only the owner got it: keep the delivery so the customer can still press "Get my file".
+      d.paid = true;
+      saveDeliveries();
+    } else {
+      if (d.path && !hosted) {
+        try {
+          fs.unlinkSync(d.path);
+        } catch {}
+      }
+      delete deliveries[key];
+      saveDeliveries();
+      if (paymentIntentId) {
+        await recordInStripe(paymentIntentId, {
+          delivered_at: new Date().toISOString(),
+          delivered_to: sentTo.slice(0, 200),
+          delivered_file: d.name.slice(0, 100),
+          delivery_message: msgUrl ?? '',
+        });
+      }
+      if (owner) {
+        await notifyOwner({
+          content: noFile
+            ? `Payment confirmed for "${d.description || 'invoice'}" and <@${d.customerId}> was told (${sentTo}).`
+            : `"${d.name}" was sent to ${sentTo}.`,
+        });
+      }
     }
   }
 }
@@ -1355,9 +1351,16 @@ function checkinEmbed({ pct, customerId, amount, currency, description, expiresS
   return e;
 }
 
-function checkinRow(payUrl) {
-  if (!payUrl) return [];
-  return [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('Pay link').setStyle(ButtonStyle.Link).setURL(payUrl))];
+// Buttons under a check-in: "Go to invoice" (jumps to the original invoice message) and the pay link.
+function checkinRow(payUrl, msgUrl) {
+  const row = new ActionRowBuilder();
+  if (msgUrl) {
+    row.addComponents(new ButtonBuilder().setLabel('Go to invoice').setStyle(ButtonStyle.Link).setURL(msgUrl));
+  }
+  if (payUrl) {
+    row.addComponents(new ButtonBuilder().setLabel('Pay link').setStyle(ButtonStyle.Link).setURL(payUrl));
+  }
+  return row.components.length ? [row] : [];
 }
 
 async function sendCheckin(agentId, payload, tag) {
@@ -1385,10 +1388,11 @@ function scheduleAgentReminder({ customerId, agentId, sessionId, amount, descrip
         const s = await stripe.checkout.sessions.retrieve(sessionId);
         if (s.status !== 'open' || s.metadata?.[`agent_notified_${pct}`]) return;
 
-        const embed = checkinEmbed({ pct, customerId, amount, currency, description, expiresSec: expiresAt, msgUrl: s.metadata?.invoice_msg_url });
+        const msgUrl = s.metadata?.invoice_msg_url;
+        const embed = checkinEmbed({ pct, customerId, amount, currency, description, expiresSec: expiresAt, msgUrl });
         const delivered = await sendCheckin(
           agentId,
-          { embeds: [embed], components: checkinRow(s.url) },
+          { embeds: [embed], components: checkinRow(s.url, msgUrl) },
           `${pct}% reminder`
         );
         if (delivered) {
@@ -1447,7 +1451,7 @@ function scheduleMonzoReminder(m) {
         const payUrl = MONZO_LINK ? `${MONZO_LINK}/${e.amount.toFixed(2)}?d=${encodeURIComponent(e.reference)}` : null;
         const delivered = await sendCheckin(
           e.agentId,
-          { embeds: [embed], components: checkinRow(payUrl) },
+          { embeds: [embed], components: checkinRow(payUrl, e.msgUrl) },
           `Monzo ${pct}% reminder`
         );
         if (delivered) {
@@ -1666,7 +1670,10 @@ async function sendStripeCheckout(interaction) {
 
     const sentInvoice = await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
     if (sentInvoice?.url) {
-      stripe.checkout.sessions.update(session.id, { metadata: { invoice_msg_url: sentInvoice.url } }).catch(() => {});
+      // Saved so the 25/50/75% check-ins can link back to this invoice message.
+      await stripe.checkout.sessions
+        .update(session.id, { metadata: { invoice_msg_url: sentInvoice.url } })
+        .catch((e) => console.error('Could not save invoice message link:', e.message));
     }
     
     // GUARANTEED LOGGING (invoice + a copy of the file, any size)
@@ -1803,8 +1810,8 @@ async function sendMonzoInvoice(interaction) {
       );
     embed.addFields({ name: 'Pay by', value: `<t:${tsec(monzoLedger[key].expiresAt)}:R>` });
     if (MONZO_PAYMENT_DETAILS) embed.addFields({ name: 'Pay to', value: MONZO_PAYMENT_DETAILS.replace(/\\n/g, '\n') });
-    if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (sent here as soon as payment lands)` });
-    if (linkUrl) embed.addFields({ name: 'Download', value: 'Link sent here as soon as payment lands' });
+    if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (sent here as soon as payment lands, or press Get my file)` });
+    if (linkUrl) embed.addFields({ name: 'Download', value: 'Link sent here as soon as payment lands, or press Get my file' });
     embed
       .addFields(
         { name: 'Generated In Guild', value: where.guild },
@@ -2706,31 +2713,23 @@ async function onGetFile(interaction) {
     return interaction.reply({ content: 'Only the customer can get this file.', ephemeral: true });
   }
 
+  let checkPi = null;
   if (d.type === 'monzo') {
     if (!d.paid) {
       return interaction.reply({ content: 'Payment has not been received yet.', ephemeral: true });
     }
-    await interaction.reply({ content: 'Sending your file now.', ephemeral: true });
-    return deliverFile(key, null);
-  }
-
-  const session = await stripe.checkout.sessions.retrieve(key);
-  if (session.payment_status !== 'paid') {
-    return interaction.reply({
-      content: 'Payment has not been received yet.',
-      ephemeral: true,
-    });
-  }
-
-  const checkPi = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
-  if (checkPi) {
-    const pi = await stripe.paymentIntents.retrieve(checkPi, { expand: ['latest_charge'] });
-    if (pi.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.refunded) {
-      discardPending(key);
-      return interaction.reply({
-        content: 'This payment was refunded.',
-        ephemeral: true,
-      });
+  } else {
+    const session = await stripe.checkout.sessions.retrieve(key);
+    if (session.payment_status !== 'paid') {
+      return interaction.reply({ content: 'Payment has not been received yet.', ephemeral: true });
+    }
+    checkPi = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
+    if (checkPi) {
+      const pi = await stripe.paymentIntents.retrieve(checkPi, { expand: ['latest_charge'] });
+      if (pi.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.refunded) {
+        discardPending(key);
+        return interaction.reply({ content: 'This payment was refunded.', ephemeral: true });
+      }
     }
   }
 
