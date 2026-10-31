@@ -502,6 +502,15 @@ function saveLinkDelivery(key, url, interaction, customer) {
 }
 
 const DOWNLOADS_FILE = path.join(DATA_DIR, 'downloads.json');
+const DOWNLOAD_HISTORY_FILE = path.join(DATA_DIR, 'download_history.json');
+let downloadHistory = [];
+try { const h = JSON.parse(fs.readFileSync(DOWNLOAD_HISTORY_FILE, 'utf8')); if (Array.isArray(h)) downloadHistory = h.slice(-500); } catch {}
+function recordDownloadEvent(type, details = {}) {
+  const entry = { id: crypto.randomUUID(), type, file: short(String(details.file || 'Unknown file'), 140), customerId: details.customerId || null, agentId: details.agentId || null, token: details.token ? String(details.token).slice(0, 12) : null, detail: short(String(details.detail || ''), 300), at: Date.now() };
+  downloadHistory.push(entry); if (downloadHistory.length > 500) downloadHistory = downloadHistory.slice(-500);
+  try { atomicWrite(DOWNLOAD_HISTORY_FILE, JSON.stringify(downloadHistory, null, 2)); } catch (e) { console.error('Could not save download history:', e.message); }
+  scheduleBackup(); return entry;
+}
 let downloads = {};
 try {
   downloads = JSON.parse(fs.readFileSync(DOWNLOADS_FILE, 'utf8'));
@@ -514,22 +523,46 @@ const saveDownloads = () => {
   }
   scheduleBackup();
 };
+const activeDownloadTokens = new Set();
+
 function cleanDownloads() {
-  for (const [t, dl] of Object.entries(downloads)) {
-    if (Date.now() > dl.expiresAt || !dl?.path || !fs.existsSync(dl.path)) {
-      try {
-        fs.unlinkSync(dl.path);
-      } catch {}
-      delete downloads[t];
+  const now = Date.now(); let removed = 0;
+  for (const [token, dl] of Object.entries(downloads)) {
+    const expired = !dl || !Number.isFinite(Number(dl.expiresAt)) || now > Number(dl.expiresAt);
+    const missing = !dl?.path || !fs.existsSync(dl.path);
+    if ((expired || missing || dl.used) && !activeDownloadTokens.has(token)) {
+      if (dl?.path) { try { fs.unlinkSync(dl.path); } catch {} }
+      delete downloads[token]; removed++;
+      if (expired) recordDownloadEvent('expired', { file: dl?.name, customerId: dl?.customerId, token, detail: 'Expired link/file removed by cleanup.' });
     }
   }
-  saveDownloads();
+  try { const activePaths = new Set(Object.values(downloads).map((d) => path.resolve(String(d?.path || ''))));
+    for (const name of fs.readdirSync(FILES_DIR)) { const fp = path.join(FILES_DIR,name); try { const st=fs.statSync(fp); if(st.isFile() && now-st.mtimeMs>24*60*60*1000 && /^(download_|backup_download_)/.test(name) && !activePaths.has(path.resolve(fp))) fs.unlinkSync(fp); } catch {} }
+  } catch {}
+  saveDownloads(); if (removed) console.log(`Download cleanup removed ${removed} expired, used, or missing link record(s).`); return removed;
 }
 cleanDownloads();
 setInterval(cleanDownloads, 60 * 60 * 1000);
 
+function verifyZipIntegrity(filePath) {
+  if (!/\.zip$/i.test(String(filePath || ''))) return { isZip: false, entries: 0 };
+  if (!filePath || !fs.existsSync(filePath)) throw new Error('ZIP file is missing.');
+  const zip = new AdmZip(filePath); const entries = zip.getEntries();
+  if (!entries.length) throw new Error('The ZIP archive is empty or invalid.');
+  if (typeof zip.test === 'function' && zip.test() === false) throw new Error('ZIP integrity check failed (CRC/checksum error).');
+  return { isZip: true, entries: entries.length };
+}
+function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download is ready') {
+  const isZip = /\.zip$/i.test(String(name || ''));
+  return new EmbedBuilder().setColor(GREEN).setTitle(label)
+    .setDescription(`Your complete **${short(String(name || 'file'), 180)}** is ready. ${isZip ? 'This is one original ZIP archive — no split parts or joining steps.' : 'Your original file is ready to download.'}`)
+    .addFields({ name: 'File type', value: isZip ? 'ZIP archive' : 'File', inline: true }, ...(Number.isFinite(sizeBytes) ? [{ name: 'Size', value: `${(sizeBytes/(1024*1024)).toFixed(2)} MB`, inline: true }] : []), ...(expiresAt ? [{ name: 'Link expires', value: `<t:${Math.floor(expiresAt/1000)}:R>`, inline: true }] : []))
+    .setFooter({ text: 'Bankroll secure delivery • One-time download link' }).setTimestamp();
+}
+
 function makeDownloadLink(d, paymentIntentId) {
   if (!d?.path || !fs.existsSync(d.path)) throw new Error('The source file is no longer available.');
+  verifyZipIntegrity(d.path);
   const token = crypto.randomBytes(24).toString('hex');
   const safeName = path.basename(String(d.name || 'download.zip')).replace(/[^\w.\-]/g, '_');
   const downloadPath = path.join(FILES_DIR, `download_${token}_${safeName}`);
@@ -545,6 +578,7 @@ function makeDownloadLink(d, paymentIntentId) {
     used: false,
   };
   saveDownloads();
+  recordDownloadEvent('link_created', { file: safeName, customerId: d.customerId || OWNER_ID, agentId: d.agentId || OWNER_ID, token, detail: 'One-time link created; expires in 24 hours.' });
   const slug = (d.description || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '') || 'order';
   return `${BASE_URL}/bankroll-${slug}-download/${token}`;
 }
@@ -567,6 +601,7 @@ function makeBackupDownloadLink(buffer, name) {
     backupDownload: true,
   };
   saveDownloads();
+  recordDownloadEvent('backup_link_created', { file: safeName, customerId: OWNER_ID, token, detail: 'One-time backup ZIP link created; expires in 24 hours.' });
   return `${BASE_URL}/bankroll-backup-download/${token}`;
 }
 
@@ -709,7 +744,7 @@ async function backupDataOnce() {
   }
 
   try {
-    const jsonNames = ['deliveries.json', 'downloads.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json'];
+    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json'];
     const files = [];
     for (const name of jsonNames) {
       const fp = path.join(DATA_DIR, name);
@@ -880,6 +915,7 @@ async function deliverFile(key, paymentIntentId) {
   try { owner = await client.users.fetch(OWNER_ID); } catch {}
 
   const noFile = !d.link && !d.path;
+  if(d.path && fs.existsSync(d.path)){try{verifyZipIntegrity(d.path);}catch(e){recordDownloadEvent('verification_failed',{file:d.name,customerId:d.customerId,agentId:d.agentId,detail:e.message});if(owner)await owner.send(`Download blocked: **${d.name}** failed ZIP integrity verification. The paid file was not sent. ${short(e.message,180)}`).catch(()=>{});return;}}
   let dlink = d.link || null;
   let hosted = false;
 
@@ -918,7 +954,7 @@ async function deliverFile(key, paymentIntentId) {
     if (dlink) {
       return {
         content: `<@${d.customerId}> payment received. Your complete ${isZip ? 'ZIP' : 'file'} is ready. The secure download link works once and expires in 24 hours.`,
-        embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Your download is ready').setDescription(`Download the complete **${d.name}** using the button below. This is one original file — no split archives or joining steps.`)],
+        embeds: [buildDownloadEmbed(d.name, downloads[dlink.split('/').pop()]?.expiresAt, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined)],
         components: [downloadLinkRow(dlink, isZip ? 'Download ZIP' : 'Download File')],
         allowedMentions: { parse: [] },
       };
@@ -1326,7 +1362,14 @@ const setupCmd = new SlashCommandBuilder()
   .setIntegrationTypes([ApplicationIntegrationType.GuildInstall])
   .setContexts([InteractionContextType.Guild]);
 
-const commands = [bankrollCmd, monzoCmd, vaultCmd, sendfileCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
+const downloadsCmd = common(new SlashCommandBuilder().setName('downloads').setDescription('Manage secure downloads, history and backups (admin only)')
+  .addSubcommand((sub) => sub.setName('history').setDescription('View recent download activity').addIntegerOption((o) => o.setName('count').setDescription('Number of events to show').setMinValue(1).setMaxValue(25)))
+  .addSubcommand((sub) => sub.setName('cleanup').setDescription('Remove expired and used download files/links'))
+  .addSubcommand((sub) => sub.setName('regenerate').setDescription('Create a fresh secure link for a vault file').addStringOption((o) => o.setName('vault_key').setDescription('Exact vault key').setRequired(true)))
+  .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate data and file backup'))
+  .addSubcommand((sub) => sub.setName('verify').setDescription('Verify a vault ZIP archive and checksum').addStringOption((o) => o.setName('vault_key').setDescription('Exact vault key').setRequired(true))));
+
+const commands = [bankrollCmd, monzoCmd, vaultCmd, sendfileCmd, downloadsCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -1368,13 +1411,14 @@ async function autoRestoreOnStartup() {
     const targets = {
       'deliveries.json': DELIVERIES_FILE,
       'downloads.json': DOWNLOADS_FILE,
+      'download_history.json': DOWNLOAD_HISTORY_FILE,
       'vault.json': VAULT_FILE,
       'monzo_payments.json': MONZO_FILE,
       'notifications.json': NOTIFICATIONS_FILE,
       'scheduled_sends.json': SEND_JOBS_FILE,
     };
     const isValidJsonFor = (name, value) => {
-      if (name === 'notifications.json') return Array.isArray(value);
+      if (name === 'notifications.json' || name === 'download_history.json') return Array.isArray(value);
       return !!value && typeof value === 'object' && !Array.isArray(value);
     };
     const localNeedsRestore = (name, fp) => {
@@ -1432,6 +1476,7 @@ async function autoRestoreOnStartup() {
     // Reload database objects after importing the newest valid snapshots.
     try { deliveries = JSON.parse(fs.readFileSync(DELIVERIES_FILE, 'utf8')); } catch {}
     try { downloads = JSON.parse(fs.readFileSync(DOWNLOADS_FILE, 'utf8')); } catch {}
+    try { const h = JSON.parse(fs.readFileSync(DOWNLOAD_HISTORY_FILE, 'utf8')); if (Array.isArray(h)) downloadHistory = h.slice(-500); } catch {}
     try { vault = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8')); } catch {}
     try { monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8')); } catch {}
     try {
@@ -2444,6 +2489,33 @@ function replaceSpawnCode(zipBuf, oldCode, newCode) {
 // SPAWNCODE-TOOLS-END
 
 // ---------- Vault Command Handler ----------
+async function cmdDownloads(interaction) {
+  if (!allowed.has(interaction.user.id)) return interaction.editReply('Only authorized admins can manage downloads.');
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'history') {
+    const count = interaction.options.getInteger('count') || 15; const rows = downloadHistory.slice(-count).reverse();
+    if (!rows.length) return interaction.editReply('No download activity has been recorded yet.');
+    const lines = rows.map((e) => `${e.type.includes('failed') || e.type.includes('denied') || e.type.includes('expired') ? '⚠️' : e.type === 'download_completed' ? '✅' : '📦'} <t:${Math.floor(e.at/1000)}:R> **${short(e.type.replace(/_/g,' '),60)}** — ${short(e.file,90)}${e.customerId ? ` — <@${e.customerId}>` : ''}${e.detail ? `\n${short(e.detail,140)}` : ''}`);
+    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(GREY).setTitle(`Download activity (${downloadHistory.length} stored)`).setDescription(lines.join('\n\n').slice(0,3900)).setFooter({ text: 'Audit history is retained across restarts and included in backups.' })] });
+  }
+  if (sub === 'cleanup') { const removed = cleanDownloads(); recordNotification('downloads.cleanup','Download cleanup completed',`${removed} expired, used or missing download record(s) removed.`,'success'); return interaction.editReply(`Cleanup complete. Removed **${removed}** expired, used or missing download record(s).`); }
+  if (sub === 'backup') { await interaction.editReply('Starting an immediate Bankroll backup…'); await backupData(); recordNotification('downloads.backup','Manual backup completed','An immediate backup run was requested from /downloads backup.','success'); return interaction.editReply('Backup run finished. Check #bankroll-backup and the bot logs for any upload errors.'); }
+  const key = interaction.options.getString('vault_key').trim(); const item = vault[key];
+  if (!item?.path || !fs.existsSync(item.path)) return interaction.editReply(`Vault file \`${key}\` is missing.`);
+  if (sub === 'verify') {
+    try { const actualHash=await sha256File(item.path); const size=fs.statSync(item.path).size; const zipInfo=verifyZipIntegrity(item.path); const hashMatches=!item.sha256||item.sha256===actualHash; if(!item.sha256){item.sha256=actualHash;saveVault();}
+      return interaction.editReply({ embeds:[new EmbedBuilder().setColor(hashMatches?GREEN:RED).setTitle(`Download integrity: ${key}`).setDescription(hashMatches?'File exists and the SHA-256 checksum matches.':'Checksum mismatch: do not send this file until checked.').addFields({name:'File',value:short(item.originalName||key,100),inline:true},{name:'Size',value:`${(size/(1024*1024)).toFixed(2)} MB`,inline:true},{name:'ZIP entries',value:zipInfo.isZip?String(zipInfo.entries):'Not a ZIP',inline:true},{name:'SHA-256',value:actualHash}).setTimestamp()] });
+    } catch(e) { recordDownloadEvent('verification_failed',{file:item.originalName||key,detail:e.message}); return interaction.editReply(`ZIP/file verification failed: ${e.message}`); }
+  }
+  if (sub === 'regenerate') {
+    if(!BASE_URL) return interaction.editReply('PUBLIC_URL is not configured, so Bankroll cannot create hosted download links.');
+    try { const zipInfo=verifyZipIntegrity(item.path); const size=fs.statSync(item.path).size; const url=makeDownloadLink({path:item.path,name:item.originalName||path.basename(item.path),customerId:interaction.user.id,agentId:interaction.user.id,vaultKey:key,description:'admin-regenerated-download'},null); const token=url.split('/').pop(); const expiresAt=downloads[token]?.expiresAt;
+      recordDownloadEvent('link_regenerated',{file:item.originalName||key,customerId:interaction.user.id,agentId:interaction.user.id,token,detail:`Admin regenerated a link for vault key ${key}; ZIP entries ${zipInfo.entries||0}.`});
+      return interaction.editReply({embeds:[buildDownloadEmbed(item.originalName||key,expiresAt,size,'Fresh download link generated')],components:[downloadLinkRow(url,/\.zip$/i.test(item.originalName||'')?'Download ZIP':'Download File')]});
+    } catch(e) { recordDownloadEvent('link_regeneration_failed',{file:item.originalName||key,customerId:interaction.user.id,detail:e.message}); return interaction.editReply(`Could not regenerate the link: ${e.message}`); }
+  }
+}
+
 async function cmdVault(interaction) {
   if (!allowed.has(interaction.user.id)) {
     return interaction.reply({ content: 'Only authorized users can manage the vault.', ephemeral: true });
@@ -2478,6 +2550,7 @@ async function cmdVault(interaction) {
       );
     }
 
+    if (/\.zip$/i.test(att.name)) { try { verifyZipIntegrity(filePath); } catch (zipError) { try { fs.unlinkSync(filePath); } catch {} return interaction.editReply(`That ZIP failed its integrity check and was not added: ${short(zipError.message, 220)}`); } }
     vault[key] = {
       path: filePath,
       originalName: att.name,
@@ -3532,7 +3605,7 @@ async function onGetFile(interaction) {
   const getPayload = () => dlink
     ? {
         content: `<@${d.customerId}> here is your secure download. The link works once and expires in 24 hours.`,
-        embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Your download is ready').setDescription(`Download the complete **${d.name}** using the button below. No split ZIPs or joining steps.`)],
+        embeds: [buildDownloadEmbed(d.name, downloads[dlink.split('/').pop()]?.expiresAt, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined)],
         components: [downloadLinkRow(dlink, isZip ? 'Download ZIP' : 'Download File')],
         allowedMentions: { parse: [] },
       }
@@ -3679,6 +3752,7 @@ async function onScheduledSendButton(interaction) {
   if (!item?.path || !fs.existsSync(item.path)) {
     return interaction.update({ content: `The scheduled time has arrived, but vault file \`${job.vaultKey}\` is missing. Re-add it, then contact the bot owner.`, components: [sendfileButton(jobId)] });
   }
+  try{verifyZipIntegrity(item.path);}catch(e){recordDownloadEvent('verification_failed',{file:job.originalName,customerId:interaction.user.id,detail:e.message});return interaction.update({content:`I stopped this delivery because the ZIP failed its integrity check: ${short(e.message,180)}. Please contact the bot owner.`,components:[]});}
 
   job.status = 'sending';
   await interaction.update({ content: `${sendfileProgress(job)}\n\nPreparing your complete ZIP now...`, components: [], allowedMentions: { parse: [] } });
@@ -3808,6 +3882,9 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdVault(interaction);
       case 'sendfile':
         return await startScheduledSend(interaction);
+      case 'downloads':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdDownloads(interaction);
       case 'cancel':
         return await cmdCancel(interaction);
       case 'remind':
@@ -4046,18 +4123,21 @@ app.get('/bankroll-backup-file/:token', (req, res) => {
   fs.createReadStream(fp).on('error', () => res.destroy()).pipe(res);
 });
 
+const downloadAttempts = new Map();
 app.get('/:name/:token', (req, res) => {
   if (!req.params.name.startsWith('bankroll-')) return res.status(404).send('Not found');
-  const token = req.params.token;
-  const t = downloads[token];
-  if (!t || t.used || Date.now() > t.expiresAt || !fs.existsSync(t.path)) {
-    return res.status(410).send('This download link has already been used or has expired.');
-  }
+  const token = req.params.token; const remote=String(req.ip||req.socket?.remoteAddress||'unknown');
+  const attempt=downloadAttempts.get(remote)||{count:0,resetAt:Date.now()+60000}; if(Date.now()>attempt.resetAt){attempt.count=0;attempt.resetAt=Date.now()+60000;} attempt.count++;downloadAttempts.set(remote,attempt);
+  if(attempt.count>40)return res.status(429).send('Too many download attempts. Try again in a minute.');
+  if(!/^[a-f0-9]{48,64}$/i.test(token)){recordDownloadEvent('access_denied',{detail:'Malformed download token.'});return res.status(404).send('Not found');}
+  const t=downloads[token]; const filesRoot=path.resolve(FILES_DIR)+path.sep; const safePath=t?.path&&path.resolve(String(t.path)).startsWith(filesRoot);
+  if(!t||t.used||activeDownloadTokens.has(token)||Date.now()>t.expiresAt||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
+
   const ua = req.headers['user-agent'] || '';
   if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) {
     return res.status(200).send('Download link');
   }
-  t.used = true;
+  t.used = true; activeDownloadTokens.add(token); saveDownloads();
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(t.name)}`);
   let finished = false;
@@ -4066,19 +4146,14 @@ app.get('/:name/:token', (req, res) => {
     try {
       fs.unlinkSync(t.path);
     } catch {}
-    delete downloads[token];
-    saveDownloads();
+    delete downloads[token]; activeDownloadTokens.delete(token); saveDownloads();
+    recordDownloadEvent('download_completed',{file:t.name,customerId:t.customerId,agentId:t.agentId,token,detail:'The complete file was successfully streamed.'});
     notifyOwner({ content: `<@${t.customerId}> downloaded "${t.name}".` });
     recordInStripe(t.paymentIntentId, { downloaded_at: new Date().toISOString() });
   });
-  res.on('close', () => {
-    if (!finished) t.used = false;
-  });
+  res.on('close', () => { if(!finished){t.used=false;activeDownloadTokens.delete(token);saveDownloads();recordDownloadEvent('download_interrupted',{file:t.name,customerId:t.customerId,token,detail:'Connection closed before the file finished; link re-enabled.'});} });
   const stream = fs.createReadStream(t.path);
-  stream.on('error', () => {
-    t.used = false;
-    res.destroy();
-  });
+  stream.on('error', (e) => { t.used=false;activeDownloadTokens.delete(token);saveDownloads();recordDownloadEvent('download_failed',{file:t.name,customerId:t.customerId,token,detail:short(e.message,180)});res.destroy(); });
   stream.pipe(res);
 });
 
