@@ -4796,13 +4796,13 @@ async function cmdSpam(interaction) {
     .setColor(GREY)
     .setTitle('Timed message ready')
     .setDescription(dmMode
-      ? 'Press **Start** to send the repeated message to your own DMs. DM mode uses a slower interval and waits when Discord applies a rate limit.'
-      : 'Press **Start** to begin posting the message below as a reply to this embed.')
+      ? 'Press **Start** to post the repeated message here using a slower interval and automatic rate-limit retries.'
+      : 'Press **Start** to begin posting the message below as a reply to this embed. Bankroll will automatically wait and retry if Discord rate-limits it.')
     .addFields(
       { name: 'Message to repeat', value: message.slice(0, 1024) },
       { name: 'Duration', value: durationMinutes + ' minute(s)', inline: true },
-      { name: 'Destination', value: dmMode ? 'Your DMs' : 'This channel / chat', inline: true },
-      { name: 'Interval', value: dmMode ? 'Every 5 seconds (plus any rate-limit wait)' : 'Every 1 second', inline: true }
+      { name: 'Sending location', value: 'This channel / chat', inline: true },
+      { name: 'Interval', value: dmMode ? 'Every 5 seconds (plus any rate-limit wait)' : 'Every 1 second (plus any rate-limit wait)', inline: true }
     )
     .setFooter({ text: 'Only the person who ran /spam can start or stop this session.' });
   const row = new ActionRowBuilder().addComponents(
@@ -4841,13 +4841,13 @@ async function handleSpamConsent(interaction) {
   await interaction.update({
     embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Spam running')
       .setDescription(request.dmMode
-        ? 'Bankroll is sending the repeated message to your DMs. DM mode waits for Discord rate limits and uses a slower interval.'
-        : 'The message below is being posted as replies to this embed.')
+        ? 'The message is being posted here using slower sending and automatic rate-limit retries.'
+        : 'The message is being posted here. Bankroll will automatically wait and retry if Discord rate-limits it.')
       .addFields(
         { name: 'Repeated message', value: request.message.slice(0, 1024) },
         { name: 'Duration', value: request.durationMinutes + ' minute(s)', inline: true },
-        { name: 'Destination', value: request.dmMode ? 'Your DMs' : 'This channel / chat', inline: true },
-        { name: 'Interval', value: request.dmMode ? 'Every 5 seconds (plus any rate-limit wait)' : 'Every 1 second', inline: true }
+        { name: 'Sending location', value: 'This channel / chat', inline: true },
+        { name: 'Interval', value: request.dmMode ? 'Every 5 seconds (plus any rate-limit wait)' : 'Every 1 second (plus any rate-limit wait)', inline: true }
       )
       .setFooter({ text: 'Press Stop to end the session early.' })],
     components: [new ActionRowBuilder().addComponents(
@@ -4862,33 +4862,57 @@ async function handleSpamConsent(interaction) {
       await session.sourceMessage.reply({ content: 'Message session finished.', allowedMentions: { parse: [] } }).catch(() => {});
       return;
     }
+
     try {
       const messagePayload = { content: session.message, allowedMentions: { parse: [] } };
-      // Both speed settings post in the same channel/chat. DM mode only changes
-      // the interval and how patiently the sender handles Discord rate limits.
       try {
         await session.sourceMessage.reply(messagePayload);
       } catch (replyError) {
+        // A 429 is not a permissions failure: do not immediately retry the same
+        // message through another endpoint. Let the outer handler wait and retry.
+        if (Number(replyError?.status) === 429 || Number(replyError?.rawError?.code) === 20028 || Number(replyError?.rawError?.code) === 20029) {
+          throw replyError;
+        }
         console.warn('Spam reply failed; trying channel send:', replyError.message);
         try {
           await session.sourceMessage.channel.send(messagePayload);
         } catch (channelError) {
+          if (Number(channelError?.status) === 429 || Number(channelError?.rawError?.code) === 20028 || Number(channelError?.rawError?.code) === 20029) {
+            throw channelError;
+          }
           console.warn('Spam channel send failed; trying interaction follow-up:', channelError.message);
           await session.interactionWebhook.send(messagePayload);
         }
       }
       session.sent += 1;
     } catch (error) {
-      const retryAfterMs = Number(error?.rawError?.retry_after ?? error?.data?.retry_after ?? error?.retry_after ?? error?.retryAfter ?? 0) * 1000;
-      if (session.slowMode && (Number(error?.status) === 429 || retryAfterMs > 0)) {
-        const waitMs = Math.max(session.intervalMs, Math.ceil(retryAfterMs) + 1000);
-        console.warn(`Slow-mode rate limit hit; waiting ${waitMs}ms before retrying.`);
+      const isRateLimited = Number(error?.status) === 429
+        || Number(error?.rawError?.code) === 20028
+        || Number(error?.rawError?.code) === 20029
+        || Number(error?.code) === 20028
+        || Number(error?.code) === 20029;
+      if (isRateLimited) {
+        const rawRetryAfter = Number(error?.rawError?.retry_after ?? error?.data?.retry_after ?? 0);
+        const retryAfterMs = rawRetryAfter > 0
+          ? rawRetryAfter * 1000
+          : Math.max(0, Number(error?.retryAfter || 0));
+        // Keep retrying until the requested session ends. Normal mode still
+        // respects Discord's server-provided wait; slow mode waits at least 5s.
+        const waitMs = Math.max(session.slowMode ? session.intervalMs : 1000, Math.ceil(retryAfterMs) + 1000);
+        console.warn(`Spam rate limit hit; waiting ${waitMs}ms before retrying (${session.sent} sent).`);
         if (Date.now() + waitMs < session.endAt) {
           session.timeout = setTimeout(sendNext, waitMs);
           session.timeout.unref?.();
           return;
         }
+        spamSessions.delete(sessionId);
+        await session.sourceMessage.reply({
+          content: `Message session finished. Sent ${session.sent} message(s); Discord rate-limited the final attempt until the session ended.`,
+          allowedMentions: { parse: [] }
+        }).catch(() => {});
+        return;
       }
+
       spamSessions.delete(sessionId);
       console.error('Timed message send failed:', error);
       await session.sourceMessage.edit({
@@ -4902,6 +4926,7 @@ async function handleSpamConsent(interaction) {
       }).catch(() => {});
       return;
     }
+
     if (Date.now() >= session.endAt) {
       spamSessions.delete(sessionId);
       return;
