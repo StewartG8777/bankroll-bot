@@ -1440,6 +1440,7 @@ const spamCmd = common(
   new SlashCommandBuilder().setName('spam').setDescription('Post a timed repeated-message embed in this chat or channel')
     .addStringOption((o) => o.setName('message').setDescription('Text or emoji to repeat').setMaxLength(1800).setRequired(true))
     .addIntegerOption((o) => o.setName('duration').setDescription('Duration in minutes (1–15)').setMinValue(1).setMaxValue(15).setRequired(true))
+    .addBooleanOption((o) => o.setName('dm').setDescription('Send the repeated messages to your own DMs (slower, rate-limit aware)'))
 );
 const stopSpamCmd = common(
   new SlashCommandBuilder().setName('stop').setDescription('Owner: stop every active spam session')
@@ -4779,11 +4780,13 @@ async function cmdSpam(interaction) {
   }
   const message = interaction.options.getString('message', true);
   const durationMinutes = interaction.options.getInteger('duration', true);
+  const dmMode = interaction.options.getBoolean('dm') ?? false;
   const requestId = crypto.randomBytes(8).toString('hex');
   spamRequests.set(requestId, {
     ownerId: interaction.user.id,
     message,
     durationMinutes,
+    dmMode,
     expiresAt: Date.now() + 10 * 60 * 1000
   });
   const expiry = setTimeout(() => spamRequests.delete(requestId), 10 * 60 * 1000);
@@ -4792,11 +4795,14 @@ async function cmdSpam(interaction) {
   const embed = new EmbedBuilder()
     .setColor(GREY)
     .setTitle('Timed message ready')
-    .setDescription('Press **Start** to begin posting the message below as a reply to this embed.')
+    .setDescription(dmMode
+      ? 'Press **Start** to send the repeated message to your own DMs. DM mode uses a slower interval and waits when Discord applies a rate limit.'
+      : 'Press **Start** to begin posting the message below as a reply to this embed.')
     .addFields(
       { name: 'Message to repeat', value: message.slice(0, 1024) },
       { name: 'Duration', value: durationMinutes + ' minute(s)', inline: true },
-      { name: 'Interval', value: 'Every 1 second', inline: true }
+      { name: 'Destination', value: dmMode ? 'Your DMs' : 'This channel / chat', inline: true },
+      { name: 'Interval', value: dmMode ? 'Every 5 seconds (plus any rate-limit wait)' : 'Every 1 second', inline: true }
     )
     .setFooter({ text: 'Only the person who ran /spam can start or stop this session.' });
   const row = new ActionRowBuilder().addComponents(
@@ -4824,20 +4830,25 @@ async function handleSpamConsent(interaction) {
     ownerId: request.ownerId,
     sourceMessage: interaction.message,
     interactionWebhook: interaction.webhook,
+    targetUser: request.dmMode ? interaction.user : null,
     message: request.message,
     endAt: Date.now() + request.durationMinutes * 60000,
-    intervalMs: 1000,
+    dmMode: request.dmMode,
+    intervalMs: request.dmMode ? 5000 : 1000,
     sent: 0,
     timeout: null
   };
   spamSessions.set(sessionId, session);
   await interaction.update({
     embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Spam running')
-      .setDescription('The message below is being posted as replies to this embed.')
+      .setDescription(request.dmMode
+        ? 'Bankroll is sending the repeated message to your DMs. DM mode waits for Discord rate limits and uses a slower interval.'
+        : 'The message below is being posted as replies to this embed.')
       .addFields(
         { name: 'Repeated message', value: request.message.slice(0, 1024) },
         { name: 'Duration', value: request.durationMinutes + ' minute(s)', inline: true },
-        { name: 'Interval', value: 'Every 1 second', inline: true }
+        { name: 'Destination', value: request.dmMode ? 'Your DMs' : 'This channel / chat', inline: true },
+        { name: 'Interval', value: request.dmMode ? 'Every 5 seconds (plus any rate-limit wait)' : 'Every 1 second', inline: true }
       )
       .setFooter({ text: 'Press Stop to end the session early.' })],
     components: [new ActionRowBuilder().addComponents(
@@ -4854,21 +4865,36 @@ async function handleSpamConsent(interaction) {
     }
     try {
       const messagePayload = { content: session.message, allowedMentions: { parse: [] } };
-      // Prefer a real reply. User-installed apps may not have channel Send Messages
-      // permission, so fall back to the interaction webhook, which can send follow-ups.
-      try {
-        await session.sourceMessage.reply(messagePayload);
-      } catch (replyError) {
-        console.warn('Spam reply failed; trying channel send:', replyError.message);
+      if (session.dmMode) {
+        if (!session.targetUser) throw new Error('DM recipient is unavailable.');
+        await session.targetUser.send(messagePayload);
+      } else {
+        // Prefer a real reply. User-installed apps may not have channel Send Messages
+        // permission, so fall back to the interaction webhook, which can send follow-ups.
         try {
-          await session.sourceMessage.channel.send(messagePayload);
-        } catch (channelError) {
-          console.warn('Spam channel send failed; trying interaction follow-up:', channelError.message);
-          await session.interactionWebhook.send(messagePayload);
+          await session.sourceMessage.reply(messagePayload);
+        } catch (replyError) {
+          console.warn('Spam reply failed; trying channel send:', replyError.message);
+          try {
+            await session.sourceMessage.channel.send(messagePayload);
+          } catch (channelError) {
+            console.warn('Spam channel send failed; trying interaction follow-up:', channelError.message);
+            await session.interactionWebhook.send(messagePayload);
+          }
         }
       }
       session.sent += 1;
     } catch (error) {
+      const retryAfterMs = Number(error?.rawError?.retry_after ?? error?.data?.retry_after ?? error?.retry_after ?? error?.retryAfter ?? 0) * 1000;
+      if (session.dmMode && (Number(error?.status) === 429 || retryAfterMs > 0)) {
+        const waitMs = Math.max(session.intervalMs, Math.ceil(retryAfterMs) + 1000);
+        console.warn(`DM rate limit hit; waiting ${waitMs}ms before retrying.`);
+        if (Date.now() + waitMs < session.endAt) {
+          session.timeout = setTimeout(sendNext, waitMs);
+          session.timeout.unref?.();
+          return;
+        }
+      }
       spamSessions.delete(sessionId);
       console.error('Timed message send failed:', error);
       await session.sourceMessage.edit({
