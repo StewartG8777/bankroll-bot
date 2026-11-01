@@ -1823,6 +1823,13 @@ const previewCmd = common(
   new SlashCommandBuilder().setName('preview').setDescription('Select a customer and preview their Bankroll experience')
 );
 
+const exportCmd = common(
+  new SlashCommandBuilder()
+    .setName('export')
+    .setDescription('Export Bankroll source files')
+    .addSubcommand((sub) => sub.setName('index').setDescription('Upload the raw index.js file to the private index logs channel'))
+);
+
 const botAdminCmd = common(
   new SlashCommandBuilder()
     .setName('bot')
@@ -1896,7 +1903,7 @@ const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription(
   .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' }))
   .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records')));
 
-const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
+const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -4094,13 +4101,54 @@ async function cmdTotal(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
+async function cmdExport(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can export the source file.');
+  if (interaction.options.getSubcommand() !== 'index') return interaction.editReply('Unknown export option.');
+  if (!interaction.guild) return interaction.editReply('Run /export index in a server where Bankroll can manage channels.');
+
+  const channelName = 'bankroll-index-logs';
+  let logChannel = interaction.guild.channels.cache.find(
+    (channel) => channel.name === channelName && channel.type === ChannelType.GuildText
+  );
+
+  if (!logChannel) {
+    const me = interaction.guild.members.me || await interaction.guild.members.fetchMe();
+    if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      return interaction.editReply('Bankroll needs Manage Channels permission to create the private index logs channel.');
+    }
+    const overwrites = [
+      { id: interaction.guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+      { id: me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ReadMessageHistory] },
+    ];
+    if (interaction.guild.members.cache.has(OWNER_ID) || await interaction.guild.members.fetch(OWNER_ID).catch(() => null)) {
+      overwrites.push({ id: OWNER_ID, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ReadMessageHistory] });
+    }
+    logChannel = await interaction.guild.channels.create({
+      name: channelName,
+      type: ChannelType.GuildText,
+      permissionOverwrites: overwrites,
+      reason: 'Private Bankroll index.js export and audit log',
+    });
+  }
+
+  const sourcePath = path.join(__dirname, 'index.js');
+  if (!fs.existsSync(sourcePath)) return interaction.editReply('Could not find the running index.js file.');
+  const timestamp = new Date().toLocaleString('en-GB', { timeZone: 'Europe/London', dateStyle: 'medium', timeStyle: 'medium' });
+  await logChannel.send({
+    content: '**Bankroll index.js export**\\nRequested by: <@' + interaction.user.id + '>\\nTime: ' + timestamp,
+    files: [new AttachmentBuilder(sourcePath, { name: 'index.js' })],
+    allowedMentions: { users: [interaction.user.id] },
+  });
+  return interaction.editReply('Raw `index.js` uploaded to <#' + logChannel.id + '>.');
+}
+
 // Shown by /bot refresh-commands so the owner can see what this deployed version changed. Add a line per update.
 const RECENT_UPDATES = [
   '/monzo-review: customer Discord ID can be left blank and assigned after all transactions are reviewed.',
   '/monzo-review: supports this month, last month, this week and last week, with editable transaction dates.',
   '/bot refresh-commands: compares the full command definition, reports added/removed/changed commands and verifies Discord registration.',
   '/sendfile: accepts any file type stored in the vault, not only ZIP archives.',
-  'Removed the unused /export index and /bot export-index commands.',
+  '/export index: uploads the raw index.js file to the private #bankroll-index-logs channel and records who ran it and when.',
   'Historical Monzo customer IDs are assigned to the nine reviewed sales in newest-to-oldest order.',
 ];
 
@@ -5765,6 +5813,9 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdRefund(interaction);
       case 'setup':
         return await cmdSetup(interaction);
+      case 'export':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdExport(interaction);
       case 'bot':
         await interaction.deferReply({ ephemeral: true });
         return await cmdBotAdmin(interaction);
