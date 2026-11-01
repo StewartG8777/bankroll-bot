@@ -1302,7 +1302,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
         '**Invoice error:** ' + invoiceError,
         '',
         'The paid order is saved. Bankroll will retry by replying to the original invoice only. No customer DM will be sent.',
-      ].join('\\n')).catch(() => {});
+      ].join('\n')).catch(() => {});
     }
   }
 
