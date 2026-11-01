@@ -492,6 +492,12 @@ function mergeMonzoReviewStates(current, incoming) {
 function saveMonzoReview() {
   try {
     fs.mkdirSync(path.dirname(MONZO_REVIEW_FILE), { recursive: true });
+    // Merge the on-disk copy before writing so a stale in-memory object can
+    // never erase reviews that were saved by an earlier interaction.
+    try {
+      const diskState = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
+      if (diskState && typeof diskState === 'object') monzoReviewState = mergeMonzoReviewStates(monzoReviewState, diskState);
+    } catch (readError) { if (readError.code !== 'ENOENT') throw readError; }
     atomicWrite(MONZO_REVIEW_FILE, JSON.stringify(monzoReviewState, null, 2));
     const persisted = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
     if (!persisted || typeof persisted !== 'object' || !persisted.reviewed || typeof persisted.reviewed !== 'object') {
@@ -4064,7 +4070,19 @@ async function cmdRestore(interaction) {
     return interaction.editReply(`Restored ${downloadHistory.length} download history record(s).`);
   }
 
-  const store = target === 'deliveries' ? deliveries : target === 'downloads' ? downloads : target === 'monzo' ? monzoLedger : target === 'monzo_review' ? monzoReviewState : vault;
+  if (target === 'monzo_review') {
+    if (!data.transactions || typeof data.transactions !== 'object' || Array.isArray(data.transactions) ||
+        !data.reviewed || typeof data.reviewed !== 'object' || Array.isArray(data.reviewed)) {
+      return interaction.editReply('That monzo_review.json backup must contain transactions and reviewed objects.');
+    }
+    const before = Object.keys(monzoReviewState.reviewed || {}).length;
+    monzoReviewState = mergeMonzoReviewStates(monzoReviewState, data);
+    if (!saveMonzoReview()) return interaction.editReply('❌ The review backup was merged in memory but could not be verified on disk. Check Render logs.');
+    const after = Object.keys(monzoReviewState.reviewed || {}).length;
+    return interaction.editReply('Restored/merged Monzo review history. ' + Math.max(0, after - before) + ' new reviewed sale(s); ' + after + ' total reviewed sale(s) now saved.');
+  }
+
+  const store = target === 'deliveries' ? deliveries : target === 'downloads' ? downloads : target === 'monzo' ? monzoLedger : vault;
   const filesRoot = path.resolve(target === 'vault' ? VAULT_DIR : FILES_DIR) + path.sep;
   let added = 0;
   let already = 0;
