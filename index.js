@@ -3566,7 +3566,7 @@ async function cmdPaymentTest(interaction) {
       );
     if (method === 'monzo') embed.addFields({ name: 'Payment reference', value: `\`${reference}\``, inline: true });
     if (expiresAt) embed.addFields({ name: 'Pay by', value: method === 'monzo' ? `<t:${tsec(expiresAt)}:R>` : `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
-    if (fileData || externalLink) embed.addFields({ name: 'File / delivery', value: `${fileLabel} — ${mode === 'link' ? 'hosted link' : 'direct attachment first; hosted link if Discord rejects the file'}` });
+    if (fileData || externalLink) embed.addFields({ name: 'File', value: `${fileLabel}\n${mode === 'link' ? 'Download Button' : 'Direct attachment / Download Button'}` });
     embed.addFields(
       { name: 'Generated In Guild', value: where.guild },
       { name: 'Generated In Channel', value: where.channel }
