@@ -4120,17 +4120,62 @@ async function cmdExport(interaction) {
 
   let target = null;
   const expectedName = 'bankroll-index-logs';
-  for (const guild of client.guilds.cache.values()) {
+  const guilds = [...client.guilds.cache.values()];
+
+  // Reuse the dedicated channel if it already exists in any server.
+  for (const guild of guilds) {
     let channels = guild.channels.cache;
     if (!channels.size) channels = await guild.channels.fetch().catch(() => channels);
     target = channels.find((channel) =>
-      channel?.name?.toLowerCase().replace(/\\s+/g, '-') === expectedName &&
+      channel?.name?.toLowerCase().replace(/\s+/g, '-') === expectedName &&
       channel.isTextBased?.() && typeof channel.send === 'function'
     ) || null;
     if (target) break;
   }
+
+  // Create the channel automatically if it does not exist. It is private:
+  // only Bankroll and the configured owner can view it.
   if (!target) {
-    return interaction.editReply('Could not find **#bankroll-index-logs**. Create that text channel and give Bankroll permission to view it, attach files and send messages.');
+    const createGuild = guilds.find((guild) => {
+      const me = guild.members.me;
+      return me?.permissions?.has(PermissionFlagsBits.ManageChannels) &&
+        me?.permissions?.has(PermissionFlagsBits.ViewChannel);
+    });
+    if (!createGuild) {
+      return interaction.editReply('I could not find **#bankroll-index-logs** or a server where I have permission to create it. Give Bankroll **Manage Channels** and **View Channel**, then run /export index again.');
+    }
+
+    target = await createGuild.channels.create({
+      name: expectedName,
+      type: ChannelType.GuildText,
+      topic: 'Private Bankroll source-code export and audit log. Created automatically by /export index.',
+      permissionOverwrites: [
+        {
+          id: createGuild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel],
+        },
+        {
+          id: client.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.ManageChannels,
+          ],
+        },
+        {
+          id: OWNER_ID,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+          ],
+        },
+      ],
+      reason: 'Create private Bankroll index export and audit channel',
+    });
   }
 
   const stat = fs.statSync(indexPath);
