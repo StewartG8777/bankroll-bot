@@ -1264,49 +1264,68 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   let msgUrl = null;
   let invoiceReply = null;
 
-  // Keep the paid notification and download attached to the original invoice.
-  // This works in the invoice's original server channel or DM and does not require
-  // the bot and customer to share a server or allow customer DMs.
+  // Post the delivery under the original invoice. Inside the 15 minutes after the invoice command, the saved
+  // interaction can always post (it works in a private DM the bot is not part of). After that the bot may be
+  // blocked (Missing Access) in that DM, so the customer's Download ZIP / Get my file button on the invoice
+  // takes over: their click is allowed to post there.
+  let blocked = false;
   try {
-    const invoice = await getInvoiceMessage(d, key);
-    if (!invoice) throw new Error('The original invoice message could not be found.');
-    invoiceReply = await sendWithFallback((p) => invoice.reply({
-      ...p,
-      content: noFile
-        ? 'Payment received — thank you!'
-        : dlink
-          ? `Payment received — your complete ${isZip ? 'ZIP' : 'file'} is ready to download below.`
-          : 'Payment received — your complete file is attached below.',
-      allowedMentions: { parse: [] },
-      failIfNotExists: true,
-    }));
-    msgUrl = invoiceReply.url || null;
-    sentTo = 'a reply to the original invoice';
+    const replyText = noFile
+      ? 'Payment received — thank you!'
+      : dlink
+        ? `Payment received — your complete ${isZip ? 'ZIP' : 'file'} is ready to download below.`
+        : 'Payment received — your complete file is attached below.';
+    const live = liveInteractions.get(key);
+    let lastError = null;
+    if (live?.interaction && Date.now() - live.at < 14 * 60 * 1000) {
+      try {
+        invoiceReply = await sendWithFallback((p) => live.interaction.followUp({ ...p, content: replyText, allowedMentions: { parse: [] } }));
+        sentTo = 'a reply to the original invoice';
+      } catch (e) { lastError = e; console.error(`Live invoice reply failed for ${key}:`, e.message); }
+    }
+    if (!sentTo) {
+      try {
+        const invoice = await getInvoiceMessage(d, key);
+        if (!invoice) throw new Error('The original invoice message could not be found.');
+        invoiceReply = await sendWithFallback((p) => invoice.reply({ ...p, content: replyText, allowedMentions: { parse: [] }, failIfNotExists: true }));
+        sentTo = 'a reply to the original invoice';
+      } catch (e) { lastError = lastError || e; if (!sentTo) throw e; }
+    }
+    msgUrl = invoiceReply?.url || null;
   } catch (e) {
     const invoiceError = String(e?.message || e).slice(0, 300);
     console.error(`Could not reply to invoice for paid order ${key}:`, e);
+    blocked = /missing access|missing permissions|unknown channel|cannot send messages/i.test(invoiceError) || Number(e?.code) === 50001 || Number(e?.code) === 50013;
 
-    // Customer delivery is invoice-reply only. Never DM the customer.
-    // Keep the paid order saved and let the existing retry scheduler try again.
     d.deliveryError = `Invoice reply failed: ${invoiceError}`;
     d.paid = true;
     d.paymentConfirmed = true;
+    if (blocked) d.awaitingCustomerButton = true;
     saveDeliveries();
 
     if (owner && Date.now() - Number(d.lastDeliveryFailureAlertAt || 0) >= 5 * 60 * 1000) {
       d.lastDeliveryFailureAlertAt = Date.now();
       saveDeliveries();
       await owner.send([
-        '❌ ' + (d.testMode ? '[TEST] ' : '') + 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED',
+        (blocked ? '⚠️ ' : '❌ ') + (d.testMode ? '[TEST] ' : '') + (blocked ? 'PAID — CUSTOMER MUST PRESS THE BUTTON' : 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED'),
         '',
         '**File:** ' + String(d.name || 'file'),
         '**Customer:** <@' + String(d.customerId || '') + '>',
         '**Order:** ' + key,
         '**Invoice error:** ' + invoiceError,
         '',
-        'The paid order is saved. Bankroll will retry by replying to the original invoice only. No customer DM will be sent.',
+        blocked
+          ? 'The bot cannot post in that DM any more (Discord only lets it post there for 15 minutes after the command). The payment is saved: tell the customer to press **Download ZIP** on the invoice and the file is sent straight away.'
+          : 'The paid order is saved. Bankroll will retry by replying to the original invoice only. No customer DM will be sent.',
       ].join('\n')).catch(() => {});
     }
+  }
+
+  if (!sentTo && blocked) {
+    // Retrying cannot help: wait for the customer's button press instead of retrying forever.
+    clearDeliveryWatch(key);
+    const retryTimer = deliveryRetryTimers.get(key); if (retryTimer) clearTimeout(retryTimer); deliveryRetryTimers.delete(key);
+    return false;
   }
 
   if (sentTo) {
@@ -4795,10 +4814,7 @@ async function onGetFile(interaction) {
   }
 
   const old = interaction.message.embeds[0];
-  await interaction.message.edit({
-    embeds: old ? [EmbedBuilder.from(old).setColor(GREY).setTitle(String(old.title || '').startsWith('PAID') ? old.title : `PAID - ${old.title}`)] : [],
-    components: [],
-  }).catch(() => {});
+  await interaction.message.edit({ components: [] }).catch(() => {});
 
   if (d.path && !d.vaultKey) { try { fs.unlinkSync(d.path); } catch {} }
   delete deliveries[key];
