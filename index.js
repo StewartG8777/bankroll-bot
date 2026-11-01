@@ -576,6 +576,53 @@ const monzoOpen = () =>
     (m) => m.status === 'open' && Date.now() < (m.expiresAt ?? m.createdAt + MONZO_OPEN_MS)
   );
 const monzoPaid = () => Object.values(monzoLedger).filter((m) => m.status === 'paid');
+
+// Ensure every historical sale approved in /monzo-review is present in the same
+// paid ledger used by /payments, /total, /customer and financial reports.
+function syncMonzoReviewSalesToLedger() {
+  let added = 0;
+  let repaired = 0;
+  for (const [txId, review] of Object.entries(monzoReviewState.reviewed || {})) {
+    if (review?.category !== 'sale') continue;
+    const key = 'monzo_import_' + txId;
+    const dateMs = Number(review.settledAt || review.createdAt || review.reviewedAt || Date.now());
+    const existing = monzoLedger[key];
+    const entry = {
+      ...(existing || {}),
+      key,
+      status: 'paid',
+      imported: true,
+      recordType: 'sale',
+      source: 'Monzo historical transaction import',
+      customerId: String(review.customerId || existing?.customerId || ''),
+      agentId: String(review.agentId || OWNER_ID),
+      amount: Number(review.amount || existing?.amount || 0),
+      currency: String(review.currency || existing?.currency || 'gbp').toLowerCase(),
+      description: String(review.sold || review.description || existing?.description || review.transactionDescription || 'Historical Monzo sale'),
+      originalDescription: String(review.transactionDescription || existing?.originalDescription || ''),
+      counterparty: String(review.counterparty || existing?.counterparty || ''),
+      reference: String(review.reference || existing?.reference || ''),
+      txId,
+      createdAt: Number(review.createdAt || existing?.createdAt || dateMs),
+      paidAt: dateMs,
+      importedAt: Number(review.reviewedAt || existing?.importedAt || Date.now()),
+    };
+    if (!Number.isFinite(entry.amount) || entry.amount <= 0) {
+      console.warn('Skipped invalid historical Monzo sale ' + txId + ': amount was missing or invalid.');
+      continue;
+    }
+    if (!existing) added++;
+    else if (existing.status !== 'paid' || !existing.customerId || !existing.agentId || !existing.paidAt) repaired++;
+    monzoLedger[key] = entry;
+  }
+  if (added || repaired) {
+    saveMonzo();
+    console.log('Synced historical Monzo sales into the financial ledger: ' + added + ' added, ' + repaired + ' repaired.');
+  } else {
+    console.log('Historical Monzo sales are already present in the financial ledger.');
+  }
+  return { added, repaired };
+}
 const tsec = (ms) => Math.floor(ms / 1000);
 function markMonzoPaid(key, txId, manual = false) {
   const d = deliveries[key];
@@ -2374,6 +2421,7 @@ const onReady = async () => {
   restorePendingDeliveryRetries();
 
   backfillMonzoLedger();
+  syncMonzoReviewSalesToLedger();
   applyMonzoReviewCustomerIds();
   const monzoRebuilt = restoreMonzoReminders();
   restoreReminders().then(async (n) => {
