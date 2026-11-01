@@ -1053,7 +1053,7 @@ async function updateInvoicePaidMessage(d, key, paymentIntentId = null) {
   // The paid status is shown on the invoice; the actual download is posted as a reply to that invoice.
   for (const row of invoice.components || []) {
     const kept = (row.components || []).filter((component) =>
-      component.customId && !String(component.customId).startsWith('getfile:')
+      component.customId && !String(component.customId).startsWith('getfile:') && !String(component.customId).startsWith('testpaid:')
     );
     if (kept.length) rows.push(new ActionRowBuilder().addComponents(kept.map((component) => ButtonBuilder.from(component))));
   }
@@ -3349,7 +3349,8 @@ async function cmdPaymentTest(interaction) {
   }
 
   const method = interaction.options.getSubcommand();
-  const selectedCustomer = interaction.options.getUser('customer', true);
+  const customer = interaction.options.getUser('customer', true);
+  const agent = interaction.user;
   await interaction.deferReply();
   let sourcePath = null;
   let token = null;
@@ -3368,8 +3369,8 @@ async function cmdPaymentTest(interaction) {
     const testUrl = await makeDownloadLink({
       path: sourcePath,
       name: fileName,
-      customerId: selectedCustomer.id,
-      agentId: OWNER_ID,
+      customerId: customer.id,
+      agentId: agent.id,
       description: 'test-' + method,
       testMode: true,
     }, null);
@@ -3377,96 +3378,110 @@ async function cmdPaymentTest(interaction) {
     try { fs.unlinkSync(sourcePath); } catch {}
     sourcePath = null;
 
-    const paidAt = Date.now();
+    const amount = 1.23;
+    const description = 'Bankroll payment and download delivery test';
     const reference = 'TEST-' + method.toUpperCase() + '-' + testId;
-    const methodLabel = method === 'monzo' ? 'Monzo' : 'Bankroll card';
     testKey = (method === 'monzo' ? 'monzo_test_' : 'stripe_test_') + testId.toLowerCase();
-    const invoiceEmbed = new EmbedBuilder()
+    const expiresAt = method === 'monzo' ? Date.now() + MONZO_OPEN_MS : Math.floor(Date.now() / 1000) + 24 * 60 * 60;
+    const where = whereFrom(interaction, customer);
+
+    // Keep the real invoice layout and fields. Only the payment action is
+    // replaced with a test-only button that simulates the payment confirmation.
+    const embed = new EmbedBuilder()
       .setColor(GREEN)
       .setTitle(method === 'monzo' ? 'Bankroll Monzo Invoice Created' : 'Bankroll Invoice Created')
-      .setDescription('TEST INVOICE — this invoice is automatically paid by the test. No real payment is taken.')
+      .setDescription(method === 'monzo'
+        ? 'Awaiting payment. Pay the exact amount below and include the reference.'
+        : 'Please use the link below to complete your purchase.')
       .addFields(
-        { name: 'Sales Agent', value: '<@' + OWNER_ID + '>', inline: true },
-        { name: 'Customer', value: '<@' + selectedCustomer.id + '>', inline: true },
-        { name: 'Amount', value: money(1.23, 'gbp'), inline: true },
-        { name: 'Description', value: 'Bankroll payment and download delivery test' },
-        { name: 'Payment Status', value: 'AWAITING PAYMENT (TEST)', inline: true },
-        { name: 'Transaction Reference', value: reference, inline: true },
-        { name: 'File', value: fileName + ' (posted as a reply once the test payment is confirmed)' }
-      )
-      .setFooter({ text: 'TEST MODE • No Stripe charge or Monzo transaction • ' + testKey })
-      .setTimestamp();
+        { name: 'Sales Agent', value: `<@${agent.id}>` },
+        { name: 'Customer', value: `<@${customer.id}>` },
+        { name: 'Amount', value: money(amount, method === 'monzo' ? 'gbp' : CURRENCY), ...(method === 'monzo' ? { inline: true } : {}) }
+      );
 
+    if (method === 'monzo') {
+      embed.addFields(
+        { name: 'Payment reference', value: `\\`${reference}\\``, inline: true },
+        { name: 'Description', value: description },
+        { name: 'Pay by', value: `<t:${tsec(expiresAt)}:R>` }
+      );
+      if (MONZO_PAYMENT_DETAILS) embed.addFields({ name: 'Pay to', value: MONZO_PAYMENT_DETAILS.replace(/\\n/g, '\n') });
+    } else {
+      embed.addFields({ name: 'Description', value: description });
+      embed.addFields({ name: 'Pay by', value: `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
+    }
+    embed.addFields({ name: 'File', value: `${fileName} (posted as a reply to this invoice as soon as payment lands)` });
+    embed.addFields(
+      { name: 'Generated In Guild', value: where.guild },
+      { name: 'Generated In Channel', value: where.channel }
+    ).setFooter({ text: `Created by ${agent.username} | ID: ${testKey} | TEST MODE` });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('testpaid:' + testKey)
+        .setLabel('Mark as Paid (TEST)')
+        .setStyle(ButtonStyle.Success)
+    );
     const invoiceMessage = await interaction.editReply({
-      content: '<@' + selectedCustomer.id + '> — a Bankroll test invoice has been created. It will now be marked as paid automatically.',
-      embeds: [invoiceEmbed],
-      components: [],
+      content: `<@${customer.id}>`,
+      embeds: [embed],
+      components: [row],
       allowedMentions: { parse: [] },
     });
 
     deliveries[testKey] = {
       link: testUrl,
       name: fileName,
-      description: 'Bankroll payment and delivery test',
+      description,
       channelId: interaction.channelId,
       msgId: invoiceMessage.id,
       msgChannelId: invoiceMessage.channelId,
-      customerId: selectedCustomer.id,
-      agentId: OWNER_ID,
+      customerId: customer.id,
+      agentId: agent.id,
       savedAt: Date.now(),
       type: method === 'monzo' ? 'monzo' : 'stripe',
       paid: false,
       paymentConfirmed: false,
-      amount: 1.23,
-      currency: 'gbp',
+      amount,
+      currency: method === 'monzo' ? 'gbp' : CURRENCY,
       reference,
       txId: reference,
       testMode: true,
     };
     saveDeliveries();
+
     if (method === 'monzo') {
       monzoLedger[testKey] = {
         key: testKey,
         status: 'open',
-        customerId: selectedCustomer.id,
-        agentId: OWNER_ID,
-        amount: 1.23,
+        customerId: customer.id,
+        agentId: agent.id,
+        amount,
         currency: 'gbp',
-        description: 'Bankroll payment and delivery test',
+        description,
         reference,
         createdAt: Date.now(),
-        expiresAt: Date.now() + MONZO_OPEN_MS,
+        expiresAt,
         channelId: interaction.channelId,
         fileName,
+        msgUrl: invoiceMessage.url,
         testMode: true,
       };
       saveMonzo();
     }
+
     liveInteractions.set(testKey, { interaction, at: Date.now() });
     setTimeout(() => liveInteractions.delete(testKey), 14 * 60 * 1000);
-
-    recordNotification('test.invoice_created', 'Test invoice created', methodLabel + ' test invoice ' + testKey + ' created for customer ' + selectedCustomer.id + '.', 'success');
-    recordDownloadEvent('test_payment_simulated', {
+    recordNotification('test.invoice_created', 'Test invoice created', method + ' test invoice ' + testKey + ' created for customer ' + customer.id + '.', 'success');
+    recordDownloadEvent('test_invoice_created', {
       file: fileName,
-      customerId: selectedCustomer.id,
-      agentId: OWNER_ID,
+      customerId: customer.id,
+      agentId: agent.id,
       token,
-      detail: 'A public test invoice was created, automatically marked as paid, and delivered using the normal invoice-reply flow. No real payment was taken.',
+      detail: 'Test invoice mirrors the real invoice layout. Payment awaits the owner clicking Mark as Paid (TEST).',
     });
-
-    // Run the same paid-state update, invoice reply, download delivery and owner
-    // notification path used by a real confirmed payment.
-    await deliverFile(testKey, null);
-    const completed = deliveries[testKey]?.deliveryComplete;
-    if (!completed) {
-      return interaction.followUp({
-        content: 'The test invoice was created and marked paid, but delivery did not complete. Check /delivery status for order ' + testKey + '.',
-        ephemeral: true,
-      });
-    }
-    recordNotification('test.delivery_ready', 'Test download delivered', fileName + ' was posted as a reply to test invoice ' + testKey + '.', 'success');
     return interaction.followUp({
-      content: 'Test completed: the invoice was created publicly, automatically marked as PAID, the customer received the download as a reply to that invoice, and the owner notification was triggered. No real payment was taken.',
+      content: 'Test invoice posted. Click **Mark as Paid (TEST)** on the invoice when you are ready to simulate payment. This will run the normal paid-invoice reply, download delivery and owner notification flow. No real payment is taken.',
       ephemeral: true,
     });
   } catch (err) {
@@ -4748,6 +4763,25 @@ async function onScheduledSendButton(interaction) {
 }
 
 async function onButton(interaction) {
+  if (interaction.customId.startsWith('testpaid:')) {
+    if (interaction.user.id !== OWNER_ID) {
+      return interaction.reply({ content: 'Only the bot owner can mark a test invoice as paid.', ephemeral: true });
+    }
+    const key = interaction.customId.slice('testpaid:'.length);
+    const d = deliveries[key];
+    if (!d?.testMode) {
+      return interaction.reply({ content: 'This test invoice is invalid or has expired.', ephemeral: true });
+    }
+    if (d.deliveryComplete || d.paid) {
+      return interaction.reply({ content: 'This test invoice has already been marked as paid.', ephemeral: true });
+    }
+    await interaction.deferUpdate();
+    const delivered = await deliverFile(key, null);
+    if (delivered && deliveries[key]?.deliveryComplete) {
+      return interaction.followUp({ content: 'Test payment marked as paid. The invoice has been updated, the download has been posted as a reply, and the owner notification has been triggered.', ephemeral: true });
+    }
+    return interaction.followUp({ content: 'The test invoice was marked as paid, but delivery has not completed. Check /delivery status for order ' + key + '.', ephemeral: true });
+  }
   if (interaction.customId.startsWith('sendfile:')) return onScheduledSendButton(interaction);
   if (interaction.customId.startsWith('getfile:')) return onGetFile(interaction);
   if (interaction.customId.startsWith('refund_')) return onRefundButton(interaction);
