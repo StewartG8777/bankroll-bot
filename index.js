@@ -1233,6 +1233,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
         .addFields(
           { name: 'Customer', value: `<@${d.customerId}>`, inline: true },
           { name: 'Delivery', value: dlink ? 'Hosted Download button' : 'Direct Discord attachment', inline: true },
+          { name: 'Download tracking', value: dlink ? 'Successful hosted downloads are confirmed separately' : 'Discord does not report whether an attachment was saved by the customer' },
           { name: 'Invoice reply', value: msgUrl || 'Posted successfully' }
         ).setTimestamp()]
     }, { notificationType: 'delivery.sent', notificationStatus: 'success' });
@@ -3437,9 +3438,14 @@ async function cmdPaymentTest(interaction) {
     const testId = crypto.randomBytes(5).toString('hex').toUpperCase();
     testKey = (method === 'monzo' ? 'monzo_test_' : 'stripe_test_') + testId.toLowerCase();
     const reference = 'TEST-' + method.toUpperCase() + '-' + testId;
-    const expiresAt = method === 'monzo'
-      ? Date.now() + MONZO_OPEN_MS
-      : (expiresMins ? Math.floor(Date.now() / 1000) + expiresMins * 60 : null);
+    let expiresAt = null;
+    if (method === 'monzo') expiresAt = Date.now() + MONZO_OPEN_MS;
+    else if (expiresMins) {
+      let secs = expiresMins * 60;
+      if (expiresMins === 30) secs += 60;
+      if (expiresMins === 1440) secs -= 60;
+      expiresAt = Math.floor(Date.now() / 1000) + secs;
+    }
 
     if (fileData) {
       saveDelivery(testKey, fileData, interaction, customer);
