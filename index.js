@@ -2207,6 +2207,19 @@ const onReady = async () => {
   } catch (error) {
     console.error('Automatic slash-command refresh failed:', error);
   }
+  // Restart-loop warning: DM the owner if the bot has started 3+ times in 10 minutes.
+  try {
+    const startsFile = path.join(DATA_DIR, 'startups.json');
+    let starts = [];
+    try { starts = JSON.parse(fs.readFileSync(startsFile, 'utf8')); } catch {}
+    const nowMs = Date.now();
+    starts = (Array.isArray(starts) ? starts : []).filter((t) => nowMs - Number(t) < 10 * 60 * 1000);
+    starts.push(nowMs);
+    atomicWrite(startsFile, JSON.stringify(starts));
+    if (starts.length >= 3) {
+      await alertOwner('Restart loop warning', new Error('The bot has started ' + starts.length + ' times in the last 10 minutes. Check the Render logs for a crash or a failing deploy.'));
+    }
+  } catch (e) { console.error('Restart-loop check failed:', e.message); }
   await autoRestoreOnStartup();
   try {
     const status = ['online', 'idle', 'dnd', 'invisible'].includes(savedPresence?.status) ? savedPresence.status : 'online';
@@ -3964,6 +3977,7 @@ async function cmdTotal(interaction) {
 
 // Shown by /bot refresh-commands so the owner can see what this deployed version changed. Add a line per update.
 const RECENT_UPDATES = [
+  'Restart-loop warning: you get a DM if the bot starts 3+ times in 10 minutes.',
   'ZIP/file attachment limit raised to 100 MB; larger files (or a Discord rejection) use the one-time link only.',
   'Owner "File sent" notice shows Delivery Method: Automatic file delivery, or Get file button on the invoice.',
   'Paid delivery: ZIP is attached with the ready embed plus a one-time download link; link only if it cannot be attached.',
