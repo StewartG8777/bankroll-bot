@@ -6,6 +6,7 @@ const express = require('express');
 const Stripe = require('stripe');
 const AdmZip = require('adm-zip'); // Used for archive editing and small archive inspection.
 const yauzl = require('yauzl'); // Streaming ZIP reader for large archives.
+const zlib = require('zlib');
 const { pipeline } = require('stream/promises');
 const { Readable, Transform } = require('stream');
 const { monitorEventLoopDelay } = require('perf_hooks');
@@ -29,6 +30,7 @@ const {
   AttachmentBuilder,
   ChannelType,
   PermissionFlagsBits,
+  Options,
 } = require('discord.js');
 
 const {
@@ -57,10 +59,33 @@ const {
 
 const MONZO_LINK = (MONZO_ME_URL || (MONZO_USERNAME ? `https://monzo.me/${MONZO_USERNAME.replace(/^\/+|\/+$/g, '')}` : '')).replace(/\/+$/, '');
 
+// Fail with a clear Render log line instead of an obscure crash when a required variable is missing.
+for (const [name, value] of Object.entries({ DISCORD_TOKEN, STRIPE_SECRET_KEY })) {
+  if (!String(value || '').trim()) {
+    console.error(`STARTUP ERROR: required environment variable ${name} is missing or empty. Set it in the Render Environment tab and redeploy.`);
+    process.exit(1);
+  }
+}
+if (!OWNER_ID) console.warn('STARTUP WARNING: OWNER_ID is not set; owner-only commands and owner DMs will not work.');
+if (!/^whsec_/.test(String(STRIPE_WEBHOOK_SECRET || ''))) console.warn('STARTUP WARNING: STRIPE_WEBHOOK_SECRET is missing or does not start with whsec_. Stripe webhooks will be rejected. A LIVE key needs the signing secret of the LIVE webhook endpoint.');
+console.log(`Stripe mode: ${/^(sk|rk)_live_/.test(STRIPE_SECRET_KEY) ? 'LIVE' : 'TEST'}`);
 const stripe = new Stripe(STRIPE_SECRET_KEY);
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
   partials: [Partials.Channel],
+  // The backup restore pages through thousands of messages. Without limits discord.js keeps every
+  // fetched message (and its attachments) in memory forever, which is risky on a 512 MB free instance.
+  makeCache: Options.cacheWithLimits({
+    ...Options.DefaultMakeCacheSettings,
+    MessageManager: 25,
+    ReactionManager: 0,
+    GuildMemberManager: 50,
+    PresenceManager: 0,
+    VoiceStateManager: 0,
+    GuildScheduledEventManager: 0,
+    StageInstanceManager: 0,
+    ThreadManager: 0,
+  }),
 });
 
 // Who is allowed to run the commands (owner is always allowed)
@@ -117,11 +142,10 @@ try {
 let restoreDone = false;
 let backupTimer = null;
 function saveNotifications() {
-  try {
-    atomicWrite(NOTIFICATIONS_FILE, JSON.stringify(notificationHistory.slice(-100), null, 2));
-  } catch (e) {
-    console.error('Could not save notification history:', e.message);
-  }
+  debouncedSave('notifications', () => {
+    try { atomicWrite(NOTIFICATIONS_FILE, JSON.stringify(notificationHistory.slice(-100))); }
+    catch (e) { console.error('Could not save notification history:', e.message); }
+  });
   scheduleBackup();
 }
 function recordNotification(type, title, detail, status = 'info') {
@@ -146,13 +170,21 @@ const money = (amount, cur) =>
 const short = (text, n) => (text && text.length > n ? text.slice(0, n - 1) + '…' : text || '—');
 
 // Posts a copy of important events to a private server channel (via a channel webhook).
-async function getLogChannel() {
+let logChannelCache = { channel: null, at: 0 };
+async function findLogChannel() {
   if (LOG_CHANNEL_ID) return client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
   for (const g of client.guilds.cache.values()) {
     const c = g.channels.cache.find((x) => x.name === 'bankroll-log' && x.isTextBased());
     if (c) return c;
   }
   return null;
+}
+// The channel is looked up once and reused for 10 minutes; a failed post clears it so it is found again.
+async function getLogChannel() {
+  if (logChannelCache.channel && Date.now() - logChannelCache.at < 10 * 60 * 1000) return logChannelCache.channel;
+  const channel = await findLogChannel();
+  logChannelCache = { channel: channel || null, at: Date.now() };
+  return channel;
 }
 
 async function logToServer(payload) {
@@ -180,6 +212,7 @@ async function logToServer(payload) {
     }
   } catch (e) {
     console.error('Log channel failed:', e.message);
+    logChannelCache = { channel: null, at: 0 };
   }
   if (!LOG_WEBHOOK_URL) return;
   try {
@@ -318,13 +351,14 @@ const WEBHOOK_EVENTS_FILE = path.join(DATA_DIR, 'webhook_events.json');
 const WIPED_CUSTOMERS_FILE = path.join(DATA_DIR, 'wiped_customers.json');
 let processedWebhookEvents = {};
 try { processedWebhookEvents = JSON.parse(fs.readFileSync(WEBHOOK_EVENTS_FILE, 'utf8')); } catch {}
-    try { const ids = JSON.parse(fs.readFileSync(WIPED_CUSTOMERS_FILE, 'utf8')); if (Array.isArray(ids)) wipedCustomers = new Set(ids.map(String)); } catch {}
 function hasProcessedWebhook(id) { return !!(id && processedWebhookEvents[id]); }
 function markWebhookProcessed(id, type) {
   if (!id) return;
   processedWebhookEvents[id] = { type: String(type || 'unknown'), at: Date.now() };
   processedWebhookEvents = Object.fromEntries(Object.entries(processedWebhookEvents).sort((a,b) => Number(b[1]?.at || 0)-Number(a[1]?.at || 0)).slice(0,2000));
-  try { atomicWrite(WEBHOOK_EVENTS_FILE, JSON.stringify(processedWebhookEvents)); } catch (e) { console.error('Could not persist webhook event:', e.message); }
+  debouncedSave('webhook_events', () => {
+    try { atomicWrite(WEBHOOK_EVENTS_FILE, JSON.stringify(processedWebhookEvents)); } catch (e) { console.error('Could not persist webhook event:', e.message); }
+  });
   scheduleBackup();
 }
 const deliveryRetryTimers = new Map();
@@ -452,19 +486,53 @@ try {
   deliveries = JSON.parse(fs.readFileSync(DELIVERIES_FILE, 'utf8'));
 } catch {}
 const saveDeliveries = () => {
-  try {
-    atomicWrite(DELIVERIES_FILE, JSON.stringify(deliveries));
-  } catch (e) {
-    console.error('Could not save deliveries:', e.message);
-  }
+  debouncedSave('deliveries', () => {
+    try { atomicWrite(DELIVERIES_FILE, JSON.stringify(deliveries)); }
+    catch (e) { console.error('Could not save deliveries:', e.message); }
+  });
   scheduleBackup();
 };
 
-// Backups are sent a few seconds after any change, but never before the startup restore has finished.
-function scheduleBackup() {
+// Backups are posted at most once every 10 minutes (a final one still runs on shutdown), and never before the
+// startup restore has finished. `urgent` (a payment was just confirmed) goes out within 15 seconds instead.
+const BACKUP_MIN_INTERVAL_MS = 10 * 60 * 1000;
+let lastBackupRunAt = 0;
+let backupUrgentPending = false;
+function scheduleBackup(urgent = false) {
   if (!restoreDone) return;
+  if (urgent) backupUrgentPending = true;
+  else if (backupUrgentPending) return; // an urgent backup is already queued; don't push it back
   clearTimeout(backupTimer);
-  backupTimer = setTimeout(() => backupData(), 15 * 1000);
+  const wait = backupUrgentPending ? 15 * 1000 : Math.max(15 * 1000, BACKUP_MIN_INTERVAL_MS - (Date.now() - lastBackupRunAt));
+  backupTimer = setTimeout(() => { backupUrgentPending = false; backupData(); }, wait);
+}
+
+// Several save functions fire many times in a burst (a single delivery can call saveDeliveries() a dozen
+// times). Writes for the same file are coalesced into one write ~1.5s later; flushSaves() writes anything
+// pending immediately (used before every backup, restore and on shutdown).
+const pendingSaves = new Map();
+function debouncedSave(label, writeFn, delayMs = 1500) {
+  const existing = pendingSaves.get(label);
+  if (existing) { existing.writeFn = writeFn; return; }
+  pendingSaves.set(label, { writeFn, timer: setTimeout(() => runPendingSave(label), delayMs) });
+}
+function runPendingSave(label) {
+  const entry = pendingSaves.get(label);
+  if (!entry) return;
+  clearTimeout(entry.timer);
+  pendingSaves.delete(label);
+  try { entry.writeFn(); } catch (e) { console.error(`Could not save ${label}:`, e.message); }
+}
+function flushSaves() { for (const label of [...pendingSaves.keys()]) runPendingSave(label); }
+
+// SHA-256 of a stored file, recomputed only when its size or modified time changed.
+const fileHashCache = new Map();
+async function sha256FileCached(fp, st) {
+  const hit = fileHashCache.get(fp);
+  if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.sha;
+  const sha = await sha256File(fp);
+  fileHashCache.set(fp, { size: st.size, mtimeMs: st.mtimeMs, sha });
+  return sha;
 }
 
 // Monzo ledger: every Monzo invoice (open / paid / cancelled / expired) so history and totals survive.
@@ -595,11 +663,10 @@ let wipedCustomers = new Set();
 try { const ids = JSON.parse(fs.readFileSync(WIPED_CUSTOMERS_FILE, 'utf8')); if (Array.isArray(ids)) wipedCustomers = new Set(ids.map(String)); } catch {}
 function saveWipedCustomers() { atomicWrite(WIPED_CUSTOMERS_FILE, JSON.stringify([...wipedCustomers], null, 2)); }
 const saveMonzo = () => {
-  try {
-    atomicWrite(MONZO_FILE, JSON.stringify(monzoLedger));
-  } catch (e) {
-    console.error('Could not save Monzo ledger:', e.message);
-  }
+  debouncedSave('monzo_payments', () => {
+    try { atomicWrite(MONZO_FILE, JSON.stringify(monzoLedger)); }
+    catch (e) { console.error('Could not save Monzo ledger:', e.message); }
+  });
   scheduleBackup();
 };
 const MONZO_OPEN_MS = 7 * 24 * 60 * 60 * 1000;
@@ -630,25 +697,28 @@ const monzoPaid = () => {
 
 // Ensure every historical sale approved in /monzo-review is present in the same
 // paid ledger used by /payments, /total, /customer and financial reports.
-function syncMonzoReviewSalesToLedger() {
-  // Startup backup recovery can replace these JSON files after the module-level
-  // variables were first loaded. Reload them now so this reconciliation uses
-  // the recovered records rather than stale, pre-restore in-memory objects.
-  try {
-    const restoredLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8'));
-    if (restoredLedger && typeof restoredLedger === 'object' && !Array.isArray(restoredLedger)) {
-      monzoLedger = { ...monzoLedger, ...restoredLedger };
+function syncMonzoReviewSalesToLedger(reloadFromDisk = false) {
+  // Startup backup recovery can replace these JSON files after the module-level variables were first
+  // loaded, so startup (and /restore) pass reloadFromDisk=true to reconcile against the recovered records.
+  // The report commands call it without that and no longer re-read two JSON files on every run.
+  if (reloadFromDisk) {
+    flushSaves();
+    try {
+      const restoredLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8'));
+      if (restoredLedger && typeof restoredLedger === 'object' && !Array.isArray(restoredLedger)) {
+        monzoLedger = { ...monzoLedger, ...restoredLedger };
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') console.error('Could not reload recovered Monzo ledger:', error.message);
     }
-  } catch (error) {
-    if (error.code !== 'ENOENT') console.error('Could not reload recovered Monzo ledger:', error.message);
-  }
-  try {
-    const restoredReview = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
-    if (restoredReview && typeof restoredReview === 'object') {
-      monzoReviewState = mergeMonzoReviewStates(monzoReviewState, restoredReview);
+    try {
+      const restoredReview = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
+      if (restoredReview && typeof restoredReview === 'object') {
+        monzoReviewState = mergeMonzoReviewStates(monzoReviewState, restoredReview);
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') console.error('Could not reload recovered Monzo review records:', error.message);
     }
-  } catch (error) {
-    if (error.code !== 'ENOENT') console.error('Could not reload recovered Monzo review records:', error.message);
   }
 
   let added = 0;
@@ -716,6 +786,7 @@ function markMonzoPaid(key, txId, manual = false) {
   if (txId) e.txId = txId;
   if (manual) e.manual = true;
   saveMonzo();
+  scheduleBackup(true);
   if (d) {
     d.paid = true;
     d.paymentConfirmed = true;
@@ -725,8 +796,13 @@ function markMonzoPaid(key, txId, manual = false) {
   }
 }
 
-for (const [k, d] of Object.entries(deliveries)) {
-  if (Date.now() - d.savedAt > 7 * 24 * 60 * 60 * 1000) {
+// Removes delivery records (and their files) older than 7 days. Runs at startup and then hourly.
+// A paid order that has not been delivered yet is never purged: its file is still owed to the customer.
+function purgeOldDeliveries() {
+  let removed = 0;
+  for (const [k, d] of Object.entries(deliveries)) {
+    if (!d || !(Date.now() - d.savedAt > 7 * 24 * 60 * 60 * 1000)) continue;
+    if ((d.paymentConfirmed || d.paid) && !d.deliveryComplete) continue;
     if (d.path) {
       try {
         fs.unlinkSync(d.path);
@@ -734,14 +810,16 @@ for (const [k, d] of Object.entries(deliveries)) {
     }
     if (d.type === 'monzo' && monzoLedger[k]?.status === 'open') {
       monzoLedger[k].status = 'expired';
-      try {
-        atomicWrite(MONZO_FILE, JSON.stringify(monzoLedger));
-      } catch {}
+      saveMonzo();
     }
     delete deliveries[k];
+    removed++;
   }
+  if (removed) console.log(`Purged ${removed} delivery record(s) older than 7 days.`);
+  saveDeliveries();
 }
-saveDeliveries();
+purgeOldDeliveries();
+setInterval(purgeOldDeliveries, 60 * 60 * 1000).unref?.();
 
 const liveInteractions = new Map();
 
@@ -869,7 +947,9 @@ try { const h = JSON.parse(fs.readFileSync(DOWNLOAD_HISTORY_FILE, 'utf8')); if (
 function recordDownloadEvent(type, details = {}) {
   const entry = { id: crypto.randomUUID(), type, file: short(String(details.file || 'Unknown file'), 140), customerId: details.customerId || null, agentId: details.agentId || null, token: details.token ? String(details.token).slice(0, 12) : null, detail: short(String(details.detail || ''), 300), at: Date.now() };
   downloadHistory.push(entry); if (downloadHistory.length > 500) downloadHistory = downloadHistory.slice(-500);
-  try { atomicWrite(DOWNLOAD_HISTORY_FILE, JSON.stringify(downloadHistory, null, 2)); } catch (e) { console.error('Could not save download history:', e.message); }
+  debouncedSave('download_history', () => {
+    try { atomicWrite(DOWNLOAD_HISTORY_FILE, JSON.stringify(downloadHistory)); } catch (e) { console.error('Could not save download history:', e.message); }
+  });
   scheduleBackup(); return entry;
 }
 let downloads = {};
@@ -877,11 +957,10 @@ try {
   downloads = JSON.parse(fs.readFileSync(DOWNLOADS_FILE, 'utf8'));
 } catch {}
 const saveDownloads = () => {
-  try {
-    atomicWrite(DOWNLOADS_FILE, JSON.stringify(downloads));
-  } catch (e) {
-    console.error('Could not save downloads:', e.message);
-  }
+  debouncedSave('downloads', () => {
+    try { atomicWrite(DOWNLOADS_FILE, JSON.stringify(downloads)); }
+    catch (e) { console.error('Could not save downloads:', e.message); }
+  });
   scheduleBackup();
 };
 const activeDownloadTokens = new Set();
@@ -946,15 +1025,18 @@ async function verifyZipIntegrity(filePath) {
         entries++;
         zip.openReadStream(entry, (streamError, stream) => {
           if (streamError) return fail(streamError);
-          let crc = 0xffffffff;
+          // zlib.crc32 (Node 20.15+/22.2+) runs natively; the JS table loop is only a fallback.
+          const nativeCrc = typeof zlib.crc32 === 'function';
+          let crc = nativeCrc ? 0 : 0xffffffff;
           let size = 0;
           stream.on('data', (chunk) => {
             size += chunk.length;
+            if (nativeCrc) { crc = zlib.crc32(chunk, crc); return; }
             for (let i = 0; i < chunk.length; i++) crc = ZIP_CRC_TABLE[(crc ^ chunk[i]) & 0xff] ^ (crc >>> 8);
           });
           stream.on('error', fail);
           stream.on('end', () => {
-            const actualCrc = (crc ^ 0xffffffff) >>> 0;
+            const actualCrc = nativeCrc ? crc >>> 0 : (crc ^ 0xffffffff) >>> 0;
             if (size !== Number(entry.uncompressedSize)) return fail(new Error(`ZIP entry size mismatch: ${entry.fileName}`));
             if (actualCrc !== (Number(entry.crc32) >>> 0)) return fail(new Error(`ZIP CRC/checksum error: ${entry.fileName}`));
             zip.readEntry();
@@ -1004,7 +1086,9 @@ async function makeDownloadLink(d, paymentIntentId) {
   const token = crypto.randomBytes(24).toString('hex');
   const safeName = path.basename(String(d.name || 'download.zip')).replace(/[^\w.\-]/g, '_');
   const downloadPath = path.join(FILES_DIR, `download_${token}_${safeName}`);
-  await fs.promises.copyFile(d.path, downloadPath);
+  // A hard link is instant and uses no extra disk; fall back to a copy if links are not possible.
+  try { await fs.promises.link(d.path, downloadPath); }
+  catch { await fs.promises.copyFile(d.path, downloadPath); }
   downloads[token] = {
     path: downloadPath,
     name: safeName,
@@ -1119,6 +1203,7 @@ async function logInvoiceWithFile(embed, fileData, filePath) {
   }
 }
 const blobBackedUp = {}; // relative path -> size already in the backup channel
+const blobBackupMsgIds = {}; // relative path -> message ids of the parts this process uploaded last
 function relData(p) {
   if (!p) return null;
   const rel = path.relative(DATA_DIR, path.resolve(String(p)));
@@ -1175,6 +1260,8 @@ function safeBackupRel(rel) {
 
 async function backupDataOnce() {
   if (!restoreDone) return;
+  flushSaves(); // make sure the files on disk are current before they are read below
+  lastBackupRunAt = Date.now();
   const ch = await resolveBackupChannel();
   if (!ch) {
     console.error('Backup channel not found. Set BACKUP_CHANNEL_ID or create #bankroll-backup.');
@@ -1202,7 +1289,10 @@ async function backupDataOnce() {
     }
 
     if (files.length) {
-      const hash = crypto.createHash('sha256').update(Buffer.concat(files.map((f) => f.buffer))).digest('hex');
+      // These three change constantly (every notification, download event and webhook). They are still
+      // INCLUDED in a snapshot whenever one posts, but on their own they no longer trigger one.
+      const NOISY_BACKUP_FILES = new Set(['notifications.json', 'download_history.json', 'webhook_events.json']);
+      const hash = crypto.createHash('sha256').update(Buffer.concat(files.filter((f) => !NOISY_BACKUP_FILES.has(f.name)).map((f) => f.buffer))).digest('hex');
       if (hash !== lastBackupHash) {
         const manifest = {
           format: 'bankroll-backup-v2',
@@ -1233,7 +1323,7 @@ async function backupDataOnce() {
       let st;
       try { st = fs.statSync(fp); } catch { continue; }
       if (!st.isFile() || !st.size) continue;
-      const sha256 = await sha256File(fp);
+      const sha256 = await sha256FileCached(fp, st);
       const signature = `${st.size}:${sha256}`;
       if (blobBackedUp[rel] === signature) continue;
 
@@ -1248,17 +1338,29 @@ async function backupDataOnce() {
         continue;
       }
       try {
-        const buffer = fs.readFileSync(fp);
-        const total = Math.ceil(buffer.length / PART_BYTES);
-        for (let part = 1; part <= total; part++) {
-          const start = (part - 1) * PART_BYTES;
-          const piece = buffer.subarray(start, Math.min(start + PART_BYTES, buffer.length));
-          await ch.send({
-            content: `datafile-v2:${rel}|${st.size}|${sha256}|${part}/${total}`,
-            files: [new AttachmentBuilder(piece, { name: `bankroll-backup-part-${part}-of-${total}.bin` })],
-            allowedMentions: { parse: [] },
-          });
-        }
+        // Read one 8 MiB part at a time (peak memory ~8 MiB instead of the whole file).
+        const total = Math.ceil(st.size / PART_BYTES);
+        const sentIds = [];
+        const handle = await fs.promises.open(fp, 'r');
+        try {
+          for (let part = 1; part <= total; part++) {
+            const start = (part - 1) * PART_BYTES;
+            const piece = Buffer.alloc(Math.min(PART_BYTES, st.size - start));
+            const { bytesRead } = await handle.read(piece, 0, piece.length, start);
+            if (bytesRead !== piece.length) throw new Error(`short read on ${rel} part ${part}/${total}`);
+            const sent = await ch.send({
+              content: `datafile-v2:${rel}|${st.size}|${sha256}|${part}/${total}`,
+              files: [new AttachmentBuilder(piece, { name: `bankroll-backup-part-${part}-of-${total}.bin` })],
+              allowedMentions: { parse: [] },
+            });
+            if (sent?.id) sentIds.push(sent.id);
+          }
+        } finally { await handle.close().catch(() => {}); }
+        // The new copy is complete: delete the parts THIS process uploaded earlier for the same file,
+        // so the backup channel (and every startup scan) stops growing with each change.
+        const superseded = blobBackupMsgIds[rel] || [];
+        blobBackupMsgIds[rel] = sentIds;
+        for (const oldId of superseded) await ch.messages.delete(oldId).catch(() => {});
         blobBackedUp[rel] = signature;
         lastBackupAt = Date.now();
         console.log(`Backed up ${rel} to Discord as ${total} verified part(s).`);
@@ -1460,6 +1562,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   d.paymentConfirmedAt = d.paymentConfirmedAt || Date.now();
   if (paymentIntentId) d.paymentIntentId = paymentIntentId;
   saveDeliveries();
+  if (!wasPaymentConfirmed) scheduleBackup(true);
   startDeliveryWatch(key);
   // The original invoice message is left untouched; the delivery is posted as a reply under it.
   if (!wasPaymentConfirmed) {
@@ -2092,6 +2195,20 @@ const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription(
 
 const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
+// Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
+// are never cached.
+const asyncCache = new Map();
+function cachedAsync(key, ttlMs, fn) {
+  const hit = asyncCache.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.promise;
+  const promise = Promise.resolve().then(fn);
+  asyncCache.set(key, { at: Date.now(), promise });
+  promise.catch(() => { if (asyncCache.get(key)?.promise === promise) asyncCache.delete(key); });
+  if (asyncCache.size > 200) for (const [k, v] of asyncCache) if (Date.now() - v.at > 5 * 60 * 1000) asyncCache.delete(k);
+  return promise;
+}
+const recentCheckoutSessions = () => cachedAsync('sessions:recent500', 30 * 1000, () => stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 }));
+
 let started = false;
 async function autoRestoreOnStartup() {
   let ch = null;
@@ -2302,19 +2419,36 @@ async function autoRestoreOnStartup() {
 
     const allGroups = [...groups.values()];
     const completeGroupsFor = (rel) => allGroups.filter((g) => g.rel === rel && g.parts.size === g.total);
-    const downloadGroup = async (g) => {
-      const chunks = [];
-      for (let i = 1; i <= g.total; i++) {
-        const partAtt = g.parts.get(i);
-        if (!partAtt) throw new Error(`missing part ${i}/${g.total}`);
-        const res = await fetch(partAtt.url);
-        if (!res.ok) throw new Error(`HTTP ${res.status} downloading part ${i}`);
-        chunks.push(Buffer.from(await res.arrayBuffer()));
+    // Streams every part straight into a temp file, hashing as it goes, then verifies size + SHA-256
+    // and renames it into place. Only one 8 MiB part is ever held in memory.
+    const downloadGroupToFile = async (g, destPath) => {
+      fs.mkdirSync(path.dirname(destPath), { recursive: true });
+      const tmpPath = `${destPath}.restore.tmp`;
+      const hash = crypto.createHash('sha256');
+      let written = 0;
+      const out = fs.createWriteStream(tmpPath);
+      const finished = new Promise((resolve, reject) => { out.on('finish', resolve); out.on('error', reject); });
+      try {
+        for (let i = 1; i <= g.total; i++) {
+          const partAtt = g.parts.get(i);
+          if (!partAtt) throw new Error(`missing part ${i}/${g.total}`);
+          const res = await fetch(partAtt.url, { signal: AbortSignal.timeout(5 * 60 * 1000) });
+          if (!res.ok) throw new Error(`HTTP ${res.status} downloading part ${i}`);
+          const piece = Buffer.from(await res.arrayBuffer());
+          hash.update(piece);
+          written += piece.length;
+          if (!out.write(piece)) await new Promise((resolve) => out.once('drain', resolve));
+        }
+        out.end();
+        await finished;
+        if (written !== g.size) throw new Error(`size mismatch (${written}/${g.size})`);
+        if (g.sha && hash.digest('hex') !== g.sha) throw new Error('SHA-256 mismatch');
+        fs.renameSync(tmpPath, destPath);
+      } catch (e) {
+        out.destroy();
+        try { fs.unlinkSync(tmpPath); } catch {}
+        throw e;
       }
-      const buf = Buffer.concat(chunks);
-      if (buf.length !== g.size) throw new Error(`size mismatch (${buf.length}/${g.size})`);
-      if (g.sha && crypto.createHash('sha256').update(buf).digest('hex') !== g.sha) throw new Error('SHA-256 mismatch');
-      return buf;
     };
     const downloadZipBackup = async (z) => {
       const res = await fetch(z.att.url, { signal: AbortSignal.timeout(120000) });
@@ -2425,9 +2559,7 @@ async function autoRestoreOnStartup() {
       }
       if (!restored) for (const g of candidates) {
         try {
-          const buf = await downloadGroup(g);
-          fs.mkdirSync(path.dirname(fp), { recursive: true });
-          atomicWrite(fp, buf);
+          await downloadGroupToFile(g, fp);
           if (g.sha) blobBackedUp[rel] = `${g.size}:${g.sha}`;
           recovered += 1;
           restored = true;
@@ -2466,7 +2598,10 @@ async function autoRestoreOnStartup() {
       }
 
       if (!restored) {
-        if (!fs.existsSync(fp)) lost.push(`${rel}${lastError ? ` (${lastError.message})` : ''}`);
+        if (!fs.existsSync(fp)) {
+          const staleLink = lastError && /backup link HTTP (404|410)/.test(String(lastError.message));
+          lost.push(`${rel}${lastError ? ` (${lastError.message}${staleLink ? ' - old hosted-link backup is dead; re-add the file with /vault add so its bytes are stored in Discord' : ''})` : ''}`);
+        }
         else lost.push(`${rel} (backup checksum/size mismatch)`);
       }
     }
@@ -2528,11 +2663,21 @@ const onReady = async () => {
   // Register the slash commands from this deployed version on every startup.
   // This ensures new/changed commands are published after a Render deployment.
   try {
-    await client.application.commands.set(commands.map((c) => c.toJSON()));
-    console.log(`Registered ${commands.length} global slash/context command(s) from the running version.`);
-    if (DISCORD_GUILD_ID) {
-      const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
-      if (guild) await guild.commands.set([]);
+    const commandJson = commands.map((c) => c.toJSON());
+    const commandHash = crypto.createHash('sha256').update(JSON.stringify(commandJson)).digest('hex');
+    const commandHashFile = path.join(DATA_DIR, 'commands.hash');
+    let previousHash = '';
+    try { previousHash = fs.readFileSync(commandHashFile, 'utf8').trim(); } catch {}
+    if (previousHash === commandHash) {
+      console.log('Slash commands unchanged since the last start; skipping re-registration (use /bot refresh-commands to force).');
+    } else {
+      await client.application.commands.set(commandJson);
+      console.log(`Registered ${commands.length} global slash/context command(s) from the running version.`);
+      if (DISCORD_GUILD_ID) {
+        const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
+        if (guild) await guild.commands.set([]);
+      }
+      try { atomicWrite(commandHashFile, commandHash); } catch {}
     }
   } catch (error) {
     console.error('Automatic slash-command refresh failed:', error);
@@ -2558,11 +2703,13 @@ const onReady = async () => {
   } catch (error) {
     console.error('Could not restore saved bot presence:', error);
   }
+  void syncStripeLedger().then(() => { if (!stripeLedgerReady) setTimeout(() => void syncStripeLedger(), 2 * 60 * 1000); });
+  setInterval(() => void syncStripeLedger(), 6 * 60 * 60 * 1000);
   await reconcilePaidStripeDeliveries();
   restorePendingDeliveryRetries();
 
   backfillMonzoLedger();
-  syncMonzoReviewSalesToLedger();
+  syncMonzoReviewSalesToLedger(true);
   applyMonzoReviewCustomerIds();
   const monzoRebuilt = restoreMonzoReminders();
   restoreReminders().then(async (n) => {
@@ -2613,7 +2760,9 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     shuttingDown = true;
     console.log(`${sig} received: saving a last backup before exit`);
     clearTimeout(backupTimer);
+    flushSaves();
     await Promise.race([backupData().catch(() => {}), new Promise((r) => setTimeout(r, 20000))]);
+    try { await client.destroy(); } catch {}
     process.exit(0);
   });
 }
@@ -3248,6 +3397,51 @@ function zipSpawnCodes(zip) {
   return [...found];
 }
 
+// Same result as zipSpawnCodes(), but reads the archive from disk with the streaming ZIP reader: only the small
+// vehicles*.meta files are inflated and the archive is never loaded into memory or processed synchronously.
+function zipSpawnCodesFromFile(filePath) {
+  return new Promise((resolve, reject) => {
+    yauzl.open(filePath, { lazyEntries: true, autoClose: true, decodeStrings: true }, (openError, zip) => {
+      if (openError) return reject(openError);
+      const found = new Set();
+      const yftNames = new Set();
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        try { zip.close(); } catch {}
+        if (error) return reject(error);
+        resolve([...(found.size ? found : yftNames)]);
+      };
+      zip.on('error', finish);
+      zip.on('end', () => finish());
+      zip.on('entry', (entry) => {
+        const name = String(entry.fileName || '').replace(/\\/g, '/');
+        if (name.endsWith('/')) return zip.readEntry();
+        const base = path.posix.basename(name).toLowerCase();
+        const yft = base.match(/^([a-z0-9_]+?)(?:_hi)?\.yft$/);
+        if (yft) yftNames.add(yft[1]);
+        if (/^vehicles.*\.meta$/.test(base) && Number(entry.uncompressedSize) <= 5 * 1024 * 1024) {
+          zip.openReadStream(entry, (streamError, stream) => {
+            if (streamError) return finish(streamError);
+            const chunks = [];
+            stream.on('data', (chunk) => chunks.push(chunk));
+            stream.on('error', finish);
+            stream.on('end', () => {
+              const text = Buffer.concat(chunks).toString('utf8');
+              for (const m of text.matchAll(/<modelName>\s*([^<\s]+)\s*<\/modelName>/gi)) found.add(m[1].toLowerCase());
+              zip.readEntry();
+            });
+          });
+        } else {
+          zip.readEntry();
+        }
+      });
+      zip.readEntry();
+    });
+  });
+}
+
 // Rewrites a vehicle resource zip so spawn code `oldCode` becomes `newCode`:
 //  - stream files / folders named after it (adder.yft, adder_hi.yft, adder.ytd, adder+hi.ytd ...) are renamed
 //  - <modelName>, <txdName>, <handlingId>, <handlingName>, <parent>, <child> in .meta/.xml files are updated
@@ -3424,9 +3618,9 @@ async function cmdVault(interaction) {
     recordNotification('vault.add', 'Vault file added', `${key}: ${att.name}`, 'success');
 
     let codeNote = '';
-    if (/\.zip$/i.test(att.name) && info.size <= 50 * 1024 * 1024) {
+    if (/\.zip$/i.test(att.name)) {
       try {
-        const codes = zipSpawnCodes(new AdmZip(filePath));
+        const codes = await zipSpawnCodesFromFile(filePath);
         if (codes.length) {
           codeNote = ` Spawn code${codes.length > 1 ? 's' : ''} found: ${codes.slice(0, 10).map((c) => `\`${c}\``).join(', ')}. Change it with /vault edit.`;
         }
@@ -3469,9 +3663,8 @@ async function cmdVault(interaction) {
       let zipCheck = 'Not a ZIP file';
       if (/\.zip$/i.test(item.originalName || item.path)) {
         try {
-          const zip = new AdmZip(item.path);
-          zip.getEntries();
-          zipCheck = 'ZIP opened successfully';
+          const zipInfo = await verifyZipIntegrity(item.path);
+          zipCheck = `ZIP verified: ${zipInfo.entries} file(s), all checksums OK`;
         } catch (zipError) {
           zipCheck = `ZIP could not be opened: ${short(zipError.message, 180)}`;
         }
@@ -3613,7 +3806,7 @@ async function cmdVault(interaction) {
     try {
       buf = await fs.promises.readFile(item.path);
       if (!oldCode) {
-        const codes = zipSpawnCodes(new AdmZip(buf));
+        const codes = await zipSpawnCodesFromFile(item.path);
         if (!codes.length) return interaction.editReply('I could not find a spawn code in that zip. Pass old_spawncode yourself.');
         if (codes.length > 1) {
           return interaction.editReply(`This zip has more than one vehicle: ${codes.map((c) => `\`${c}\``).join(', ')}. Pass old_spawncode to say which one to change.`);
@@ -4098,6 +4291,7 @@ async function cmdStatus(interaction) {
 // ---------- /restore ----------
 async function cmdRestore(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the owner can run this.');
+  flushSaves();
   const att = interaction.options.getAttachment('file');
   if (att.size > 5 * 1024 * 1024) return interaction.editReply('That file is too big to be a backup.');
 
@@ -4122,7 +4316,7 @@ async function cmdRestore(interaction) {
   }
   if (target === 'download_history') {
     downloadHistory = Array.isArray(data) ? data.filter((n) => n && typeof n === 'object').slice(-500) : [];
-    try { atomicWrite(DOWNLOAD_HISTORY_FILE, JSON.stringify(downloadHistory, null, 2)); } catch (e) { return interaction.editReply(`Could not save download history: ${e.message}`); }
+    try { atomicWrite(DOWNLOAD_HISTORY_FILE, JSON.stringify(downloadHistory)); } catch (e) { return interaction.editReply(`Could not save download history: ${e.message}`); }
     return interaction.editReply(`Restored ${downloadHistory.length} download history record(s).`);
   }
 
@@ -4135,6 +4329,7 @@ async function cmdRestore(interaction) {
     monzoReviewState = mergeMonzoReviewStates(monzoReviewState, data);
     if (!saveMonzoReview()) return interaction.editReply('❌ The review backup was merged in memory but could not be verified on disk. Check Render logs.');
     const after = Object.keys(monzoReviewState.reviewed || {}).length;
+    syncMonzoReviewSalesToLedger(true);
     return interaction.editReply('Restored/merged Monzo review history. ' + Math.max(0, after - before) + ' new reviewed sale(s); ' + after + ' total reviewed sale(s) now saved.');
   }
 
@@ -4217,12 +4412,83 @@ async function cmdCurrency(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
+// ---------- Local card-payment ledger ----------
+// /total, /payments and /customer used to list up to 2000 payment intents from Stripe on every run. Now
+// every succeeded card payment is kept in a small local ledger that is (1) fully re-synced from Stripe at
+// startup and every 6 hours, and (2) updated live from webhooks. Until the first full sync of this run has
+// succeeded (or if it fails) the commands fall back to asking Stripe directly, exactly as before.
+// The ledger is derived data that Stripe can always rebuild, so it is NOT part of the Discord backups.
+const STRIPE_LEDGER_FILE = path.join(DATA_DIR, 'stripe_ledger.json');
+let stripeLedger = {};
+let stripeLedgerReady = false;
+try {
+  const savedLedger = JSON.parse(fs.readFileSync(STRIPE_LEDGER_FILE, 'utf8'));
+  if (savedLedger && typeof savedLedger.payments === 'object' && !Array.isArray(savedLedger.payments)) stripeLedger = savedLedger.payments;
+} catch {}
+function saveStripeLedger() {
+  debouncedSave('stripe_ledger', () => {
+    try { atomicWrite(STRIPE_LEDGER_FILE, JSON.stringify({ savedAt: Date.now(), payments: stripeLedger })); }
+    catch (e) { console.error('Could not save Stripe ledger:', e.message); }
+  });
+}
+// Turns a Stripe PaymentIntent (ideally expanded with latest_charge.balance_transaction) into a ledger record.
+function paymentRecordFromPI(pi, { requireAgent = true } = {}) {
+  if (!pi || pi.status !== 'succeeded') return null;
+  if (requireAgent && !pi.metadata?.agent_id) return null;
+  const ch = pi.latest_charge && typeof pi.latest_charge === 'object' ? pi.latest_charge : null;
+  const bt = ch?.balance_transaction && typeof ch.balance_transaction === 'object' ? ch.balance_transaction : null;
+  return {
+    id: pi.id,
+    created: Number(pi.created || 0),
+    amount: Number(pi.amount_received ?? pi.amount ?? 0),
+    currency: String(pi.currency || '').toLowerCase(),
+    customerId: String(pi.metadata?.customer_id || ''),
+    agentId: String(pi.metadata?.agent_id || ''),
+    description: String(pi.metadata?.description || ''),
+    fee: bt ? Number(bt.fee || 0) : null,
+    refunded: ch ? Number(ch.amount_refunded || 0) : 0,
+  };
+}
+let stripeLedgerSyncing = null;
+function syncStripeLedger() {
+  if (stripeLedgerSyncing) return stripeLedgerSyncing;
+  stripeLedgerSyncing = (async () => {
+    try {
+      const all = await stripe.paymentIntents.list({ limit: 100, expand: ['data.latest_charge.balance_transaction'] }).autoPagingToArray({ limit: 2000 });
+      for (const pi of all) {
+        const record = paymentRecordFromPI(pi);
+        if (record) stripeLedger[record.id] = record;
+      }
+      stripeLedgerReady = true;
+      saveStripeLedger();
+      console.log(`Stripe ledger synced: ${Object.keys(stripeLedger).length} card payment(s) on record.`);
+    } catch (e) {
+      console.error('Stripe ledger sync failed (commands keep asking Stripe directly):', e.message);
+    } finally { stripeLedgerSyncing = null; }
+  })();
+  return stripeLedgerSyncing;
+}
+async function updateStripeLedgerFromPI(piId) {
+  if (!piId) return;
+  try {
+    const pi = await stripe.paymentIntents.retrieve(String(piId), { expand: ['latest_charge.balance_transaction'] });
+    const record = paymentRecordFromPI(pi);
+    if (record) { stripeLedger[record.id] = record; saveStripeLedger(); }
+  } catch (e) { console.error('Could not update the local payment ledger:', e.message); }
+}
+
 // ---------- Stats commands ----------
 async function succeededPayments(sinceUnix) {
-  const params = { limit: 100, expand: ['data.latest_charge.balance_transaction'] };
-  if (sinceUnix) params.created = { gte: sinceUnix };
-  const all = await stripe.paymentIntents.list(params).autoPagingToArray({ limit: 2000 });
-  return all.filter((pi) => pi.status === 'succeeded' && pi.metadata?.agent_id && !wipedCustomers.has(String(pi.metadata?.customer_id || '')));
+  let records;
+  if (stripeLedgerReady) {
+    records = Object.values(stripeLedger).filter((r) => !sinceUnix || r.created >= sinceUnix);
+  } else {
+    const params = { limit: 100, expand: ['data.latest_charge.balance_transaction'] };
+    if (sinceUnix) params.created = { gte: sinceUnix };
+    const all = await stripe.paymentIntents.list(params).autoPagingToArray({ limit: 2000 });
+    records = all.map((pi) => paymentRecordFromPI(pi)).filter(Boolean);
+  }
+  return records.filter((r) => !wipedCustomers.has(r.customerId));
 }
 
 async function cmdPayments(interaction) {
@@ -4236,11 +4502,11 @@ async function cmdPayments(interaction) {
     console.error('Stripe payments lookup failed:', e.message);
   }
   const all = [
-    ...card.map((pi) => ({
-      at: pi.created,
+    ...card.map((r) => ({
+      at: r.created,
       text:
-        `${money(pi.amount_received / 100, pi.currency)} - <@${pi.metadata.customer_id}> - ` +
-        `${short(pi.metadata.description, 40)} - <t:${pi.created}:d> (Card)`,
+        `${money(r.amount / 100, r.currency)} - ${r.customerId ? `<@${r.customerId}>` : 'Unknown customer'} - ` +
+        `${short(r.description, 40)} - <t:${r.created}:d> (Card)`,
     })),
     ...monzoPaid().map((m) => ({
       at: tsec(m.paidAt),
@@ -4265,8 +4531,8 @@ async function cmdTotal(interaction) {
   syncMonzoReviewSalesToLedger();
   const period = interaction.options.getString('period');
   const { since, until } = periodBounds(period);
-  const everything = (await succeededPayments(since)).filter((pi) => until == null || pi.created < until);
-  const list = everything.filter((pi) => pi.currency === CURRENCY.toLowerCase());
+  const everything = (await succeededPayments(since)).filter((r) => until == null || r.created < until);
+  const list = everything.filter((r) => r.currency === CURRENCY.toLowerCase());
   const otherCurrency = everything.length - list.length;
 
   const monzoInPeriod = monzoPaid().filter((m) => (since == null || tsec(m.paidAt) >= since) && (until == null || tsec(m.paidAt) < until));
@@ -4274,17 +4540,15 @@ async function cmdTotal(interaction) {
   const monzoOther = monzoInPeriod.length - monzoList.length;
   const monzoSum = monzoList.reduce((a, m) => a + m.amount, 0);
 
-  const cardSum = list.reduce((a, pi) => a + pi.amount_received, 0) / 100;
+  const cardSum = list.reduce((a, r) => a + r.amount, 0) / 100;
   const sum = cardSum + monzoSum;
 
   let feePence = 0;
   let refundedPence = 0;
   let missingFees = 0;
-  for (const pi of list) {
-    const ch = pi.latest_charge && typeof pi.latest_charge === 'object' ? pi.latest_charge : null;
-    refundedPence += ch?.amount_refunded ?? 0;
-    const bt = ch && ch.balance_transaction && typeof ch.balance_transaction === 'object' ? ch.balance_transaction : null;
-    if (bt) feePence += bt.fee;
+  for (const r of list) {
+    refundedPence += r.refunded || 0;
+    if (r.fee != null) feePence += r.fee;
     else missingFees += 1;
   }
   const fees = feePence / 100;
@@ -4292,9 +4556,9 @@ async function cmdTotal(interaction) {
   const keep = sum - refunded - fees;
 
   const perAgent = {};
-  for (const pi of list) {
-    const id = pi.metadata.agent_id;
-    perAgent[id] = (perAgent[id] ?? 0) + pi.amount_received / 100;
+  for (const r of list) {
+    const id = r.agentId;
+    perAgent[id] = (perAgent[id] ?? 0) + r.amount / 100;
   }
   for (const m of monzoList) {
     if (m.agentId) perAgent[m.agentId] = (perAgent[m.agentId] ?? 0) + m.amount;
@@ -4553,13 +4817,14 @@ async function cmdCustomerPreview(interaction) {
   for (const m of Object.values(monzoLedger)) if (m?.customerId) ids.add(String(m.customerId));
   for (const d of Object.values(downloads)) if (d?.customerId && !d.backupDownload) ids.add(String(d.customerId));
   let sessions = [];
-  try { sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 }); }
+  try { sessions = await recentCheckoutSessions(); }
   catch (e) { console.error('Customer preview Stripe lookup failed:', e.message); }
   for (const x of sessions) if (x.metadata?.customer_id) ids.add(String(x.metadata.customer_id));
   const choices = [];
-  for (const id of [...ids].slice(0, 25)) {
-    let label = 'Customer';
-    try { const u = await client.users.fetch(id); label = u.username; } catch {}
+  const previewIds = [...ids].slice(0, 25);
+  const previewLabels = await Promise.all(previewIds.map((id) => client.users.fetch(id).then((u) => u.username).catch(() => 'Customer')));
+  for (const [index, id] of previewIds.entries()) {
+    const label = previewLabels[index];
     const count = Object.values(deliveries).filter((d) => String(d?.customerId) === id).length +
       Object.values(monzoLedger).filter((m) => String(m?.customerId) === id).length +
       sessions.filter((x) => String(x.metadata?.customer_id) === id).length;
@@ -4579,7 +4844,7 @@ async function onCustomerPreviewSelect(interaction) {
   try { customer = await client.users.fetch(customerId); } catch { customer = { username: 'Unknown customer', id: customerId }; }
   let sessions = [];
   try {
-    sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 });
+    sessions = await recentCheckoutSessions();
     sessions = sessions.filter((x) => String(x.metadata?.customer_id || '') === customerId && !wipedCustomers.has(String(x.metadata?.customer_id || '')));
   } catch (e) { console.error('Customer preview session lookup failed:', e.message); }
   const localOrders = Object.entries(deliveries).filter(([, d]) => String(d?.customerId || '') === customerId);
@@ -5075,21 +5340,25 @@ async function cmdCustomer(interaction) {
   syncMonzoReviewSalesToLedger();
   const user = interaction.options.getUser('user');
   let card = [];
-  try {
-    const res = await stripe.paymentIntents.search({
-      query: `status:'succeeded' AND metadata['customer_id']:'${user.id}'`,
-      limit: 100,
-    });
-    card = res.data.filter((pi) => !wipedCustomers.has(String(pi.metadata?.customer_id || '')));
-  } catch (e) {
-    console.error('Stripe customer lookup failed:', e.message);
+  if (stripeLedgerReady) {
+    card = Object.values(stripeLedger).filter((r) => r.customerId === String(user.id) && !wipedCustomers.has(r.customerId));
+  } else {
+    try {
+      const res = await stripe.paymentIntents.search({
+        query: `status:'succeeded' AND metadata['customer_id']:'${user.id}'`,
+        limit: 100,
+      });
+      card = res.data.map((pi) => paymentRecordFromPI(pi, { requireAgent: false })).filter((r) => r && !wipedCustomers.has(r.customerId));
+    } catch (e) {
+      console.error('Stripe customer lookup failed:', e.message);
+    }
   }
   const monzo = monzoPaid().filter((m) => m.customerId === user.id && !wipedCustomers.has(String(m.customerId || '')));
   const deliveryState = (d) => !d ? 'delivery record unavailable' : d.deliveryComplete ? 'delivered' : d.deliveryError ? 'delivery needs attention' : 'delivery pending';
   const all = [
-    ...card.map((pi) => {
-      const d = Object.entries(deliveries).find(([key, x]) => (key === pi.id || x?.paymentIntentId === pi.id) && String(x?.customerId) === user.id)?.[1];
-      return { at: pi.created, amount: pi.amount_received / 100, text: `${money(pi.amount_received / 100, pi.currency)} - ${short(pi.metadata.description, 40)} - <t:${pi.created}:d> (Card) • ${deliveryState(d)}` };
+    ...card.map((r) => {
+      const d = Object.entries(deliveries).find(([key, x]) => (key === r.id || x?.paymentIntentId === r.id) && String(x?.customerId) === user.id)?.[1];
+      return { at: r.created, amount: r.amount / 100, text: `${money(r.amount / 100, r.currency)} - ${short(r.description, 40)} - <t:${r.created}:d> (Card) • ${deliveryState(d)}` };
     }),
     ...monzo.map((m) => {
       const d = Object.values(deliveries).find((x) => x?.type === 'monzo' && x.customerId === user.id && (x.txId === m.txId || x.reference === m.reference || x.description === m.description));
@@ -5116,7 +5385,7 @@ async function cmdHistory(interaction) {
   const user = interaction.options.getUser('user');
   let card = [];
   try {
-    const sessions = await stripe.checkout.sessions.list({ limit: 100 }).autoPagingToArray({ limit: 500 });
+    const sessions = await recentCheckoutSessions();
     card = sessions.filter((s) => s.metadata?.customer_id === user.id && !wipedCustomers.has(String(s.metadata?.customer_id || '')));
   } catch (e) {
     console.error('Stripe history lookup failed:', e.message);
@@ -5259,9 +5528,10 @@ async function onAutocomplete(interaction) {
     if (interaction.commandName === 'cancel') {
       const typed = String(interaction.options.getFocused() || '').toLowerCase();
       const page = interaction.options.getInteger('page') || 1;
+      // Typing fires an autocomplete request per keystroke; reuse the Stripe lists for 30 seconds.
       const [openResult, completeResult] = await Promise.allSettled([
-        stripe.checkout.sessions.list({ limit: 100, status: 'open' }),
-        stripe.checkout.sessions.list({ limit: 100, status: 'complete' }),
+        cachedAsync('ac:sessions:open', 30 * 1000, () => stripe.checkout.sessions.list({ limit: 100, status: 'open' })),
+        cachedAsync('ac:sessions:complete', 30 * 1000, () => stripe.checkout.sessions.list({ limit: 100, status: 'complete' })),
       ]);
       const sessions = [];
       for (const [label, result] of [['open', openResult], ['complete', completeResult]]) {
@@ -5316,7 +5586,7 @@ async function onAutocomplete(interaction) {
       return await interaction.respond([]);
     }
     const typed = interaction.options.getFocused().toLowerCase();
-    const list = await stripe.paymentIntents.list({ limit: 50 });
+    const list = await cachedAsync('ac:refund:payments', 30 * 1000, () => stripe.paymentIntents.list({ limit: 50 }));
     const choices = list.data
       .filter((pi) => pi.status === 'succeeded' && pi.metadata?.agent_id)
       .filter((pi) => !typed || `${pi.metadata.description} ${pi.id}`.toLowerCase().includes(typed))
@@ -6124,6 +6394,8 @@ client.on('interactionCreate', async (interaction) => {
 
 // ---------- Monzo Webhook Listener ----------
 const app = express();
+// Render puts a proxy in front of the bot; trust one hop so req.ip is the real visitor (per-visitor download limit).
+app.set('trust proxy', 1);
 
 // Liveness and readiness endpoints for Render or external uptime monitors.
 function healthSnapshot() {
@@ -6229,6 +6501,7 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
 
 // ---------- Stripe webhook ----------
 
+const stripeEventsInFlight = new Set();
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
   try {
@@ -6243,6 +6516,10 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   }
 
   if (hasProcessedWebhook(event.id)) return res.json({ received: true, duplicate: true });
+  // Stripe retries while a slow delivery is still running; don't process the same event twice at once.
+  if (stripeEventsInFlight.has(event.id)) return res.status(202).json({ received: true, inFlight: true });
+  stripeEventsInFlight.add(event.id);
+  try {
   lastWebhookAt = Date.now();
   lastWebhookType = event.type;
 
@@ -6253,6 +6530,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         Object.assign(deliveries[s.id], { paymentConfirmed:true, paid:true, paymentConfirmedAt:event.created ? event.created*1000 : Date.now(), amount:(s.amount_total || 0)/100, currency:String(s.currency || CURRENCY).toLowerCase(), paymentIntentId:s.payment_intent || null });
         saveDeliveries();
       }
+      void updateStripeLedgerFromPI(s.payment_intent);
       await recordInStripe(s.payment_intent, { paid_at: new Date(event.created * 1000).toISOString() });
       try {
         const { customer_id, agent_id, description } = s.metadata ?? {};
@@ -6320,6 +6598,8 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         { name:'Customer', value:pi?.metadata?.customer_id ? `<@${pi.metadata.customer_id}>` : 'Not available', inline:true },
         { name:'Refund Status', value:charge.refunded ? 'Fully refunded' : 'Partially refunded', inline:true }
       );
+    if (piId && stripeLedger[piId]) { stripeLedger[piId].refunded = Number(charge.amount_refunded || 0); saveStripeLedger(); }
+    else if (piId) void updateStripeLedgerFromPI(piId);
     if (piId) await recordInStripe(piId,{refunded_at:new Date(event.created*1000).toISOString(),refund_amount:refunded,refund_status:charge.refunded?'refunded':'partially_refunded'});
     await notifyOwner({embeds:[refundEmbed]},{notificationType:'payment.refunded',notificationStatus:'warning'});
   }
@@ -6333,6 +6613,12 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
   markWebhookProcessed(event.id, event.type);
   res.json({ received: true });
+  } catch (webhookError) {
+    void alertOwner(`Stripe webhook ${event.type} failed`, webhookError);
+    if (!res.headersSent) res.status(500).send('Webhook processing failed; retry required.');
+  } finally {
+    stripeEventsInFlight.delete(event.id);
+  }
 });
 
 app.get('/bankroll-log-copy/:token', (req, res) => {
@@ -6452,7 +6738,32 @@ client.on('warn', (m) => console.warn('Warn:', m));
 client.on('shardReady', (id) => console.log('Shard ready', id));
 client.on('shardReconnecting', (id) => console.log('Shard reconnecting', id));
 
-client
-  .login(DISCORD_TOKEN)
-  .then(() => console.log('login() resolved'))
-  .catch((e) => console.error('Login failed:', e));
+// A failed login used to be logged once and the web server kept running ("Bankroll bot running")
+// while the bot sat offline forever. Retry with backoff and say WHY it failed.
+let loginAttempt = 0;
+async function loginWithRetry() {
+  loginAttempt++;
+  try {
+    await client.login(DISCORD_TOKEN);
+    console.log(`login() resolved (attempt ${loginAttempt})`);
+  } catch (e) {
+    const text = String(e?.code || e?.message || e);
+    console.error(`Login failed (attempt ${loginAttempt}):`, e?.message || e);
+    if (/TokenInvalid|invalid token|An invalid token/i.test(text)) {
+      console.error('LOGIN HINT: DISCORD_TOKEN is invalid. Reset the token in the Discord Developer Portal and update it in the Render Environment tab. Not retrying.');
+      return;
+    }
+    if (/DisallowedIntents|disallowed intents/i.test(text)) {
+      console.error('LOGIN HINT: a privileged intent is not enabled for this bot in the Developer Portal. Not retrying.');
+      return;
+    }
+    if (/429|1015|rate limit|Cloudflare|banned|403/i.test(text)) {
+      console.error('LOGIN HINT: Discord/Cloudflare may be rate-limiting or blocking this server IP. Redeploying to another region or waiting usually fixes it.');
+    }
+    // 30s, 60s, 2m, 4m ... capped at 10 minutes. Slow retries avoid making an IP block worse.
+    const delay = Math.min(30000 * 2 ** Math.min(loginAttempt - 1, 5), 10 * 60 * 1000);
+    console.error(`Retrying Discord login in ${Math.round(delay / 1000)}s.`);
+    setTimeout(() => { void loginWithRetry(); }, delay);
+  }
+}
+void loginWithRetry();
