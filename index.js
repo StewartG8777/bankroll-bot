@@ -314,7 +314,7 @@ function startDeliveryWatch(key) {
     const message = [
       '⚠️ ' + tag + 'DELIVERY DELAYED — OVER 1 MINUTE',
       '',
-      '**File:** ' + String(current.name || 'file') + ' (sent here as soon as payment lands)',
+      '**File:** ' + String(current.name || 'file'),
       '**Customer:** <@' + String(current.customerId || '') + '>',
       '**Order:** ' + key,
       '**Attempts:** ' + Number(current.deliveryAttempts || 0),
@@ -730,7 +730,7 @@ async function verifyZipIntegrity(filePath) {
 function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download is ready', oneTime = false) {
   const isZip = /\.zip$/i.test(String(name || ''));
   return new EmbedBuilder().setColor(GREEN).setTitle(label)
-    .setDescription(`Your complete **${short(String(name || 'file'), 180)}** is ready. ${isZip ? 'This is one original ZIP archive — no split parts or joining steps.' : 'Your original file is ready to download.'}`)
+    .setDescription(`Your complete **${short(String(name || 'file'), 180)}** is ready.`)
     .addFields(
       { name: 'File type', value: isZip ? 'ZIP archive' : 'File', inline: true },
       ...(Number.isFinite(sizeBytes) ? [{ name: 'Size', value: `${(sizeBytes / (1024 * 1024)).toFixed(2)} MB`, inline: true }] : []),
@@ -1345,6 +1345,19 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   }
 
   if (sentTo) {
+    // Delivered: make sure the invoice no longer offers a Get file button (prevents duplicate deliveries).
+    try {
+      const live = liveInteractions.get(key);
+      const inv = (live?.interaction && Date.now() - live.at < 14 * 60 * 1000 ? await live.interaction.fetchReply().catch(() => null) : null) || await getInvoiceMessage(d, key);
+      if (inv?.components?.length) {
+        const rows = withoutGetFile(inv);
+        if (live?.interaction && Date.now() - live.at < 14 * 60 * 1000) {
+          await live.interaction.editReply({ components: rows }).catch(() => inv.edit({ components: rows }));
+        } else {
+          await inv.edit({ components: rows });
+        }
+      }
+    } catch (e) { console.log('Could not remove Get file button after delivery:', e.message); }
     clearDeliveryWatch(key);
     delete d.deliveryWatchStartedAt;
     delete d.deliverySlowAlertSentAt;
@@ -1360,13 +1373,10 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     }
     await notifyOwner({
       embeds: [new EmbedBuilder().setColor(GREEN).setTitle(d.testMode ? '[TEST] File sent' : 'File sent')
-        .setDescription(`**File**\n${short(String(d.name || 'file'), 150)} (sent here as soon as payment lands)`)
+        .setDescription(`**File**\n${short(String(d.name || 'file'), 150)}`)
         .addFields(
-          { name: 'Customer', value: `<@${d.customerId}>`, inline: true },
-          { name: 'Delivery', value: dlink ? 'Secure hosted download link' : 'Direct Discord attachment', inline: true },
-          { name: 'Download tracking', value: dlink ? 'Successful hosted downloads are confirmed separately' : 'Discord does not report whether an attachment was saved by the customer' },
+          { name: 'Customer', value: `<@${d.customerId}>` },
           { name: 'Delivery destination', value: sentTo || 'Posted successfully' },
-          ...(msgUrl ? [{ name: 'Message', value: msgUrl }] : []),
         ).setTimestamp()]
     }, { notificationType: 'delivery.sent', notificationStatus: 'success' });
   }
@@ -4721,6 +4731,11 @@ async function onGetFile(interaction) {
     await interaction.update({ components: withoutGetFile(interaction.message) });
     return interaction.followUp({ content: 'The file was already sent or is no longer available.', ephemeral: true });
   }
+  if (d.deliveryComplete) {
+    // The file was already delivered automatically after payment; never send a second copy.
+    await interaction.update({ components: withoutGetFile(interaction.message) }).catch(() => {});
+    return interaction.followUp({ content: 'Your file was already sent as a reply to this invoice.', ephemeral: true }).catch(() => {});
+  }
   if (interaction.user.id !== d.customerId && !allowed.has(interaction.user.id)) {
     return interaction.reply({ content: 'Only the customer can get this file.', ephemeral: true });
   }
@@ -4833,11 +4848,8 @@ async function onGetFile(interaction) {
     embeds: [new EmbedBuilder().setColor(GREEN).setTitle(d.testMode ? '[TEST] File sent' : 'File sent')
       .setDescription(`**File**\n${short(String(d.name || 'file'), 150)}`)
       .addFields(
-        { name: 'Customer', value: `<@${d.customerId}>`, inline: true },
-        { name: 'Delivery', value: dlink ? 'Secure hosted download link' : 'Direct Discord attachment', inline: true },
-        { name: 'Download tracking', value: dlink ? 'Successful hosted downloads are confirmed separately' : 'Discord does not report whether an attachment was saved by the customer' },
+        { name: 'Customer', value: `<@${d.customerId}>` },
         { name: 'Delivery destination', value: 'Get file button on the invoice' },
-        ...(msg?.url ? [{ name: 'Message', value: msg.url }] : []),
       ).setTimestamp()]
   }, { notificationType: 'delivery.sent', notificationStatus: 'success' });
 }
