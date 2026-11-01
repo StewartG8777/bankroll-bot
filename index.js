@@ -3343,16 +3343,17 @@ async function cmdPaymentTest(interaction) {
   }
   if (!BASE_URL) {
     return interaction.reply({
-      content: 'Payment test needs PUBLIC_URL configured so the test ZIP can use the real hosted-download route. No test data or invoices were created.',
+      content: 'Payment test needs PUBLIC_URL configured so the test ZIP can use the real hosted-download route. No test invoice was created.',
       ephemeral: true,
     });
   }
 
   const method = interaction.options.getSubcommand();
   const selectedCustomer = interaction.options.getUser('customer', true);
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply();
   let sourcePath = null;
   let token = null;
+  let testKey = null;
   try {
     const testId = crypto.randomBytes(5).toString('hex').toUpperCase();
     const fileName = 'Bankroll_' + method.toUpperCase() + '_TEST.zip';
@@ -3379,49 +3380,111 @@ async function cmdPaymentTest(interaction) {
     const paidAt = Date.now();
     const reference = 'TEST-' + method.toUpperCase() + '-' + testId;
     const methodLabel = method === 'monzo' ? 'Monzo' : 'Bankroll card';
-    const paidEmbed = new EmbedBuilder()
+    testKey = (method === 'monzo' ? 'monzo_test_' : 'stripe_test_') + testId.toLowerCase();
+    const invoiceEmbed = new EmbedBuilder()
       .setColor(GREEN)
-      .setTitle('[TEST] PAID | ' + (method === 'monzo' ? 'MONZO PAYMENT RECEIVED' : 'BANKROLL PAYMENT RECEIVED'))
-      .setDescription('Simulated successful ' + methodLabel + ' payment. No real payment was made.')
+      .setTitle(method === 'monzo' ? 'Bankroll Monzo Invoice Created' : 'Bankroll Invoice Created')
+      .setDescription('TEST INVOICE — this invoice is automatically paid by the test. No real payment is taken.')
       .addFields(
-        { name: 'Customer', value: '<@' + selectedCustomer.id + '>', inline: true },
         { name: 'Sales Agent', value: '<@' + OWNER_ID + '>', inline: true },
-        { name: 'Amount Paid', value: money(1.23, 'gbp'), inline: true },
-        { name: 'Payment Status', value: 'PAID (TEST)', inline: true },
-        { name: 'Paid At', value: '<t:' + Math.floor(paidAt / 1000) + ':F>', inline: true },
-        { name: 'Transaction Reference', value: reference }
+        { name: 'Customer', value: '<@' + selectedCustomer.id + '>', inline: true },
+        { name: 'Amount', value: money(1.23, 'gbp'), inline: true },
+        { name: 'Description', value: 'Bankroll payment and download delivery test' },
+        { name: 'Payment Status', value: 'AWAITING PAYMENT (TEST)', inline: true },
+        { name: 'Transaction Reference', value: reference, inline: true },
+        { name: 'File', value: fileName + ' (posted as a reply once the test payment is confirmed)' }
       )
-      .setFooter({ text: 'TEST MODE • No Stripe charge or Monzo transaction' })
+      .setFooter({ text: 'TEST MODE • No Stripe charge or Monzo transaction • ' + testKey })
       .setTimestamp();
 
-    const download = downloads[token];
-    paidEmbed.setTitle('[TEST] PAID — Download ready')
-      .setDescription('Simulated successful ' + methodLabel + ' payment. The test ZIP is ready below.')
-      .addFields({ name: 'File', value: fileName, inline: true });
-    recordNotification('test.payment_paid', paidEmbed.data.title, 'Simulated ' + method + ' payment ' + reference + ' for customer ' + selectedCustomer.id, 'success');
-    recordNotification('test.delivery_ready', 'Test download ready', fileName + ' test download link generated for customer ' + selectedCustomer.id + '.', 'success');
+    const invoiceMessage = await interaction.editReply({
+      content: '<@' + selectedCustomer.id + '> — a Bankroll test invoice has been created. It will now be marked as paid automatically.',
+      embeds: [invoiceEmbed],
+      components: [],
+      allowedMentions: { parse: [] },
+    });
+
+    deliveries[testKey] = {
+      link: testUrl,
+      name: fileName,
+      description: 'Bankroll payment and delivery test',
+      channelId: interaction.channelId,
+      msgId: invoiceMessage.id,
+      msgChannelId: invoiceMessage.channelId,
+      customerId: selectedCustomer.id,
+      agentId: OWNER_ID,
+      savedAt: Date.now(),
+      type: method === 'monzo' ? 'monzo' : 'stripe',
+      paid: false,
+      paymentConfirmed: false,
+      amount: 1.23,
+      currency: 'gbp',
+      reference,
+      txId: reference,
+      testMode: true,
+    };
+    saveDeliveries();
+    if (method === 'monzo') {
+      monzoLedger[testKey] = {
+        key: testKey,
+        status: 'open',
+        customerId: selectedCustomer.id,
+        agentId: OWNER_ID,
+        amount: 1.23,
+        currency: 'gbp',
+        description: 'Bankroll payment and delivery test',
+        reference,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + MONZO_OPEN_MS,
+        channelId: interaction.channelId,
+        fileName,
+        testMode: true,
+      };
+      saveMonzo();
+    }
+    liveInteractions.set(testKey, { interaction, at: Date.now() });
+    setTimeout(() => liveInteractions.delete(testKey), 14 * 60 * 1000);
+
+    recordNotification('test.invoice_created', 'Test invoice created', methodLabel + ' test invoice ' + testKey + ' created for customer ' + selectedCustomer.id + '.', 'success');
     recordDownloadEvent('test_payment_simulated', {
       file: fileName,
       customerId: selectedCustomer.id,
       agentId: OWNER_ID,
-      token: token,
-      detail: 'Simulated payment. Paid confirmation and test ZIP button returned privately to the command invoker. No DMs or live payment data were created.',
+      token,
+      detail: 'A public test invoice was created, automatically marked as paid, and delivered using the normal invoice-reply flow. No real payment was taken.',
     });
-    return interaction.editReply({
-      content: 'Test completed for **' + methodLabel + '**. Only you can see this result. No DMs were sent and no real payment was taken.',
-      embeds: [paidEmbed, buildDownloadEmbed(fileName, download?.expiresAt, fs.statSync(download.path).size)],
-      components: [downloadLinkRow(testUrl, 'Download Test ZIP')],
-      allowedMentions: { parse: [] },
+
+    // Run the same paid-state update, invoice reply, download delivery and owner
+    // notification path used by a real confirmed payment.
+    await deliverFile(testKey, null);
+    const completed = deliveries[testKey]?.deliveryComplete;
+    if (!completed) {
+      return interaction.followUp({
+        content: 'The test invoice was created and marked paid, but delivery did not complete. Check /delivery status for order ' + testKey + '.',
+        ephemeral: true,
+      });
+    }
+    recordNotification('test.delivery_ready', 'Test download delivered', fileName + ' was posted as a reply to test invoice ' + testKey + '.', 'success');
+    return interaction.followUp({
+      content: 'Test completed: the invoice was created publicly, automatically marked as PAID, the customer received the download as a reply to that invoice, and the owner notification was triggered. No real payment was taken.',
+      ephemeral: true,
     });
   } catch (err) {
-    if (token && downloads[token]) {
+    if (testKey && deliveries[testKey]) {
+      deliveries[testKey].deliveryError = String(err.message || err).slice(0, 300);
+      saveDeliveries();
+    }
+    if (token && downloads[token] && !deliveries[testKey]?.deliveryComplete) {
       try { fs.unlinkSync(downloads[token].path); } catch {}
       delete downloads[token];
       saveDownloads();
     }
     if (sourcePath) { try { fs.unlinkSync(sourcePath); } catch {} }
     console.error('Payment test failed:', err);
-    return interaction.editReply('Payment test failed: ' + err.message);
+    if (interaction.deferred || interaction.replied) {
+      return interaction.followUp({ content: 'Payment test failed: ' + err.message, ephemeral: true }).catch(() => {});
+    }
+    return interaction.reply({ content: 'Payment test failed: ' + err.message, ephemeral: true });
   }
 }
 
