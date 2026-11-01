@@ -4836,19 +4836,31 @@ async function handleSpamConsent(interaction) {
       return;
     }
     try {
-      await session.sourceMessage.channel.send({
-        content: session.message,
-        reply: { messageReference: session.sourceMessage.id, failIfNotExists: false },
-        allowedMentions: { parse: [] }
-      });
+      // First try to post as a reply to the setup embed.
+      try {
+        await session.sourceMessage.reply({
+          content: session.message,
+          allowedMentions: { parse: [] }
+        });
+      } catch (replyError) {
+        // If Discord rejects the reply reference, still deliver the message in the channel.
+        console.warn('Spam reply failed; trying a normal channel message:', replyError.message);
+        await session.sourceMessage.channel.send({
+          content: session.message,
+          allowedMentions: { parse: [] }
+        });
+      }
       session.sent += 1;
     } catch (error) {
       spamSessions.delete(sessionId);
-      console.error('Timed message reply failed:', error);
+      console.error('Timed message send failed:', error);
       await session.sourceMessage.edit({
         embeds: [new EmbedBuilder().setColor(RED).setTitle('Spam failed')
           .setDescription('Bankroll could not send the repeated message. The session has stopped.')
-          .addFields({ name: 'Discord error', value: String(error.message || 'Unknown error').slice(0, 1000) })],
+          .addFields(
+            { name: 'Messages sent', value: String(session.sent), inline: true },
+            { name: 'Discord error', value: String(error.message || 'Unknown error').slice(0, 1000) }
+          )],
         components: []
       }).catch(() => {});
       return;
