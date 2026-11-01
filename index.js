@@ -2484,6 +2484,10 @@ async function sendStripeCheckout(interaction) {
       }
     }
     if (linkUrl) saveLinkDelivery(session.id, linkUrl, interaction, customer);
+    if (deliveries[session.id]) {
+      Object.assign(deliveries[session.id], { type: 'stripe', amount, currency: cur, description });
+      saveDeliveries();
+    }
     const where = whereFrom(interaction, customer);
 
     const embed = new EmbedBuilder()
@@ -2500,10 +2504,10 @@ async function sendStripeCheckout(interaction) {
       embed.addFields({ name: 'Pay by', value: `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
     }
     if (fileData) {
-      embed.addFields({ name: 'File', value: `${fileData.name} (sent to the customer by DM after payment)` });
+      embed.addFields({ name: 'File', value: `${fileData.name} (posted as a reply to this invoice after payment)` });
     }
     if (linkUrl) {
-      embed.addFields({ name: 'Download', value: 'Download link sent to the customer by DM after payment' });
+      embed.addFields({ name: 'Download', value: 'Download link posted as a reply to this invoice after payment' });
     }
     embed
       .addFields(
@@ -2642,6 +2646,7 @@ async function sendMonzoInvoice(interaction) {
       type: 'monzo',
       paid: false,
       amount,
+      currency: 'gbp',
       reference,
       description,
     });
@@ -6719,6 +6724,10 @@ async function sendStripeCheckout(interaction) {
       }
     }
     if (linkUrl) saveLinkDelivery(session.id, linkUrl, interaction, customer);
+    if (deliveries[session.id]) {
+      Object.assign(deliveries[session.id], { type: 'stripe', amount, currency: cur, description });
+      saveDeliveries();
+    }
     const where = whereFrom(interaction, customer);
 
     const embed = new EmbedBuilder()
@@ -6735,10 +6744,10 @@ async function sendStripeCheckout(interaction) {
       embed.addFields({ name: 'Pay by', value: `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
     }
     if (fileData) {
-      embed.addFields({ name: 'File', value: `${fileData.name} (sent to the customer by DM after payment)` });
+      embed.addFields({ name: 'File', value: `${fileData.name} (posted as a reply to this invoice after payment)` });
     }
     if (linkUrl) {
-      embed.addFields({ name: 'Download', value: 'Download link sent to the customer by DM after payment' });
+      embed.addFields({ name: 'Download', value: 'Download link posted as a reply to this invoice after payment' });
     }
     embed
       .addFields(
@@ -6877,6 +6886,7 @@ async function sendMonzoInvoice(interaction) {
       type: 'monzo',
       paid: false,
       amount,
+      currency: 'gbp',
       reference,
       description,
     });
