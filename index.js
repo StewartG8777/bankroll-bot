@@ -3376,7 +3376,6 @@ async function cmdPaymentTest(interaction) {
     try { fs.unlinkSync(sourcePath); } catch {}
     sourcePath = null;
 
-    const owner = await client.users.fetch(OWNER_ID);
     const paidAt = Date.now();
     const reference = 'TEST-' + method.toUpperCase() + '-' + testId;
     const methodLabel = method === 'monzo' ? 'Monzo' : 'Bankroll card';
@@ -3395,52 +3394,25 @@ async function cmdPaymentTest(interaction) {
       .setFooter({ text: 'TEST MODE • No Stripe charge or Monzo transaction' })
       .setTimestamp();
 
-    // Seller-side notifications always go to the bot owner.
-    await owner.send({ embeds: [paidEmbed] });
-    recordNotification('test.payment_paid', paidEmbed.data.title, 'Simulated ' + method + ' payment ' + reference + ' for customer ' + selectedCustomer.id, 'success');
-
-    await owner.send({
-      content: '[TEST] Payment received. The ZIP was delivered successfully to <@' + selectedCustomer.id + '>. This is a simulation; no payment was taken.',
-      allowedMentions: { parse: [] },
-    });
-    recordNotification('test.delivery_ready', 'Test delivery confirmation sent', fileName + ' seller confirmation sent for customer ' + selectedCustomer.id + '.', 'success');
-
-    // Customer-facing test delivery is posted in the command channel, never by DM.
     const download = downloads[token];
-    const customerEmbed = new EmbedBuilder()
-      .setColor(GREEN)
-      .setTitle('[TEST] PAID — Download ready')
-      .setDescription('Simulated payment successful. The test ZIP is ready below.')
-      .addFields(
-        { name: 'Customer', value: '<@' + selectedCustomer.id + '>', inline: true },
-        { name: 'File', value: fileName, inline: true },
-        { name: 'Amount', value: money(1.23, 'gbp'), inline: true },
-        { name: 'Reference', value: reference }
-      )
-      .setFooter({ text: 'TEST MODE • No real payment was taken' })
-      .setTimestamp();
-    const testDeliveryMessage = await interaction.channel.send({
-      content: '<@' + selectedCustomer.id + '> [TEST] Payment received — your ZIP is ready to download below.',
-      embeds: [customerEmbed, buildDownloadEmbed(fileName, download?.expiresAt, fs.statSync(download.path).size)],
-      components: [downloadLinkRow(testUrl, 'Download Test ZIP')],
-      allowedMentions: { users: [selectedCustomer.id] },
-    });
-
+    paidEmbed.setTitle('[TEST] PAID — Download ready')
+      .setDescription('Simulated successful ' + methodLabel + ' payment. The test ZIP is ready below.')
+      .addFields({ name: 'File', value: fileName, inline: true });
+    recordNotification('test.payment_paid', paidEmbed.data.title, 'Simulated ' + method + ' payment ' + reference + ' for customer ' + selectedCustomer.id, 'success');
+    recordNotification('test.delivery_ready', 'Test download ready', fileName + ' test download link generated for customer ' + selectedCustomer.id + '.', 'success');
     recordDownloadEvent('test_payment_simulated', {
       file: fileName,
       customerId: selectedCustomer.id,
       agentId: OWNER_ID,
       token: token,
-      detail: 'Simulated ' + method + ' payment and posted the test ZIP download button in the command channel (message ' + testDeliveryMessage.id + '). No customer DM, live invoice, Stripe payment, Monzo transaction, delivery record or vault item was created.',
+      detail: 'Simulated payment. Paid confirmation and test ZIP button returned privately to the command invoker. No DMs or live payment data were created.',
     });
-
-    return interaction.editReply(
-      'Test started for **' + methodLabel + '**.\\n' +
-      '• Seller PAID notification sent to you.\\n' +
-      '• Test PAID confirmation and download button posted in this channel for <@' + selectedCustomer.id + '>.\\n' +
-      '• No customer DM was sent.\\n' +
-      'No real payment was taken and no live invoice or vault data was changed.'
-    );
+    return interaction.editReply({
+      content: 'Test completed for **' + methodLabel + '**. Only you can see this result. No DMs were sent and no real payment was taken.',
+      embeds: [paidEmbed, buildDownloadEmbed(fileName, download?.expiresAt, fs.statSync(download.path).size)],
+      components: [downloadLinkRow(testUrl, 'Download Test ZIP')],
+      allowedMentions: { parse: [] },
+    });
   } catch (err) {
     if (token && downloads[token]) {
       try { fs.unlinkSync(downloads[token].path); } catch {}
