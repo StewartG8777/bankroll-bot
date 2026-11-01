@@ -18,6 +18,9 @@ const {
   ButtonBuilder,
   ButtonStyle,
   StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   SlashCommandBuilder,
   ContextMenuCommandBuilder,
   ApplicationCommandType,
@@ -310,6 +313,7 @@ function periodBounds(period) {
 const FILES_DIR = path.join(DATA_DIR, 'files');
 const DELIVERIES_FILE = path.join(DATA_DIR, 'deliveries.json');
 const MONZO_FILE = path.join(DATA_DIR, 'monzo_payments.json');
+const MONZO_REVIEW_FILE = path.join(DATA_DIR, 'monzo_review.json');
 const WEBHOOK_EVENTS_FILE = path.join(DATA_DIR, 'webhook_events.json');
 const WIPED_CUSTOMERS_FILE = path.join(DATA_DIR, 'wiped_customers.json');
 let processedWebhookEvents = {};
@@ -466,6 +470,19 @@ function scheduleBackup() {
 // Monzo ledger: every Monzo invoice (open / paid / cancelled / expired) so history and totals survive.
 let monzoLedger = {};
 try { monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8')); } catch {}
+let monzoReviewState = { transactions: {}, reviewed: {} };
+try {
+  const savedReview = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
+  if (savedReview && typeof savedReview === 'object') monzoReviewState = {
+    transactions: savedReview.transactions && typeof savedReview.transactions === 'object' ? savedReview.transactions : {},
+    reviewed: savedReview.reviewed && typeof savedReview.reviewed === 'object' ? savedReview.reviewed : {},
+  };
+} catch {}
+function saveMonzoReview() {
+  try { atomicWrite(MONZO_REVIEW_FILE, JSON.stringify(monzoReviewState, null, 2)); }
+  catch (e) { console.error('Could not save Monzo review records:', e.message); }
+  scheduleBackup();
+}
 let wipedCustomers = new Set();
 try { const ids = JSON.parse(fs.readFileSync(WIPED_CUSTOMERS_FILE, 'utf8')); if (Array.isArray(ids)) wipedCustomers = new Set(ids.map(String)); } catch {}
 function saveWipedCustomers() { atomicWrite(WIPED_CUSTOMERS_FILE, JSON.stringify([...wipedCustomers], null, 2)); }
@@ -970,7 +987,7 @@ async function backupDataOnce() {
   }
 
   try {
-    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json'];
+    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json'];
     const files = [];
     for (const name of jsonNames) {
       const fp = path.join(DATA_DIR, name);
@@ -1531,6 +1548,12 @@ const monzoCmd = common(
     )
 );
 
+const monzoReviewCmd = common(
+  new SlashCommandBuilder()
+    .setName('monzo-review')
+    .setDescription('Review last month’s real Monzo transactions and add confirmed sales to Bankroll history (owner only)')
+);
+
 const vaultCmd = common(
   new SlashCommandBuilder()
     .setName('vault')
@@ -1808,7 +1831,7 @@ const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription(
   .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' }))
   .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records')));
 
-const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
+const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -3797,8 +3820,8 @@ async function cmdRestore(interaction) {
   if (att.size > 5 * 1024 * 1024) return interaction.editReply('That file is too big to be a backup.');
 
   const fname = att.name.toLowerCase();
-  const target = fname.startsWith('deliveries') ? 'deliveries' : fname.startsWith('downloads') ? 'downloads' : fname.startsWith('download_history') ? 'download_history' : fname.startsWith('vault') ? 'vault' : fname.startsWith('monzo') ? 'monzo' : fname.startsWith('notifications') ? 'notifications' : null;
-  if (!target) return interaction.editReply('Pick deliveries.json, downloads.json, download_history.json, vault.json, monzo_payments.json or notifications.json from the backup channel.');
+  const target = fname.startsWith('deliveries') ? 'deliveries' : fname.startsWith('downloads') ? 'downloads' : fname.startsWith('download_history') ? 'download_history' : fname.startsWith('vault') ? 'vault' : fname.startsWith('monzo_review') ? 'monzo_review' : fname.startsWith('monzo') ? 'monzo' : fname.startsWith('notifications') ? 'notifications' : null;
+  if (!target) return interaction.editReply('Pick deliveries.json, downloads.json, download_history.json, vault.json, monzo_payments.json, monzo_review.json or notifications.json from the backup channel.');
 
   let data;
   try {
@@ -3821,7 +3844,7 @@ async function cmdRestore(interaction) {
     return interaction.editReply(`Restored ${downloadHistory.length} download history record(s).`);
   }
 
-  const store = target === 'deliveries' ? deliveries : target === 'downloads' ? downloads : target === 'monzo' ? monzoLedger : vault;
+  const store = target === 'deliveries' ? deliveries : target === 'downloads' ? downloads : target === 'monzo' ? monzoLedger : target === 'monzo_review' ? monzoReviewState : vault;
   const filesRoot = path.resolve(target === 'vault' ? VAULT_DIR : FILES_DIR) + path.sep;
   let added = 0;
   let already = 0;
@@ -3866,6 +3889,7 @@ async function cmdRestore(interaction) {
   if (target === 'deliveries') saveDeliveries();
   else if (target === 'downloads') saveDownloads();
   else if (target === 'monzo') saveMonzo();
+  else if (target === 'monzo_review') saveMonzoReview();
   else saveVault();
 
   return interaction.editReply(
@@ -4413,6 +4437,229 @@ async function cmdWipe(interaction) {
   });
 }
 
+function monzoReviewTransactionsSorted() {
+  return Object.values(monzoReviewState.transactions || {})
+    .filter((tx) => tx && tx.id && !monzoReviewState.reviewed?.[tx.id])
+    .sort((a, b) => Date.parse(b.created || b.settled || 0) - Date.parse(a.created || a.settled || 0));
+}
+
+function monzoReviewPayload(page = 0) {
+  const pending = monzoReviewTransactionsSorted();
+  const pageSize = 25;
+  const pageCount = Math.max(1, Math.ceil(pending.length / pageSize));
+  const current = Math.max(0, Math.min(Number(page) || 0, pageCount - 1));
+  const items = pending.slice(current * pageSize, (current + 1) * pageSize);
+  const all = Object.values(monzoReviewState.transactions || {});
+  const reviewed = Object.keys(monzoReviewState.reviewed || {}).length;
+  const income = all.filter((tx) => Number(tx.amount) > 0).reduce((sum, tx) => sum + Number(tx.amount || 0), 0) / 100;
+  const outgoing = all.filter((tx) => Number(tx.amount) < 0).reduce((sum, tx) => sum + Math.abs(Number(tx.amount || 0)), 0) / 100;
+  const embed = new EmbedBuilder()
+    .setColor(GREEN)
+    .setTitle('Monzo historical transaction review')
+    .setDescription(
+      '**Previous calendar month**\n' +
+      'Transactions found: **' + all.length + '** • Reviewed: **' + reviewed + '** • Awaiting review: **' + pending.length + '**\n' +
+      'Money in: **' + money(income, 'gbp') + '** • Money out: **' + money(outgoing, 'gbp') + '**\n\n' +
+      'Choose a transaction below. Bankroll will ask for the Discord customer ID, what was sold/what it was for, the sales agent and the transaction category. Nothing is classified automatically.'
+    )
+    .setFooter({ text: pending.length ? 'Page ' + (current + 1) + ' of ' + pageCount + ' • ' + pending.length + ' awaiting review' : 'All imported transactions have been reviewed.' });
+  const components = [];
+  if (items.length) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('monzo_review_select')
+      .setPlaceholder('Select a transaction to review')
+      .addOptions(items.map((tx) => {
+        const currency = String(tx.currency || 'GBP').toLowerCase();
+        const amount = money(Number(tx.amount || 0) / 100, currency);
+        const who = tx.counterparty?.name || tx.merchant?.name || tx.description || 'Monzo transaction';
+        const when = new Date(tx.created || tx.settled || Date.now()).toLocaleDateString('en-GB');
+        return {
+          label: (amount + ' • ' + short(String(who), 55)).slice(0, 100),
+          description: (when + ' • ' + String(tx.description || tx.notes || 'No description')).slice(0, 100),
+          value: String(tx.id),
+        };
+      }));
+    components.push(new ActionRowBuilder().addComponents(menu));
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('monzo_review_page:' + Math.max(0, current - 1)).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(current === 0),
+      new ButtonBuilder().setCustomId('monzo_review_page:' + Math.min(pageCount - 1, current + 1)).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(current >= pageCount - 1)
+    ));
+  }
+  return { embeds: [embed], components, ephemeral: true };
+}
+
+async function fetchMonzoLastMonthTransactions() {
+  if (!MONZO_ACCESS_TOKEN || !MONZO_ACCOUNT_ID) {
+    throw new Error('Monzo history access is not configured. Set MONZO_ACCESS_TOKEN and MONZO_ACCOUNT_ID in the bot environment.');
+  }
+  const bounds = periodBounds('last_month');
+  const since = bounds.since;
+  const until = bounds.until;
+  const found = new Map();
+  // Monzo caps each request at 100. Consecutive 24-hour windows avoid silently
+  // truncating a busy month while preserving the exact London month boundaries.
+  for (let cursor = since; cursor < until; cursor += 24 * 60 * 60) {
+    const before = Math.min(until, cursor + 24 * 60 * 60);
+    const params = new URLSearchParams({
+      account_id: MONZO_ACCOUNT_ID,
+      since: new Date(cursor * 1000).toISOString(),
+      before: new Date(before * 1000).toISOString(),
+      limit: '100',
+    });
+    const response = await fetch('https://api.monzo.com/transactions?' + params.toString(), {
+      headers: { Authorization: 'Bearer ' + MONZO_ACCESS_TOKEN },
+    });
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      if (response.status === 401) throw new Error('Monzo rejected the access token (401). It may have expired; refresh MONZO_ACCESS_TOKEN in Render.');
+      if (response.status === 403) throw new Error('Monzo denied transaction-history access (403). Check that the token has read-transactions permission.');
+      throw new Error('Monzo transaction request failed (' + response.status + '): ' + short(body, 250));
+    }
+    const data = await response.json();
+    const batch = Array.isArray(data.transactions) ? data.transactions : [];
+    if (batch.length >= 100) {
+      throw new Error('Monzo returned 100 transactions in one 24-hour window. Import stopped rather than silently truncating that day.');
+    }
+    for (const tx of batch) if (tx?.id) found.set(tx.id, tx);
+  }
+  return [...found.values()].sort((a, b) => Date.parse(a.created || a.settled || 0) - Date.parse(b.created || b.settled || 0));
+}
+
+async function cmdMonzoReview(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can review historical Monzo transactions.');
+  const transactions = await fetchMonzoLastMonthTransactions();
+  for (const tx of transactions) {
+    if (!monzoReviewState.transactions[tx.id]) monzoReviewState.transactions[tx.id] = tx;
+  }
+  saveMonzoReview();
+  const reviewedCount = transactions.filter((tx) => !!monzoReviewState.reviewed[tx.id]).length;
+  const payload = monzoReviewPayload(0);
+  payload.embeds[0].addFields(
+    { name: 'Transactions fetched this run', value: String(transactions.length), inline: true },
+    { name: 'Already reviewed', value: String(reviewedCount), inline: true }
+  );
+  return interaction.editReply(payload);
+}
+
+async function showMonzoReviewModal(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'Only the bot owner can review these transactions.', ephemeral: true });
+  const txId = interaction.values[0];
+  const tx = monzoReviewState.transactions[txId];
+  if (!tx) return interaction.reply({ content: 'That transaction is no longer in the review list. Run /monzo-review again.', ephemeral: true });
+  if (monzoReviewState.reviewed[txId]) return interaction.reply({ content: 'That transaction has already been reviewed.', ephemeral: true });
+  const modal = new ModalBuilder()
+    .setCustomId('monzo_review_modal:' + txId)
+    .setTitle('Classify Monzo transaction');
+  const customer = new TextInputBuilder()
+    .setCustomId('customer_id')
+    .setLabel('Customer Discord ID (required for a sale)')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(25);
+  const sold = new TextInputBuilder()
+    .setCustomId('sold')
+    .setLabel('What was sold / what was this for?')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(500)
+    .setPlaceholder('Product, vehicle, service, expense details, etc.');
+  const agent = new TextInputBuilder()
+    .setCustomId('agent_id')
+    .setLabel('Sales agent Discord ID (optional)')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(25);
+  const category = new TextInputBuilder()
+    .setCustomId('category')
+    .setLabel('Category: sale / refund / expense / personal / other')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(20)
+    .setPlaceholder('sale, refund, expense, personal or other');
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(customer),
+    new ActionRowBuilder().addComponents(sold),
+    new ActionRowBuilder().addComponents(agent),
+    new ActionRowBuilder().addComponents(category)
+  );
+  await interaction.showModal(modal);
+}
+
+async function saveMonzoReviewModal(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'Only the bot owner can save historical Monzo records.', ephemeral: true });
+  const txId = interaction.customId.slice('monzo_review_modal:'.length);
+  const tx = monzoReviewState.transactions[txId];
+  if (!tx) return interaction.reply({ content: 'Transaction not found. Run /monzo-review again.', ephemeral: true });
+  if (monzoReviewState.reviewed[txId]) return interaction.reply({ content: 'This transaction has already been saved.', ephemeral: true });
+
+  const cleanDiscordId = (value) => String(value || '').trim().replace(/^<@!?(\d+)>$/, '$1');
+  const customerId = cleanDiscordId(interaction.fields.getTextInputValue('customer_id'));
+  const agentId = cleanDiscordId(interaction.fields.getTextInputValue('agent_id'));
+  const sold = interaction.fields.getTextInputValue('sold').trim();
+  const category = interaction.fields.getTextInputValue('category').trim().toLowerCase();
+  const categories = new Set(['sale', 'refund', 'expense', 'personal', 'other']);
+  if (!categories.has(category)) {
+    return interaction.reply({ content: 'Invalid category. Use exactly: sale, refund, expense, personal or other.', ephemeral: true });
+  }
+  if (category === 'sale' && !/^\d{17,20}$/.test(customerId)) {
+    return interaction.reply({ content: 'A sale needs a valid customer Discord ID (17–20 digits). Nothing has been saved yet.', ephemeral: true });
+  }
+  if (customerId && !/^\d{17,20}$/.test(customerId)) {
+    return interaction.reply({ content: 'That customer Discord ID is not valid. Use the numeric ID or leave it blank.', ephemeral: true });
+  }
+  if (agentId && !/^\d{17,20}$/.test(agentId)) {
+    return interaction.reply({ content: 'That sales agent Discord ID is not valid. Use the numeric ID or leave it blank.', ephemeral: true });
+  }
+  if (category === 'sale' && Number(tx.amount) <= 0) {
+    return interaction.reply({ content: 'A sale must be an incoming Monzo transaction. This transaction is money out, so classify it as expense, personal or other instead.', ephemeral: true });
+  }
+
+  const record = {
+    transactionId: txId,
+    amount: Number(tx.amount || 0) / 100,
+    currency: String(tx.currency || 'GBP').toLowerCase(),
+    transactionDescription: String(tx.description || ''),
+    counterparty: String(tx.counterparty?.name || tx.merchant?.name || ''),
+    sold: sold,
+    category: category,
+    customerId: customerId || null,
+    agentId: agentId || null,
+    createdAt: Date.parse(tx.created || tx.settled || Date.now()),
+    settledAt: Date.parse(tx.settled || tx.created || Date.now()),
+    reviewedAt: Date.now(),
+    reviewedBy: interaction.user.id,
+  };
+  monzoReviewState.reviewed[txId] = record;
+  if (category === 'sale') {
+    const key = 'monzo_import_' + txId;
+    monzoLedger[key] = {
+      key: key,
+      status: 'paid',
+      imported: true,
+      recordType: 'sale',
+      source: 'Monzo historical transaction import',
+      customerId: customerId,
+      agentId: agentId || null,
+      amount: record.amount,
+      currency: record.currency,
+      description: sold,
+      originalDescription: record.transactionDescription,
+      counterparty: record.counterparty,
+      reference: String(tx.notes || ''),
+      txId: txId,
+      createdAt: record.createdAt,
+      paidAt: record.settledAt,
+      importedAt: record.reviewedAt,
+    };
+    saveMonzo();
+  }
+  saveMonzoReview();
+  const outcome = category === 'sale'
+    ? 'Recorded **' + money(record.amount, record.currency) + '** as a historical sale for <@' + customerId + '>. It is now included in Bankroll customer history, payment history and totals' + (agentId ? ' under <@' + agentId + '>' : '') + '.'
+    : 'Marked as **' + category + '**. It has been saved in the Monzo review history but will not be counted as sales or revenue.';
+  return interaction.reply({ content: '✅ ' + outcome + '\n**Transaction:** ' + txId + '\n**Details:** ' + short(sold, 300), ephemeral: true, allowedMentions: { parse: [] } });
+}
+
 async function cmdCustomer(interaction) {
   const user = interaction.options.getUser('user');
   let card = [];
@@ -4627,6 +4874,7 @@ async function onAutocomplete(interaction) {
         .filter((purchase) => purchase.name.includes('[PAID]') || purchase.name.includes('[UNPAID]'));
 
       const monzo = Object.entries(monzoLedger).map(([key, entry]) => {
+        if (entry.imported) return null;
         const delivery = deliveries[key];
         const rawStatus = String(entry.status || (delivery?.paid ? 'paid' : 'open')).toLowerCase();
         const expired = rawStatus === 'open' &&
@@ -5104,6 +5352,11 @@ async function onScheduledSendButton(interaction) {
 }
 
 async function onButton(interaction) {
+  if (interaction.customId.startsWith('monzo_review_page:')) {
+    if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'Only the bot owner can review these transactions.', ephemeral: true });
+    const page = Number(interaction.customId.split(':')[1] || 0);
+    return interaction.update(monzoReviewPayload(page));
+  }
   if (interaction.customId.startsWith('testpaid:')) {
     if (interaction.user.id !== OWNER_ID) {
       return interaction.reply({ content: 'Only the bot owner can mark a test invoice as paid.', ephemeral: true });
@@ -5370,7 +5623,9 @@ client.on('interactionCreate', async (interaction) => {
       return await handleSpamConsent(interaction);
     }
     if (interaction.isButton()) return await onButton(interaction);
+    if (interaction.isStringSelectMenu() && interaction.customId === 'monzo_review_select') return await showMonzoReviewModal(interaction);
     if (interaction.isStringSelectMenu() && interaction.customId === 'customer_preview_select') return await onCustomerPreviewSelect(interaction);
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('monzo_review_modal:')) return await saveMonzoReviewModal(interaction);
     if (!interaction.isChatInputCommand()) return;
     if (!commands.some((c) => c.name === interaction.commandName)) return;
 
@@ -5386,6 +5641,9 @@ client.on('interactionCreate', async (interaction) => {
         return await sendStripeCheckout(interaction);
       case 'bankroll-monzo':
         return await sendMonzoInvoice(interaction);
+      case 'monzo-review':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdMonzoReview(interaction);
       case 'test':
         return await cmdPaymentTest(interaction);
       case 'vault':
