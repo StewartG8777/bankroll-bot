@@ -4830,10 +4830,9 @@ async function handleSpamConsent(interaction) {
     ownerId: request.ownerId,
     sourceMessage: interaction.message,
     interactionWebhook: interaction.webhook,
-    targetUser: request.dmMode ? interaction.user : null,
     message: request.message,
     endAt: Date.now() + request.durationMinutes * 60000,
-    dmMode: request.dmMode,
+    slowMode: request.dmMode,
     intervalMs: request.dmMode ? 5000 : 1000,
     sent: 0,
     timeout: null
@@ -4865,30 +4864,25 @@ async function handleSpamConsent(interaction) {
     }
     try {
       const messagePayload = { content: session.message, allowedMentions: { parse: [] } };
-      if (session.dmMode) {
-        if (!session.targetUser) throw new Error('DM recipient is unavailable.');
-        await session.targetUser.send(messagePayload);
-      } else {
-        // Prefer a real reply. User-installed apps may not have channel Send Messages
-        // permission, so fall back to the interaction webhook, which can send follow-ups.
+      // Both speed settings post in the same channel/chat. DM mode only changes
+      // the interval and how patiently the sender handles Discord rate limits.
+      try {
+        await session.sourceMessage.reply(messagePayload);
+      } catch (replyError) {
+        console.warn('Spam reply failed; trying channel send:', replyError.message);
         try {
-          await session.sourceMessage.reply(messagePayload);
-        } catch (replyError) {
-          console.warn('Spam reply failed; trying channel send:', replyError.message);
-          try {
-            await session.sourceMessage.channel.send(messagePayload);
-          } catch (channelError) {
-            console.warn('Spam channel send failed; trying interaction follow-up:', channelError.message);
-            await session.interactionWebhook.send(messagePayload);
-          }
+          await session.sourceMessage.channel.send(messagePayload);
+        } catch (channelError) {
+          console.warn('Spam channel send failed; trying interaction follow-up:', channelError.message);
+          await session.interactionWebhook.send(messagePayload);
         }
       }
       session.sent += 1;
     } catch (error) {
       const retryAfterMs = Number(error?.rawError?.retry_after ?? error?.data?.retry_after ?? error?.retry_after ?? error?.retryAfter ?? 0) * 1000;
-      if (session.dmMode && (Number(error?.status) === 429 || retryAfterMs > 0)) {
+      if (session.slowMode && (Number(error?.status) === 429 || retryAfterMs > 0)) {
         const waitMs = Math.max(session.intervalMs, Math.ceil(retryAfterMs) + 1000);
-        console.warn(`DM rate limit hit; waiting ${waitMs}ms before retrying.`);
+        console.warn(`Slow-mode rate limit hit; waiting ${waitMs}ms before retrying.`);
         if (Date.now() + waitMs < session.endAt) {
           session.timeout = setTimeout(sendNext, waitMs);
           session.timeout.unref?.();
