@@ -1823,6 +1823,13 @@ const previewCmd = common(
   new SlashCommandBuilder().setName('preview').setDescription('Select a customer and preview their Bankroll experience')
 );
 
+const exportCmd = common(
+  new SlashCommandBuilder()
+    .setName('export')
+    .setDescription('Export Bankroll source files to the private log channel')
+    .addSubcommand((sub) => sub.setName('index').setDescription('Post the raw running index.js file to #bankroll-index-logs'))
+);
+
 const botAdminCmd = common(
   new SlashCommandBuilder()
     .setName('bot')
@@ -1897,7 +1904,7 @@ const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription(
   .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' }))
   .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records')));
 
-const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
+const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -4103,6 +4110,39 @@ const RECENT_UPDATES = [
   'Historical Monzo customer IDs are assigned to the nine reviewed sales in newest-to-oldest order.',
 ];
 
+async function cmdExport(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can export source files.');
+  const sub = interaction.options.getSubcommand();
+  if (sub !== 'index') return interaction.editReply('Unknown export type.');
+
+  const indexPath = path.join(__dirname, 'index.js');
+  if (!fs.existsSync(indexPath)) return interaction.editReply('Could not find the running index.js file on this instance.');
+
+  let target = null;
+  const expectedName = 'bankroll-index-logs';
+  for (const guild of client.guilds.cache.values()) {
+    let channels = guild.channels.cache;
+    if (!channels.size) channels = await guild.channels.fetch().catch(() => channels);
+    target = channels.find((channel) =>
+      channel?.name?.toLowerCase().replace(/\\s+/g, '-') === expectedName &&
+      channel.isTextBased?.() && typeof channel.send === 'function'
+    ) || null;
+    if (target) break;
+  }
+  if (!target) {
+    return interaction.editReply('Could not find **#bankroll-index-logs**. Create that text channel and give Bankroll permission to view it, attach files and send messages.');
+  }
+
+  const stat = fs.statSync(indexPath);
+  if (!stat.size) return interaction.editReply('The running index.js file is empty; nothing was exported.');
+  await target.send({
+    content: 'index.js export • requested by <@' + interaction.user.id + '> • <t:' + Math.floor(Date.now() / 1000) + ':F>',
+    files: [new AttachmentBuilder(indexPath, { name: 'index.js' })],
+    allowedMentions: { parse: [] },
+  });
+  return interaction.editReply('✅ The raw **index.js** file has been exported to ' + target.toString() + ' and the export is logged there.');
+}
+
 async function cmdBotAdmin(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can use these controls.');
   const sub = interaction.options.getSubcommand();
@@ -5777,6 +5817,9 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdRefund(interaction);
       case 'setup':
         return await cmdSetup(interaction);
+      case 'export':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdExport(interaction);
       case 'bot':
         await interaction.deferReply({ ephemeral: true });
         return await cmdBotAdmin(interaction);
