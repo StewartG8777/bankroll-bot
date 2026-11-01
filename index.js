@@ -268,16 +268,42 @@ function londonOffset(ms) {
   const p = londonParts(ms);
   return Date.UTC(p.y, p.m - 1, p.d, p.h, p.mi, p.s) - Math.floor(ms / 1000) * 1000;
 }
-function periodStart(period) {
-  const p = londonParts(Date.now());
-  let d = p.d;
-  if (period === 'week') {
-    const dow = new Date(Date.UTC(p.y, p.m - 1, p.d)).getUTCDay();
-    d -= (dow + 6) % 7;
-  }
-  if (period === 'month') d = 1;
-  const guess = Date.UTC(p.y, p.m - 1, d);
+function londonMidnightUnix(year, monthIndex, day) {
+  const guess = Date.UTC(year, monthIndex, day);
   return Math.floor((guess - londonOffset(guess)) / 1000);
+}
+function periodBounds(period) {
+  if (period === 'all') return { since: null, until: null };
+  const p = londonParts(Date.now());
+  const today = Date.UTC(p.y, p.m - 1, p.d);
+  const dow = new Date(today).getUTCDay();
+  const monday = today - ((dow + 6) % 7) * 86400000;
+  let start;
+  let end;
+  if (period === 'today') {
+    start = today;
+    end = today + 86400000;
+  } else if (period === 'week') {
+    start = monday;
+    end = monday + 7 * 86400000;
+  } else if (period === 'last_week') {
+    start = monday - 7 * 86400000;
+    end = monday;
+  } else if (period === 'month') {
+    start = Date.UTC(p.y, p.m - 1, 1);
+    end = Date.UTC(p.y, p.m, 1);
+  } else if (period === 'last_month') {
+    start = Date.UTC(p.y, p.m - 2, 1);
+    end = Date.UTC(p.y, p.m - 1, 1);
+  } else {
+    throw new Error('Unknown totals period.');
+  }
+  const startDate = new Date(start);
+  const endDate = new Date(end);
+  return {
+    since: londonMidnightUnix(startDate.getUTCFullYear(), startDate.getUTCMonth(), startDate.getUTCDate()),
+    until: londonMidnightUnix(endDate.getUTCFullYear(), endDate.getUTCMonth(), endDate.getUTCDate()),
+  };
 }
 
 // ---------- File / link delivery & Vault ----------
@@ -1682,7 +1708,10 @@ const totalCmd = common(
         .addChoices(
           { name: 'Today', value: 'today' },
           { name: 'This week', value: 'week' },
-          { name: 'This month', value: 'month' }
+          { name: 'Last week', value: 'last_week' },
+          { name: 'This month', value: 'month' },
+          { name: 'Last month', value: 'last_month' },
+          { name: 'All time', value: 'all' }
         )
     )
 );
@@ -3913,12 +3942,12 @@ async function cmdPayments(interaction) {
 
 async function cmdTotal(interaction) {
   const period = interaction.options.getString('period');
-  const since = periodStart(period);
-  const everything = await succeededPayments(since);
+  const { since, until } = periodBounds(period);
+  const everything = (await succeededPayments(since)).filter((pi) => until == null || pi.created < until);
   const list = everything.filter((pi) => pi.currency === CURRENCY.toLowerCase());
   const otherCurrency = everything.length - list.length;
 
-  const monzoInPeriod = monzoPaid().filter((m) => tsec(m.paidAt) >= since);
+  const monzoInPeriod = monzoPaid().filter((m) => (since == null || tsec(m.paidAt) >= since) && (until == null || tsec(m.paidAt) < until));
   const monzoList = monzoInPeriod.filter((m) => m.currency === CURRENCY.toLowerCase());
   const monzoOther = monzoInPeriod.length - monzoList.length;
   const monzoSum = monzoList.reduce((a, m) => a + m.amount, 0);
@@ -3952,7 +3981,7 @@ async function cmdTotal(interaction) {
     .sort((a, b) => b[1] - a[1])
     .map(([id, v]) => `<@${id}>: ${money(v, CURRENCY)}`);
 
-  const label = { today: 'Today', week: 'This week', month: 'This month' }[period];
+  const label = { today: 'Today', week: 'This week', last_week: 'Last week', month: 'This month', last_month: 'Last month', all: 'All time' }[period];
   const embed = new EmbedBuilder()
     .setColor(GREEN)
     .setTitle(`Takings - ${label}`)
