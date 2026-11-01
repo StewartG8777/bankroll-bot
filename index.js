@@ -2036,6 +2036,7 @@ async function autoRestoreOnStartup() {
       'download_history.json': DOWNLOAD_HISTORY_FILE,
       'vault.json': VAULT_FILE,
       'monzo_payments.json': MONZO_FILE,
+      'monzo_review.json': MONZO_REVIEW_FILE,
       'notifications.json': NOTIFICATIONS_FILE,
       'scheduled_sends.json': SEND_JOBS_FILE,
       'webhook_events.json': WEBHOOK_EVENTS_FILE,
@@ -2104,6 +2105,18 @@ async function autoRestoreOnStartup() {
     try { const h = JSON.parse(fs.readFileSync(DOWNLOAD_HISTORY_FILE, 'utf8')); if (Array.isArray(h)) downloadHistory = h.slice(-500); } catch {}
     try { vault = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8')); } catch {}
     try { monzoLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8')); } catch {}
+    try {
+      const restoredReview = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
+      if (restoredReview && typeof restoredReview === 'object') {
+        monzoReviewState = {
+          transactions: restoredReview.transactions && typeof restoredReview.transactions === 'object' ? restoredReview.transactions : {},
+          reviewed: restoredReview.reviewed && typeof restoredReview.reviewed === 'object' ? restoredReview.reviewed : {},
+        };
+      }
+      console.log(`Restored Monzo review data: ${Object.keys(monzoReviewState.transactions).length} transactions, ${Object.keys(monzoReviewState.reviewed).length} reviewed.`);
+    } catch (error) {
+      if (error.code !== 'ENOENT') console.error('Could not reload restored Monzo review data:', error.message);
+    }
     try {
       const restoredNotifications = JSON.parse(fs.readFileSync(NOTIFICATIONS_FILE, 'utf8'));
       if (Array.isArray(restoredNotifications)) notificationHistory = restoredNotifications.slice(-100);
