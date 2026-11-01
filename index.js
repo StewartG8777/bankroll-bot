@@ -3401,7 +3401,7 @@ async function cmdPaymentTest(interaction) {
 
     if (method === 'monzo') {
       embed.addFields(
-        { name: 'Payment reference', value: `\\`${reference}\\``, inline: true },
+        { name: 'Payment reference', value: `\`${reference}\``, inline: true },
         { name: 'Description', value: description },
         { name: 'Pay by', value: `<t:${tsec(expiresAt)}:R>` }
       );
