@@ -4829,7 +4829,17 @@ async function onGetFile(interaction) {
     delivery_message: msg.url ?? '',
   });
   recordDownloadEvent('delivery_sent', { file: d.name, customerId: d.customerId, agentId: d.agentId, detail: 'Customer requested the paid file; delivery message was sent.' });
-  await notifyOwner({ content: `"${d.name}" was delivered to <@${d.customerId}>. Hosted downloads are tracked separately when the file is actually downloaded.` });
+  await notifyOwner({
+    embeds: [new EmbedBuilder().setColor(GREEN).setTitle(d.testMode ? '[TEST] File sent' : 'File sent')
+      .setDescription(`**File**\n${short(String(d.name || 'file'), 150)}`)
+      .addFields(
+        { name: 'Customer', value: `<@${d.customerId}>`, inline: true },
+        { name: 'Delivery', value: dlink ? 'Secure hosted download link' : 'Direct Discord attachment', inline: true },
+        { name: 'Download tracking', value: dlink ? 'Successful hosted downloads are confirmed separately' : 'Discord does not report whether an attachment was saved by the customer' },
+        { name: 'Delivery destination', value: 'Get file button on the invoice' },
+        ...(msg?.url ? [{ name: 'Message', value: msg.url }] : []),
+      ).setTimestamp()]
+  }, { notificationType: 'delivery.sent', notificationStatus: 'success' });
 }
 
 function randomSearchGb(durationMinutes) {
