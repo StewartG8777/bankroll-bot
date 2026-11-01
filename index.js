@@ -506,7 +506,7 @@ function applyMonzoReviewCustomerIds() {
   }
   const sales = Object.entries(monzoReviewState.reviewed || {})
     .filter(([txId, record]) => record?.category === 'sale' && monzoReviewState.transactions?.[txId]?.id)
-    .sort(([aId], [a], [bId], [b]) => {
+    .sort(([aId], [bId]) => {
       const aAt = Date.parse(monzoReviewState.transactions[aId]?.created || monzoReviewState.transactions[aId]?.settled || 0);
       const bAt = Date.parse(monzoReviewState.transactions[bId]?.created || monzoReviewState.transactions[bId]?.settled || 0);
       return bAt - aAt || String(bId).localeCompare(String(aId));
