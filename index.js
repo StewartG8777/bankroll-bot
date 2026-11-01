@@ -738,6 +738,27 @@ function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download i
     .setTimestamp();
 }
 
+function buildCustomerDeliveryEmbed(name, sizeBytes, downloadUrl = null) {
+  const isZip = /\\.zip$/i.test(String(name || ''));
+  const safeName = short(String(name || 'file'), 180);
+  const embed = new EmbedBuilder()
+    .setColor(GREEN)
+    .setAuthor({ name: 'BANKROLL | FILE DELIVERY' })
+    .setTitle(isZip ? 'Your ZIP is ready!' : 'Your file is ready!')
+    .setDescription(
+      'Your purchase has been successfully processed. Your complete file is ready to download.' +
+      (downloadUrl ? `\\n\\n[Download ${isZip ? 'ZIP' : 'file'}](${downloadUrl}) — secure one-time link.` : '')
+    )
+    .addFields(
+      { name: 'File', value: safeName, inline: false },
+      { name: 'Status', value: downloadUrl ? 'Ready · Secure download' : 'Ready · Attached below', inline: true },
+      ...(Number.isFinite(sizeBytes) ? [{ name: 'File size', value: `${(sizeBytes / (1024 * 1024)).toFixed(2)} MB`, inline: true }] : [])
+    )
+    .setFooter({ text: downloadUrl ? 'Bankroll secure delivery • One-time link' : 'Bankroll secure delivery' })
+    .setTimestamp();
+  return embed;
+}
+
 async function makeDownloadLink(d, paymentIntentId) {
   if (!d?.path || !fs.existsSync(d.path)) throw new Error('The source file is no longer available.');
   const token = crypto.randomBytes(24).toString('hex');
@@ -1204,19 +1225,19 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   }
 
   const isZip = /\.zip$/i.test(String(d.name || ''));
+  const deliverySize = d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined;
   const payload = () => {
-    if (noFile) return { content: `<@${d.customerId}> payment received. Thank you!` };
+    if (noFile) return { content: `<@${d.customerId}> payment received. Thank you!`, allowedMentions: { parse: [] } };
     if (dlink) {
       return {
-        content: `<@${d.customerId}> payment received. Your complete ${isZip ? 'ZIP' : 'file'} is ready. The secure download link works once and has no time expiry.`,
-        embeds: [buildDownloadEmbed(d.name, downloads[dlink.split('/').pop()]?.expiresAt, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined)],
-        components: [downloadLinkRow(dlink, isZip ? 'Download ZIP' : 'Download File')],
+        content: `<@${d.customerId}> payment received. Your complete ${isZip ? 'ZIP' : 'file'} is ready below.`,
+        embeds: [buildCustomerDeliveryEmbed(d.name, deliverySize, dlink)],
         allowedMentions: { parse: [] },
       };
     }
     return {
-      content: `<@${d.customerId}> payment received. Here is your complete file.`,
-      embeds: [buildDownloadEmbed(d.name, null, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined)],
+      content: `<@${d.customerId}> payment received. Your complete file is attached below.`,
+      embeds: [buildCustomerDeliveryEmbed(d.name, deliverySize)],
       files: [new AttachmentBuilder(d.path, { name: path.basename(d.name || 'download.zip') })],
       allowedMentions: { parse: [] },
     };
