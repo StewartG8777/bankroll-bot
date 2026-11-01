@@ -479,9 +479,19 @@ try {
   };
 } catch {}
 function saveMonzoReview() {
-  try { atomicWrite(MONZO_REVIEW_FILE, JSON.stringify(monzoReviewState, null, 2)); }
-  catch (e) { console.error('Could not save Monzo review records:', e.message); }
-  scheduleBackup();
+  try {
+    atomicWrite(MONZO_REVIEW_FILE, JSON.stringify(monzoReviewState, null, 2));
+    const persisted = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
+    const saved = persisted && persisted.reviewed && typeof persisted.reviewed === 'object' ? persisted.reviewed : {};
+    for (const txId of Object.keys(monzoReviewState.reviewed || {})) {
+      if (!saved[txId]) throw new Error('Review missing after disk read-back: ' + txId);
+    }
+    scheduleBackup();
+    return true;
+  } catch (e) {
+    console.error('Could not verify saved Monzo review records:', e.message);
+    return false;
+  }
 }
 
 // Owner-supplied customer mapping for the 15 Monzo sales, newest transaction to oldest.
@@ -4915,6 +4925,10 @@ async function saveMonzoReviewModal(interaction) {
     reviewedBy: interaction.user.id,
   };
   monzoReviewState.reviewed[txId] = record;
+  if (!saveMonzoReview()) {
+    delete monzoReviewState.reviewed[txId];
+    return interaction.reply({ content: '❌ Bankroll could not verify this review was saved to disk. It has NOT been marked as saved. Check the Render logs for the Monzo review save error.', ephemeral: true });
+  }
   {
     const key = 'monzo_import_' + txId;
     monzoLedger[key] = {
@@ -4938,7 +4952,6 @@ async function saveMonzoReviewModal(interaction) {
     };
     saveMonzo();
   }
-  saveMonzoReview();
   const outcome = 'Recorded **' + money(record.amount, record.currency) + '** as a historical sale' + (customerId ? ' for <@' + customerId + '>' : ' with customer ID left blank for later assignment') + ', assigned to you (<@' + OWNER_ID + '>). It is included in Bankroll payment history and totals.';
   return interaction.reply({ content: '✅ ' + outcome + '\n**Transaction:** ' + txId + '\n**Date:** ' + dateText + '\n**Details:** ' + short(sold, 300), ephemeral: true, allowedMentions: { parse: [] } });
 }
