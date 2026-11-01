@@ -5340,8 +5340,8 @@ async function startScheduledSend(interaction) {
     saveSendJobs();
   } catch (e) { console.error('Could not save /sendfile message ID:', e.message); }
 }
-// Large archives are never split. If a complete ZIP exceeds Discord's upload limit,
-// the bot serves the original ZIP through a secure one-time download link.
+// Files are never modified. If an item exceeds Discord's upload limit,
+// the bot serves the original file through a secure one-time download link.
 
 async function onScheduledSendButton(interaction) {
   const jobId = interaction.customId.slice('sendfile:'.length);
@@ -5350,7 +5350,7 @@ async function onScheduledSendButton(interaction) {
     return interaction.reply({ content: 'This scheduled file request could not be found in this DM.', ephemeral: true });
   }
   if (job.status === 'sent' || job.status === 'link_sent') {
-    return interaction.reply({ content: job.status === 'sent' ? 'This ZIP has already been sent.' : 'The one-time download link has already been sent.', ephemeral: true });
+    return interaction.reply({ content: job.status === 'sent' ? 'This file has already been sent.' : 'The one-time download link has already been sent.', ephemeral: true });
   }
   if (job.status === 'sending') return interaction.reply({ content: 'Your file is being prepared right now, one moment.', ephemeral: true });
   if (Date.now() < job.dueAt) {
@@ -5362,7 +5362,7 @@ async function onScheduledSendButton(interaction) {
     return interaction.update({ content: `The scheduled time has arrived, but vault file \`${job.vaultKey}\` is missing. Re-add it, then contact the bot owner.`, components: [sendfileButton(jobId)] });
   }
   job.status = 'sending';
-  await interaction.update({ content: `${sendfileProgress(job)}\n\nPreparing your complete ZIP now...`, components: [], allowedMentions: { parse: [] } });
+  await interaction.update({ content: `${sendfileProgress(job)}\n\nPreparing your complete file now...`, components: [], allowedMentions: { parse: [] } });
 
   const finish = async (status, note) => {
     job.status = status;
@@ -5386,7 +5386,7 @@ async function onScheduledSendButton(interaction) {
       components: [downloadLinkRow(link, 'Download File')],
       allowedMentions: { parse: [] },
     });
-    recordDownloadEvent('delivery_sent', { file: job.originalName, customerId: interaction.user.id, agentId: OWNER_ID, detail: 'Scheduled ZIP delivery link sent.' });
+    recordDownloadEvent('delivery_sent', { file: job.originalName, customerId: interaction.user.id, agentId: OWNER_ID, detail: 'Scheduled file download link sent.' });
     await finish('link_sent', 'One-time Download File button sent below.');
   };
 
