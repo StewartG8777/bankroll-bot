@@ -1551,7 +1551,15 @@ const monzoCmd = common(
 const monzoReviewCmd = common(
   new SlashCommandBuilder()
     .setName('monzo-review')
-    .setDescription('Review last month’s real Monzo transactions and add confirmed sales to Bankroll history (owner only)')
+    .setDescription('Review Monzo sales and add them to Bankroll history (owner only)')
+    .addStringOption((o) =>
+      o.setName('period').setDescription('Which transactions to review').setRequired(true).addChoices(
+        { name: 'This month', value: 'month' },
+        { name: 'Last month', value: 'last_month' },
+        { name: 'This week', value: 'week' },
+        { name: 'Last week', value: 'last_week' }
+      )
+    )
 );
 
 const vaultCmd = common(
@@ -4445,30 +4453,37 @@ async function cmdWipe(interaction) {
   });
 }
 
-function monzoReviewTransactionsSorted() {
+function monzoReviewTransactionsSorted(period = 'last_month') {
+  const bounds = periodBounds(period);
   return Object.values(monzoReviewState.transactions || {})
-    .filter((tx) => tx && tx.id && !monzoReviewState.reviewed?.[tx.id])
+    .filter((tx) => {
+      const at = Math.floor(Date.parse(tx.created || tx.settled || 0) / 1000);
+      return tx && tx.id && Number(tx.amount) > 0 && at >= bounds.since && at < bounds.until && !monzoReviewState.reviewed?.[tx.id];
+    })
     .sort((a, b) => Date.parse(b.created || b.settled || 0) - Date.parse(a.created || a.settled || 0));
 }
 
-function monzoReviewPayload(page = 0) {
-  const pending = monzoReviewTransactionsSorted();
+function monzoReviewPayload(page = 0, period = 'last_month') {
+  const pending = monzoReviewTransactionsSorted(period);
   const pageSize = 25;
   const pageCount = Math.max(1, Math.ceil(pending.length / pageSize));
   const current = Math.max(0, Math.min(Number(page) || 0, pageCount - 1));
   const items = pending.slice(current * pageSize, (current + 1) * pageSize);
-  const all = Object.values(monzoReviewState.transactions || {});
-  const reviewed = Object.keys(monzoReviewState.reviewed || {}).length;
-  const income = all.filter((tx) => Number(tx.amount) > 0).reduce((sum, tx) => sum + Number(tx.amount || 0), 0) / 100;
-  const outgoing = all.filter((tx) => Number(tx.amount) < 0).reduce((sum, tx) => sum + Math.abs(Number(tx.amount || 0)), 0) / 100;
+  const bounds = periodBounds(period);
+  const all = Object.values(monzoReviewState.transactions || {}).filter((tx) => {
+    const at = Math.floor(Date.parse(tx.created || tx.settled || 0) / 1000);
+    return Number(tx.amount) > 0 && at >= bounds.since && at < bounds.until;
+  });
+  const reviewed = all.filter((tx) => !!monzoReviewState.reviewed?.[tx.id]).length;
+  const income = all.reduce((sum, tx) => sum + Number(tx.amount || 0), 0) / 100;
   const embed = new EmbedBuilder()
     .setColor(GREEN)
     .setTitle('Monzo historical transaction review')
     .setDescription(
-      '**Previous calendar month**\n' +
-      'Transactions found: **' + all.length + '** • Reviewed: **' + reviewed + '** • Awaiting review: **' + pending.length + '**\n' +
-      'Money in: **' + money(income, 'gbp') + '** • Money out: **' + money(outgoing, 'gbp') + '**\n\n' +
-      'Choose a transaction below. Bankroll will ask for the Discord customer ID, what was sold/what it was for, the sales agent and the transaction category. Nothing is classified automatically.'
+      '**' + ({ month: 'This month', last_month: 'Last month', week: 'This week', last_week: 'Last week' }[period] || period) + '**\n' +
+      'Incoming transactions: **' + all.length + '** • Reviewed: **' + reviewed + '** • Awaiting review: **' + pending.length + '**\n' +
+      'Money received: **' + money(income, 'gbp') + '**\n\n' +
+      'Choose a transaction. Add the customer Discord ID, what was sold, and correct the transaction date if needed. Sales agent is automatically set to you.'
     )
     .setFooter({ text: pending.length ? 'Page ' + (current + 1) + ' of ' + pageCount + ' • ' + pending.length + ' awaiting review' : 'All imported transactions have been reviewed.' });
   const components = [];
@@ -4496,11 +4511,11 @@ function monzoReviewPayload(page = 0) {
   return { embeds: [embed], components, ephemeral: true };
 }
 
-async function fetchMonzoLastMonthTransactions() {
+async function fetchMonzoReviewTransactions(period = 'last_month') {
   if (!MONZO_ACCESS_TOKEN || !MONZO_ACCOUNT_ID) {
     throw new Error('Monzo history access is not configured. Set MONZO_ACCESS_TOKEN and MONZO_ACCOUNT_ID in the bot environment.');
   }
-  const bounds = periodBounds('last_month');
+  const bounds = periodBounds(period);
   const since = bounds.since;
   const until = bounds.until;
   const found = new Map();
@@ -4535,13 +4550,14 @@ async function fetchMonzoLastMonthTransactions() {
 
 async function cmdMonzoReview(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can review historical Monzo transactions.');
-  const transactions = await fetchMonzoLastMonthTransactions();
+  const period = interaction.options.getString('period') || 'last_month';
+  const transactions = (await fetchMonzoReviewTransactions(period)).filter((tx) => Number(tx.amount) > 0);
   for (const tx of transactions) {
     if (!monzoReviewState.transactions[tx.id]) monzoReviewState.transactions[tx.id] = tx;
   }
   saveMonzoReview();
   const reviewedCount = transactions.filter((tx) => !!monzoReviewState.reviewed[tx.id]).length;
-  const payload = monzoReviewPayload(0);
+  const payload = monzoReviewPayload(0, period);
   payload.embeds[0].addFields(
     { name: 'Transactions fetched this run', value: String(transactions.length), inline: true },
     { name: 'Already reviewed', value: String(reviewedCount), inline: true }
@@ -4557,12 +4573,12 @@ async function showMonzoReviewModal(interaction) {
   if (monzoReviewState.reviewed[txId]) return interaction.reply({ content: 'That transaction has already been reviewed.', ephemeral: true });
   const modal = new ModalBuilder()
     .setCustomId('monzo_review_modal:' + txId)
-    .setTitle('Classify Monzo transaction');
+    .setTitle('Review Monzo sale');
   const customer = new TextInputBuilder()
     .setCustomId('customer_id')
-    .setLabel('Customer Discord ID (required for a sale)')
+    .setLabel('Customer Discord ID')
     .setStyle(TextInputStyle.Short)
-    .setRequired(false)
+    .setRequired(true)
     .setMaxLength(25);
   const sold = new TextInputBuilder()
     .setCustomId('sold')
@@ -4571,24 +4587,18 @@ async function showMonzoReviewModal(interaction) {
     .setRequired(true)
     .setMaxLength(500)
     .setPlaceholder('Product, vehicle, service, expense details, etc.');
-  const agent = new TextInputBuilder()
-    .setCustomId('agent_id')
-    .setLabel('Sales agent Discord ID (optional)')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setMaxLength(25);
-  const category = new TextInputBuilder()
-    .setCustomId('category')
-    .setLabel('Category: sale/refund/expense/personal/other')
+  const txDate = new Date(tx.created || tx.settled || Date.now()).toISOString().slice(0, 10);
+  const date = new TextInputBuilder()
+    .setCustomId('transaction_date')
+    .setLabel('Transaction date (YYYY-MM-DD)')
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
-    .setMaxLength(20)
-    .setPlaceholder('sale, refund, expense, personal or other');
+    .setMaxLength(10)
+    .setValue(txDate);
   modal.addComponents(
     new ActionRowBuilder().addComponents(customer),
     new ActionRowBuilder().addComponents(sold),
-    new ActionRowBuilder().addComponents(agent),
-    new ActionRowBuilder().addComponents(category)
+    new ActionRowBuilder().addComponents(date)
   );
   await interaction.showModal(modal);
 }
@@ -4602,24 +4612,21 @@ async function saveMonzoReviewModal(interaction) {
 
   const cleanDiscordId = (value) => String(value || '').trim().replace(/^<@!?(\d+)>$/, '$1');
   const customerId = cleanDiscordId(interaction.fields.getTextInputValue('customer_id'));
-  const agentId = cleanDiscordId(interaction.fields.getTextInputValue('agent_id'));
   const sold = interaction.fields.getTextInputValue('sold').trim();
-  const category = interaction.fields.getTextInputValue('category').trim().toLowerCase();
-  const categories = new Set(['sale', 'refund', 'expense', 'personal', 'other']);
-  if (!categories.has(category)) {
-    return interaction.reply({ content: 'Invalid category. Use exactly: sale, refund, expense, personal or other.', ephemeral: true });
+  const dateText = interaction.fields.getTextInputValue('transaction_date').trim();
+  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateText);
+  const dateMs = dateMatch ? Date.UTC(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3]), 12) : NaN;
+  if (!Number.isFinite(dateMs) || new Date(dateMs).toISOString().slice(0, 10) !== dateText) {
+    return interaction.reply({ content: 'Enter a valid transaction date in YYYY-MM-DD format.', ephemeral: true });
   }
-  if (category === 'sale' && !/^\d{17,20}$/.test(customerId)) {
+  if (!/^\d{17,20}$/.test(customerId)) {
     return interaction.reply({ content: 'A sale needs a valid customer Discord ID (17–20 digits). Nothing has been saved yet.', ephemeral: true });
   }
-  if (customerId && !/^\d{17,20}$/.test(customerId)) {
-    return interaction.reply({ content: 'That customer Discord ID is not valid. Use the numeric ID or leave it blank.', ephemeral: true });
+  if (!/^\d{17,20}$/.test(customerId)) {
+    return interaction.reply({ content: 'Enter a valid customer Discord ID (17–20 digits).', ephemeral: true });
   }
-  if (agentId && !/^\d{17,20}$/.test(agentId)) {
-    return interaction.reply({ content: 'That sales agent Discord ID is not valid. Use the numeric ID or leave it blank.', ephemeral: true });
-  }
-  if (category === 'sale' && Number(tx.amount) <= 0) {
-    return interaction.reply({ content: 'A sale must be an incoming Monzo transaction. This transaction is money out, so classify it as expense, personal or other instead.', ephemeral: true });
+  if (Number(tx.amount) <= 0) {
+    return interaction.reply({ content: 'Only incoming Monzo transactions are included as sales.', ephemeral: true });
   }
 
   const record = {
@@ -4629,16 +4636,17 @@ async function saveMonzoReviewModal(interaction) {
     transactionDescription: String(tx.description || ''),
     counterparty: String(tx.counterparty?.name || tx.merchant?.name || ''),
     sold: sold,
-    category: category,
-    customerId: customerId || null,
-    agentId: agentId || null,
-    createdAt: Date.parse(tx.created || tx.settled || Date.now()),
-    settledAt: Date.parse(tx.settled || tx.created || Date.now()),
+    category: 'sale',
+    customerId: customerId,
+    agentId: OWNER_ID,
+    createdAt: dateMs,
+    settledAt: dateMs,
+    transactionDate: dateText,
     reviewedAt: Date.now(),
     reviewedBy: interaction.user.id,
   };
   monzoReviewState.reviewed[txId] = record;
-  if (category === 'sale') {
+  {
     const key = 'monzo_import_' + txId;
     monzoLedger[key] = {
       key: key,
@@ -4647,7 +4655,7 @@ async function saveMonzoReviewModal(interaction) {
       recordType: 'sale',
       source: 'Monzo historical transaction import',
       customerId: customerId,
-      agentId: agentId || null,
+      agentId: OWNER_ID,
       amount: record.amount,
       currency: record.currency,
       description: sold,
@@ -4662,10 +4670,8 @@ async function saveMonzoReviewModal(interaction) {
     saveMonzo();
   }
   saveMonzoReview();
-  const outcome = category === 'sale'
-    ? 'Recorded **' + money(record.amount, record.currency) + '** as a historical sale for <@' + customerId + '>. It is now included in Bankroll customer history, payment history and totals' + (agentId ? ' under <@' + agentId + '>' : '') + '.'
-    : 'Marked as **' + category + '**. It has been saved in the Monzo review history but will not be counted as sales or revenue.';
-  return interaction.reply({ content: '✅ ' + outcome + '\n**Transaction:** ' + txId + '\n**Details:** ' + short(sold, 300), ephemeral: true, allowedMentions: { parse: [] } });
+  const outcome = 'Recorded **' + money(record.amount, record.currency) + '** as a historical sale for <@' + customerId + '>, assigned to you (<@' + OWNER_ID + '>). It is included in Bankroll customer history, payment history and totals.';
+  return interaction.reply({ content: '✅ ' + outcome + '\n**Transaction:** ' + txId + '\n**Date:** ' + dateText + '\n**Details:** ' + short(sold, 300), ephemeral: true, allowedMentions: { parse: [] } });
 }
 
 async function cmdCustomer(interaction) {
@@ -5363,7 +5369,7 @@ async function onButton(interaction) {
   if (interaction.customId.startsWith('monzo_review_page:')) {
     if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'Only the bot owner can review these transactions.', ephemeral: true });
     const page = Number(interaction.customId.split(':')[1] || 0);
-    return interaction.update(monzoReviewPayload(page));
+    return interaction.update(monzoReviewPayload(page, interaction.message?.embeds?.[0]?.description?.includes('This month') ? 'month' : interaction.message?.embeds?.[0]?.description?.includes('This week') ? 'week' : interaction.message?.embeds?.[0]?.description?.includes('Last week') ? 'last_week' : 'last_month'));
   }
   if (interaction.customId.startsWith('testpaid:')) {
     if (interaction.user.id !== OWNER_ID) {
