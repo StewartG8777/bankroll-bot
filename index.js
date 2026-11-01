@@ -1440,7 +1440,7 @@ const spamCmd = common(
   new SlashCommandBuilder().setName('spam').setDescription('Post a timed repeated-message embed in this chat or channel')
     .addStringOption((o) => o.setName('message').setDescription('Text or emoji to repeat').setMaxLength(1800).setRequired(true))
     .addIntegerOption((o) => o.setName('duration').setDescription('Duration in minutes (1–15)').setMinValue(1).setMaxValue(15).setRequired(true))
-    .addBooleanOption((o) => o.setName('dm').setDescription('Send the repeated messages to your own DMs (slower, rate-limit aware)'))
+    .addBooleanOption((o) => o.setName('dm').setDescription('Use slower sending with automatic rate-limit retries (messages stay here)'))
 );
 const stopSpamCmd = common(
   new SlashCommandBuilder().setName('stop').setDescription('Owner: stop every active spam session')
