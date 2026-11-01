@@ -484,9 +484,9 @@ function saveMonzoReview() {
   scheduleBackup();
 }
 
-// One-time owner-supplied mapping for the nine Monzo sales reviewed in newest-to-oldest order.
-// It is applied after startup data recovery, and only when exactly nine reviewed sales exist.
-const MONZO_REVIEW_CUSTOMER_IDS_NEWEST_FIRST = [
+// Owner-supplied customer mapping for the 15 Monzo sales, newest transaction to oldest.
+// Each number refers to the corresponding customer in MONZO_REVIEW_CUSTOMER_IDS.
+const MONZO_REVIEW_CUSTOMER_IDS = [
   '474754953722724372',
   '1316063283526111295',
   '311970125190397962',
@@ -497,13 +497,19 @@ const MONZO_REVIEW_CUSTOMER_IDS_NEWEST_FIRST = [
   '651001341904420897',
   '558205144156733460',
 ];
-const MONZO_CUSTOMER_ASSIGNMENT_VERSION = 'review-customer-ids-2026-11-01';
+const MONZO_REVIEW_CUSTOMER_ORDER_NEWEST_FIRST = [7, 8, 7, 2, 2, 9, 2, 2, 3, 4, 5, 1, 1, 6, 6];
+const MONZO_CUSTOMER_ASSIGNMENT_VERSION = 'review-customer-ids-2026-11-01-v2';
+const PREVIOUS_MONZO_CUSTOMER_ASSIGNMENT_VERSION = 'review-customer-ids-2026-11-01';
 function applyMonzoReviewCustomerIds() {
-  const ids = MONZO_REVIEW_CUSTOMER_IDS_NEWEST_FIRST;
-  if (ids.length !== 9 || ids.some((id) => !/^\d{17,20}$/.test(id))) {
-    console.error('Monzo customer ID import skipped: the supplied ID list failed validation.');
+  const customerIds = MONZO_REVIEW_CUSTOMER_IDS;
+  const order = MONZO_REVIEW_CUSTOMER_ORDER_NEWEST_FIRST;
+  if (customerIds.length !== 9 || order.length !== 15 ||
+      customerIds.some((id) => !/^\\d{17,20}$/.test(id)) ||
+      order.some((number) => !Number.isInteger(number) || number < 1 || number > customerIds.length)) {
+    console.error('Monzo customer ID import skipped: the supplied customer list or transaction mapping failed validation.');
     return 0;
   }
+
   const sales = Object.entries(monzoReviewState.reviewed || {})
     .filter(([txId, record]) => record?.category === 'sale' && monzoReviewState.transactions?.[txId]?.id)
     .sort(([aId], [bId]) => {
@@ -511,36 +517,48 @@ function applyMonzoReviewCustomerIds() {
       const bAt = Date.parse(monzoReviewState.transactions[bId]?.created || monzoReviewState.transactions[bId]?.settled || 0);
       return bAt - aAt || String(bId).localeCompare(String(aId));
     });
-  if (sales.length !== ids.length) {
-    console.warn('Monzo customer ID import not applied: expected exactly ' + ids.length + ' reviewed sales, found ' + sales.length + '. No records were changed.');
+
+  if (sales.length !== order.length) {
+    console.warn('Monzo customer ID import not applied: expected exactly ' + order.length + ' reviewed sales for the supplied numbered mapping, found ' + sales.length + '. No records were changed.');
     return 0;
   }
-  const alreadyApplied = sales.every(([txId, record], index) =>
-    record.customerId === ids[index] &&
+
+  const assignments = sales.map(([txId, record], index) => ({
+    txId,
+    record,
+    customerId: customerIds[order[index] - 1],
+    ledgerRecord: monzoLedger['monzo_import_' + txId],
+  }));
+  const alreadyApplied = assignments.every(({ record, customerId, ledgerRecord }) =>
+    record.customerId === customerId &&
     record.bulkCustomerAssignmentVersion === MONZO_CUSTOMER_ASSIGNMENT_VERSION &&
-    monzoLedger['monzo_import_' + txId]?.customerId === ids[index]
+    ledgerRecord?.customerId === customerId
   );
   if (alreadyApplied) return 0;
-  const canApply = sales.every(([txId, record], index) => {
-    const ledgerRecord = monzoLedger['monzo_import_' + txId];
-    return !!ledgerRecord &&
-      (!record.customerId || record.customerId === ids[index]) &&
-      (!ledgerRecord.customerId || ledgerRecord.customerId === ids[index]);
+
+  const canApply = assignments.every(({ record, customerId, ledgerRecord }) => {
+    if (!ledgerRecord) return false;
+    const oldAutoAssignment = record.bulkCustomerAssignmentVersion === PREVIOUS_MONZO_CUSTOMER_ASSIGNMENT_VERSION &&
+      ledgerRecord.customerId === record.customerId;
+    return (!record.customerId || record.customerId === customerId || oldAutoAssignment) &&
+      (!ledgerRecord.customerId || ledgerRecord.customerId === customerId || oldAutoAssignment);
   });
   if (!canApply) {
-    console.warn('Monzo customer ID import not applied: at least one reviewed sale already has a different customer ID or is missing its ledger entry. No records were changed.');
+    console.warn('Monzo customer ID import not applied: at least one sale has a conflicting manually assigned customer ID or is missing its ledger entry. No records were changed.');
     return 0;
   }
-  sales.forEach(([txId, record], index) => {
-    record.customerId = ids[index];
+
+  assignments.forEach(({ record, customerId, ledgerRecord }) => {
+    record.customerId = customerId;
     record.bulkCustomerAssignmentVersion = MONZO_CUSTOMER_ASSIGNMENT_VERSION;
-    monzoLedger['monzo_import_' + txId].customerId = ids[index];
+    ledgerRecord.customerId = customerId;
   });
   saveMonzo();
   saveMonzoReview();
-  console.log('Imported customer Discord IDs for ' + sales.length + ' Monzo review sales (newest to oldest).');
-  return sales.length;
+  console.log('Imported the supplied numbered customer mapping for ' + assignments.length + ' Monzo sales (newest to oldest).');
+  return assignments.length;
 }
+
 let wipedCustomers = new Set();
 try { const ids = JSON.parse(fs.readFileSync(WIPED_CUSTOMERS_FILE, 'utf8')); if (Array.isArray(ids)) wipedCustomers = new Set(ids.map(String)); } catch {}
 function saveWipedCustomers() { atomicWrite(WIPED_CUSTOMERS_FILE, JSON.stringify([...wipedCustomers], null, 2)); }
