@@ -5843,9 +5843,6 @@ const spamSessions = new Map();
 const spamRequests = new Map();
 
 async function cmdSpam(interaction) {
-  if (!interaction.channel?.isTextBased()) {
-    return interaction.reply({ content: 'I cannot post a spam setup in this location. Use /spam in a server text channel or a direct message where Bankroll is available.', ephemeral: true });
-  }
   const message = interaction.options.getString('message', true);
   const durationMinutes = interaction.options.getInteger('duration', true);
   const dmMode = interaction.options.getBoolean('dm') ?? false;
@@ -5927,31 +5924,18 @@ async function handleSpamConsent(interaction) {
     if (!spamSessions.has(sessionId)) return;
     if (Date.now() >= session.endAt) {
       spamSessions.delete(sessionId);
-      await session.sourceMessage.reply({ content: 'Message session finished.', allowedMentions: { parse: [] } }).catch(() => {});
+      await session.interactionWebhook.send({ content: 'Message session finished.', allowedMentions: { parse: [] } }).catch(() => {});
       return;
     }
 
     try {
-      const messagePayload = { content: session.message, allowedMentions: { parse: [] } };
-      try {
-        await session.sourceMessage.reply(messagePayload);
-      } catch (replyError) {
-        // A 429 is not a permissions failure: do not immediately retry the same
-        // message through another endpoint. Let the outer handler wait and retry.
-        if (Number(replyError?.status) === 429 || Number(replyError?.rawError?.code) === 20028 || Number(replyError?.rawError?.code) === 20029) {
-          throw replyError;
-        }
-        console.warn('Spam reply failed; trying channel send:', replyError.message);
-        try {
-          await session.sourceMessage.channel.send(messagePayload);
-        } catch (channelError) {
-          if (Number(channelError?.status) === 429 || Number(channelError?.rawError?.code) === 20028 || Number(channelError?.rawError?.code) === 20029) {
-            throw channelError;
-          }
-          console.warn('Spam channel send failed; trying interaction follow-up:', channelError.message);
-          await session.interactionWebhook.send(messagePayload);
-        }
-      }
+      // Send through the interaction webhook. This works in Guild, Bot DM and
+      // User Install contexts where the bot may not be a member of the server.
+      // Use exactly one endpoint per attempt so a timeout cannot create duplicates.
+      await session.interactionWebhook.send({
+        content: session.message,
+        allowedMentions: { parse: [] }
+      });
       session.sent += 1;
     } catch (error) {
       const isRateLimited = Number(error?.status) === 429
@@ -5974,7 +5958,7 @@ async function handleSpamConsent(interaction) {
           return;
         }
         spamSessions.delete(sessionId);
-        await session.sourceMessage.reply({
+        await session.interactionWebhook.send({
           content: `Message session finished. Sent ${session.sent} message(s); Discord rate-limited the final attempt until the session ended.`,
           allowedMentions: { parse: [] }
         }).catch(() => {});
