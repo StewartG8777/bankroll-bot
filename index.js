@@ -478,13 +478,29 @@ try {
     reviewed: savedReview.reviewed && typeof savedReview.reviewed === 'object' ? savedReview.reviewed : {},
   };
 } catch {}
+function mergeMonzoReviewStates(current, incoming) {
+  const a = current && typeof current === 'object' ? current : {};
+  const b = incoming && typeof incoming === 'object' ? incoming : {};
+  const transactions = { ...(b.transactions || {}), ...(a.transactions || {}) };
+  const reviewed = { ...(b.reviewed || {}) };
+  for (const [txId, record] of Object.entries(a.reviewed || {})) {
+    const diskRecord = reviewed[txId];
+    if (!diskRecord || Number(record?.reviewedAt || 0) >= Number(diskRecord?.reviewedAt || 0)) reviewed[txId] = record;
+  }
+  return { transactions, reviewed };
+}
 function saveMonzoReview() {
   try {
+    fs.mkdirSync(path.dirname(MONZO_REVIEW_FILE), { recursive: true });
     atomicWrite(MONZO_REVIEW_FILE, JSON.stringify(monzoReviewState, null, 2));
     const persisted = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
-    const saved = persisted && persisted.reviewed && typeof persisted.reviewed === 'object' ? persisted.reviewed : {};
-    for (const txId of Object.keys(monzoReviewState.reviewed || {})) {
-      if (!saved[txId]) throw new Error('Review missing after disk read-back: ' + txId);
+    if (!persisted || typeof persisted !== 'object' || !persisted.reviewed || typeof persisted.reviewed !== 'object') {
+      throw new Error('Saved review file has an invalid structure.');
+    }
+    for (const [txId, record] of Object.entries(monzoReviewState.reviewed || {})) {
+      if (!persisted.reviewed[txId] || Number(persisted.reviewed[txId].reviewedAt || 0) !== Number(record?.reviewedAt || 0)) {
+        throw new Error('Review missing or changed after disk read-back: ' + txId);
+      }
     }
     scheduleBackup();
     return true;
@@ -615,7 +631,7 @@ function syncMonzoReviewSalesToLedger() {
   try {
     const restoredLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8'));
     if (restoredLedger && typeof restoredLedger === 'object' && !Array.isArray(restoredLedger)) {
-      monzoLedger = restoredLedger;
+      monzoLedger = { ...monzoLedger, ...restoredLedger };
     }
   } catch (error) {
     if (error.code !== 'ENOENT') console.error('Could not reload recovered Monzo ledger:', error.message);
@@ -623,10 +639,7 @@ function syncMonzoReviewSalesToLedger() {
   try {
     const restoredReview = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
     if (restoredReview && typeof restoredReview === 'object') {
-      monzoReviewState = {
-        transactions: restoredReview.transactions && typeof restoredReview.transactions === 'object' ? restoredReview.transactions : {},
-        reviewed: restoredReview.reviewed && typeof restoredReview.reviewed === 'object' ? restoredReview.reviewed : {},
-      };
+      monzoReviewState = mergeMonzoReviewStates(monzoReviewState, restoredReview);
     }
   } catch (error) {
     if (error.code !== 'ENOENT') console.error('Could not reload recovered Monzo review records:', error.message);
@@ -658,6 +671,7 @@ function syncMonzoReviewSalesToLedger() {
       createdAt: Number(review.createdAt || existing?.createdAt || dateMs),
       paidAt: dateMs,
       importedAt: Number(review.reviewedAt || existing?.importedAt || Date.now()),
+      reviewRecord: review,
     };
     if (!Number.isFinite(entry.amount) || entry.amount <= 0) {
       console.warn('Skipped invalid historical Monzo sale ' + txId + ': amount was missing or invalid.');
@@ -2409,10 +2423,11 @@ async function autoRestoreOnStartup() {
     }
 
     if (Object.keys(vault).length) saveVault();
-    try {
-      const dbBuffers = Object.values(targets).map((fp) => fs.readFileSync(fp));
-      lastBackupHash = crypto.createHash('sha256').update(Buffer.concat(dbBuffers)).digest('hex');
-    } catch {}
+    // Do not mark the current local files as already backed up here. If the
+    // backup channel is empty (or has no valid snapshot), doing so suppresses
+    // the first real snapshot and leaves this deployment with no recovery point.
+    // backupDataOnce sets lastBackupHash only after Discord confirms a snapshot.
+    lastBackupHash = '';
     lastBackupAt = msgs.find((m) => trusted(m) && String(m.content || '').startsWith('BANKROLL_BACKUP_SNAPSHOT'))?.createdTimestamp || lastBackupAt;
     recoveryInfo = { ready: wanted.length - lost.length, total: wanted.length, restored: recovered, lost: [...lost], scannedMessages: msgs.length, jsonRestored };
     recoveryNote = ` Scanned ${msgs.length} messages in #${ch.name}; restored ${jsonRestored} database file(s) and ${recovered} stored file(s); ${alreadyPresent} file(s) were already present.` +
@@ -4799,6 +4814,15 @@ async function cmdMonzoReview(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can review historical Monzo transactions.');
   const period = interaction.options.getString('period') || 'last_month';
   const transactions = (await fetchMonzoReviewTransactions(period)).filter((tx) => Number(tx.amount) > 0);
+  // Refresh from disk without discarding newer in-memory entries.
+  try {
+    const diskLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8'));
+    if (diskLedger && typeof diskLedger === 'object' && !Array.isArray(diskLedger)) monzoLedger = { ...monzoLedger, ...diskLedger };
+  } catch (error) { if (error.code !== 'ENOENT') console.error('Could not refresh Monzo ledger before review:', error.message); }
+  try {
+    const diskReview = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
+    if (diskReview && typeof diskReview === 'object') monzoReviewState = mergeMonzoReviewStates(monzoReviewState, diskReview);
+  } catch (error) { if (error.code !== 'ENOENT') console.error('Could not refresh Monzo reviews before review:', error.message); }
   let recoveredFromLedger = 0;
   for (const tx of transactions) {
     if (!monzoReviewState.transactions[tx.id]) monzoReviewState.transactions[tx.id] = tx;
@@ -4812,7 +4836,9 @@ async function cmdMonzoReview(interaction) {
         Object.values(monzoLedger).find((entry) => entry?.txId === tx.id && entry?.imported && entry?.status === 'paid');
       if (ledger && ledger.status === 'paid' && ledger.imported) {
         const dateMs = Number(ledger.paidAt || ledger.createdAt || Date.parse(tx.created || tx.settled || '') || Date.now());
+        const savedReview = ledger.reviewRecord && typeof ledger.reviewRecord === 'object' ? ledger.reviewRecord : {};
         monzoReviewState.reviewed[tx.id] = {
+          ...savedReview,
           transactionId: tx.id,
           amount: Number(ledger.amount || Number(tx.amount || 0) / 100),
           currency: String(ledger.currency || tx.currency || 'gbp').toLowerCase(),
@@ -4934,6 +4960,7 @@ async function saveMonzoReviewModal(interaction) {
     monzoLedger[key] = {
       key: key,
       status: 'paid',
+      reviewRecord: record,
       imported: true,
       recordType: 'sale',
       source: 'Monzo historical transaction import',
