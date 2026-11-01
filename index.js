@@ -1101,7 +1101,7 @@ async function updateInvoicePaidMessage(d, key, paymentIntentId = null) {
   if (!invoice) invoice = await getInvoiceMessage(d, key);
   if (!invoice?.embeds?.[0]) return false;
   const previous = invoice.embeds[0];
-  const oldTitle = String(previous.title || 'Bankroll Invoice').replace(/^PAID\\s*[|:-]\\s*/i, '');
+  const oldTitle = String(previous.title || 'Bankroll Invoice').replace(/^PAID\s*[|:-]\s*/i, '');
   const paidAt = d.paidAt || d.paymentConfirmedAt || Date.now();
   const fields = (previous.fields || []).filter((x) => !['payment status','paid at','amount paid','transaction reference'].includes(String(x.name || '').toLowerCase()));
   const paidEmbed = EmbedBuilder.from(previous).setColor(GREEN).setTitle(`PAID | ${oldTitle}`)
