@@ -412,7 +412,7 @@ function saveSendJobs() {
 const BASE_URL = PUBLIC_URL.replace(/\/+$/, '');
 const MAX_FILE_BYTES = (BASE_URL ? 100 : 10) * 1024 * 1024;
 // Largest file sent as a Discord attachment; anything bigger gets the one-time Download ZIP button instead.
-const ATTACH_MAX_BYTES = 9 * 1024 * 1024;
+const ATTACH_MAX_BYTES = 100 * 1024 * 1024;
 fs.mkdirSync(FILES_DIR, { recursive: true });
 const TMP_DIR = path.join(DATA_DIR, 'tmp');
 fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -1383,7 +1383,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
         .setDescription(`**File**\n${short(String(d.name || 'file'), 150)}`)
         .addFields(
           { name: 'Customer', value: `<@${d.customerId}>` },
-          { name: 'Delivery destination', value: sentTo || 'Posted successfully' },
+          { name: 'Delivery Method', value: 'Automatic file delivery' },
         ).setTimestamp()]
     }, { notificationType: 'delivery.sent', notificationStatus: 'success' });
   }
@@ -3964,6 +3964,8 @@ async function cmdTotal(interaction) {
 
 // Shown by /bot refresh-commands so the owner can see what this deployed version changed. Add a line per update.
 const RECENT_UPDATES = [
+  'ZIP/file attachment limit raised to 100 MB; larger files (or a Discord rejection) use the one-time link only.',
+  'Owner "File sent" notice shows Delivery Method: Automatic file delivery, or Get file button on the invoice.',
   'Paid delivery: ZIP is attached with the ready embed plus a one-time download link; link only if it cannot be attached.',
   'Get file button is removed after delivery and can no longer cause a duplicate delivery.',
   'Owner "File sent" notices trimmed (no Delivery, Download tracking or Message fields).',
@@ -4896,7 +4898,7 @@ async function onGetFile(interaction) {
       .setDescription(`**File**\n${short(String(d.name || 'file'), 150)}`)
       .addFields(
         { name: 'Customer', value: `<@${d.customerId}>` },
-        { name: 'Delivery destination', value: 'Get file button on the invoice' },
+        { name: 'Delivery Method', value: 'Get file button on the invoice' },
       ).setTimestamp()]
   }, { notificationType: 'delivery.sent', notificationStatus: 'success' });
 }
