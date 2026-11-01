@@ -3795,16 +3795,76 @@ async function cmdBotAdmin(interaction) {
   const sub = interaction.options.getSubcommand();
 
   if (sub === 'refresh-commands') {
-    await client.application.commands.set(commands.map((c) => c.toJSON()));
+    const desired = commands.map((c) => c.toJSON());
+    const currentCollection = await client.application.commands.fetch().catch((e) => {
+      console.error('Could not fetch existing global slash commands:', e.message);
+      return null;
+    });
+    const current = currentCollection ? [...currentCollection.values()].map((c) => c.toJSON()) : [];
+    const simplify = (o) => {
+      const out = {};
+      for (const k of ['type','name','description','required','autocomplete','min_value','max_value','min_length','max_length']) {
+        if (o[k] !== undefined && o[k] !== null) out[k] = o[k];
+      }
+      if (o.choices) out.choices = o.choices.map((c) => ({ name: c.name, value: c.value }));
+      if (o.options) out.options = o.options.map(simplify);
+      return out;
+    };
+    const compareOptions = (before = [], after = [], prefix = '') => {
+      const a = new Map(before.map((o) => [o.name, o]));
+      const b = new Map(after.map((o) => [o.name, o]));
+      const changes = [];
+      for (const [name, next] of b) {
+        const path = prefix ? prefix + ' / ' + name : name;
+        if (!a.has(name)) changes.push('added option ' + path);
+        else if (JSON.stringify(simplify(a.get(name))) !== JSON.stringify(simplify(next))) {
+          const nested = compareOptions(a.get(name).options || [], next.options || [], path);
+          changes.push(...(nested.length ? nested : ['updated option ' + path]));
+        }
+      }
+      for (const name of a.keys()) if (!b.has(name)) changes.push('removed option ' + (prefix ? prefix + ' / ' : '') + name);
+      return changes;
+    };
+    const oldByName = new Map(current.map((c) => [c.name, c]));
+    const newByName = new Map(desired.map((c) => [c.name, c]));
+    const added = [...newByName.keys()].filter((n) => !oldByName.has(n));
+    const removed = [...oldByName.keys()].filter((n) => !newByName.has(n));
+    const changed = [];
+    for (const [name, next] of newByName) {
+      const prev = oldByName.get(name);
+      if (!prev) continue;
+      if (JSON.stringify(simplify(prev)) !== JSON.stringify(simplify(next))) {
+        const details = compareOptions(prev.options || [], next.options || []);
+        changed.push('/' + name + (details.length ? ': ' + details.join(', ') : ': description or command settings updated'));
+      }
+    }
+
+    await client.application.commands.set(desired);
     let guildNote = '';
     if (DISCORD_GUILD_ID) {
       const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
       if (guild) {
+        const oldGuild = await guild.commands.fetch().catch(() => null);
+        const oldGuildCount = oldGuild?.size || 0;
         await guild.commands.set([]);
-        guildNote = '\\nRemoved old server-only command copies.';
+        guildNote = '\nRemoved ' + oldGuildCount + ' old server-only command copy/copies.';
       }
     }
-    return interaction.editReply(`**Slash commands refreshed successfully.**\n\nRegistered **${commands.length}** global command(s) from the version currently running on Render.\n\nNew or changed command definitions are now submitted to Discord. If you have just pushed code changes, make sure Render has deployed and restarted first; this command cannot load code directly from GitHub. Discord may take a short time to update its command list.${guildNote}`);
+    const lines = [
+      '**Slash commands refreshed.**',
+      '',
+      'Registered ' + desired.length + ' global command(s) from the code currently running on Render.',
+      currentCollection ? '' : 'Could not read the previous command list, so the comparison is unavailable.',
+      '',
+      '**Changes detected:**',
+      added.length ? 'Added: ' + added.map((n) => '/' + n).join(', ') : 'Added: none',
+      removed.length ? 'Removed: ' + removed.map((n) => '/' + n).join(', ') : 'Removed: none',
+      changed.length ? 'Changed: ' + changed.join(' | ') : 'Changed: none',
+      '',
+      'If all three say none, Discord already had the same definitions as this running Render version. This command cannot load code directly from GitHub; deploy/restart Render first after pushing code changes.',
+      guildNote
+    ].filter(Boolean);
+    return interaction.editReply(lines.join('\n').slice(0, 1900));
   }
 
   if (sub === 'export-index') {
@@ -7974,16 +8034,76 @@ async function cmdBotAdmin(interaction) {
   const sub = interaction.options.getSubcommand();
 
   if (sub === 'refresh-commands') {
-    await client.application.commands.set(commands.map((c) => c.toJSON()));
+    const desired = commands.map((c) => c.toJSON());
+    const currentCollection = await client.application.commands.fetch().catch((e) => {
+      console.error('Could not fetch existing global slash commands:', e.message);
+      return null;
+    });
+    const current = currentCollection ? [...currentCollection.values()].map((c) => c.toJSON()) : [];
+    const simplify = (o) => {
+      const out = {};
+      for (const k of ['type','name','description','required','autocomplete','min_value','max_value','min_length','max_length']) {
+        if (o[k] !== undefined && o[k] !== null) out[k] = o[k];
+      }
+      if (o.choices) out.choices = o.choices.map((c) => ({ name: c.name, value: c.value }));
+      if (o.options) out.options = o.options.map(simplify);
+      return out;
+    };
+    const compareOptions = (before = [], after = [], prefix = '') => {
+      const a = new Map(before.map((o) => [o.name, o]));
+      const b = new Map(after.map((o) => [o.name, o]));
+      const changes = [];
+      for (const [name, next] of b) {
+        const path = prefix ? prefix + ' / ' + name : name;
+        if (!a.has(name)) changes.push('added option ' + path);
+        else if (JSON.stringify(simplify(a.get(name))) !== JSON.stringify(simplify(next))) {
+          const nested = compareOptions(a.get(name).options || [], next.options || [], path);
+          changes.push(...(nested.length ? nested : ['updated option ' + path]));
+        }
+      }
+      for (const name of a.keys()) if (!b.has(name)) changes.push('removed option ' + (prefix ? prefix + ' / ' : '') + name);
+      return changes;
+    };
+    const oldByName = new Map(current.map((c) => [c.name, c]));
+    const newByName = new Map(desired.map((c) => [c.name, c]));
+    const added = [...newByName.keys()].filter((n) => !oldByName.has(n));
+    const removed = [...oldByName.keys()].filter((n) => !newByName.has(n));
+    const changed = [];
+    for (const [name, next] of newByName) {
+      const prev = oldByName.get(name);
+      if (!prev) continue;
+      if (JSON.stringify(simplify(prev)) !== JSON.stringify(simplify(next))) {
+        const details = compareOptions(prev.options || [], next.options || []);
+        changed.push('/' + name + (details.length ? ': ' + details.join(', ') : ': description or command settings updated'));
+      }
+    }
+
+    await client.application.commands.set(desired);
     let guildNote = '';
     if (DISCORD_GUILD_ID) {
       const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
       if (guild) {
+        const oldGuild = await guild.commands.fetch().catch(() => null);
+        const oldGuildCount = oldGuild?.size || 0;
         await guild.commands.set([]);
-        guildNote = '\\nRemoved old server-only command copies.';
+        guildNote = '\nRemoved ' + oldGuildCount + ' old server-only command copy/copies.';
       }
     }
-    return interaction.editReply(`**Slash commands refreshed successfully.**\n\nRegistered **${commands.length}** global command(s) from the version currently running on Render.\n\nNew or changed command definitions are now submitted to Discord. If you have just pushed code changes, make sure Render has deployed and restarted first; this command cannot load code directly from GitHub. Discord may take a short time to update its command list.${guildNote}`);
+    const lines = [
+      '**Slash commands refreshed.**',
+      '',
+      'Registered ' + desired.length + ' global command(s) from the code currently running on Render.',
+      currentCollection ? '' : 'Could not read the previous command list, so the comparison is unavailable.',
+      '',
+      '**Changes detected:**',
+      added.length ? 'Added: ' + added.map((n) => '/' + n).join(', ') : 'Added: none',
+      removed.length ? 'Removed: ' + removed.map((n) => '/' + n).join(', ') : 'Removed: none',
+      changed.length ? 'Changed: ' + changed.join(' | ') : 'Changed: none',
+      '',
+      'If all three say none, Discord already had the same definitions as this running Render version. This command cannot load code directly from GitHub; deploy/restart Render first after pushing code changes.',
+      guildNote
+    ].filter(Boolean);
+    return interaction.editReply(lines.join('\n').slice(0, 1900));
   }
 
   if (sub === 'export-index') {
