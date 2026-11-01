@@ -1117,15 +1117,19 @@ async function deliverFile(key, paymentIntentId, options = {}) {
     current.paid = true;
     saveDeliveries();
     const tag = current.testMode ? '[TEST] ' : '';
-    try {
-      const owner = await client.users.fetch(OWNER_ID);
-      await owner.send(['❌ ' + tag + 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED', '',
+    if (Date.now() - Number(current.lastDeliveryFailureAlertAt || 0) >= 5 * 60 * 1000) {
+      current.lastDeliveryFailureAlertAt = Date.now();
+      saveDeliveries();
+      try {
+        const owner = await client.users.fetch(OWNER_ID);
+        await owner.send(['❌ ' + tag + 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED', '',
         '**File:** ' + String(current.name || 'file'),
         '**Customer:** <@' + String(current.customerId || '') + '>',
         '**Order:** ' + key,
         '**Error:** ' + current.deliveryError, '',
-        'The paid order is saved. Bankroll will keep retrying automatically.'].join('\n'));
-    } catch (dmError) { console.error('Could not DM owner about failed delivery:', dmError.message); }
+          'The paid order is saved. Bankroll will keep retrying automatically.'].join('\n'));
+      } catch (dmError) { console.error('Could not DM owner about failed delivery:', dmError.message); }
+    }
     scheduleDeliveryRetry(key, paymentIntentId || current.paymentIntentId || null);
     return false;
   } finally { activeDeliveryJobs.delete(key); }
@@ -1255,7 +1259,10 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     d.paid = true;
     d.paymentConfirmed = true;
     saveDeliveries();
-    if (owner) await owner.send([
+    if (owner && Date.now() - Number(d.lastDeliveryFailureAlertAt || 0) >= 5 * 60 * 1000) {
+      d.lastDeliveryFailureAlertAt = Date.now();
+      saveDeliveries();
+      await owner.send([
       '❌ ' + (d.testMode ? '[TEST] ' : '') + 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED',
       '',
       '**File:** ' + String(d.name || 'file') + ' (sent here as soon as payment lands)',
@@ -1264,7 +1271,8 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
       '**Reason:** ' + String(d.deliveryError || 'Could not post the invoice reply').slice(0, 500),
       '',
       'The paid order is saved. Bankroll will keep retrying automatically.'
-    ].join('\n')).catch(() => {});
+      ].join('\n')).catch(() => {});
+    }
   }
 
   if (sentTo) {
@@ -1296,7 +1304,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     }
     await notifyOwner({
       embeds: [new EmbedBuilder().setColor(GREEN).setTitle(d.testMode ? '[TEST] File sent' : 'File sent')
-        .setDescription(`**${short(String(d.name || 'file'), 150)}** was posted as a reply to the original invoice.`)
+        .setDescription(`**File**\n${short(String(d.name || 'file'), 150)} (sent here as soon as payment lands)`)
         .addFields(
           { name: 'Customer', value: `<@${d.customerId}>`, inline: true },
           { name: 'Delivery', value: dlink ? 'Hosted Download button' : 'Direct Discord attachment', inline: true },
