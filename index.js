@@ -1163,47 +1163,35 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   let sentTo = null;
   let msgUrl = null;
   let reachedCustomer = false;
-  const live = liveInteractions.get(key);
-  if (live && Date.now() - live.at < 14 * 60 * 1000) {
-    try {
-      const original = await live.interaction.fetchReply();
-      const msg = await sendWithFallback((p) => live.interaction.followUp(p));
-      msgUrl = msg.url;
-      reachedCustomer = true;
-      sentTo = 'a reply under the invoice message';
-      // Original invoice status is updated centrally by updateInvoicePaidMessage().
-    } catch (e) { console.log('Could not reply under invoice:', e.message); }
-  }
-  liveInteractions.delete(key);
 
-  if (!sentTo) {
-    try {
-      const im = await getInvoiceMessage(d, key);
-      if (im) {
-        const msg = await sendWithFallback((p) => im.reply(p));
-        msgUrl = msg.url;
-        reachedCustomer = true;
-        sentTo = 'a reply under the invoice message';
-        // Original invoice status is updated centrally by updateInvoicePaidMessage().
-      }
-    } catch (e) { console.log('Could not reply to the stored invoice message:', e.message); }
-  }
-
-  if (!sentTo) {
-    try {
-      const ch = await client.channels.fetch(d.channelId);
-      const msg = await sendWithFallback((p) => ch.send(p));
-      msgUrl = msg.url;
-      reachedCustomer = true;
-      sentTo = 'the channel where the invoice was created';
-    } catch (e) { console.log('Could not post in original channel:', e.message); }
-  }
-
-  if (!sentTo && owner) {
-    try {
-      await sendWithFallback((p) => owner.send(p));
-      sentTo = 'your DMs';
-    } catch (e) { console.error('Could not deliver file anywhere:', e.message); }
+  // Paid files must be delivered directly to the customer, not posted as a
+  // reply in the seller's DM/channel where the invoice was created.
+  try {
+    if (!d.customerId) throw new Error('This order has no saved customer ID.');
+    const customer = await client.users.fetch(d.customerId);
+    const msg = await sendWithFallback((p) => customer.send({
+      ...p,
+      content: noFile
+        ? 'Your payment has been confirmed. Thank you!'
+        : dlink
+          ? `Your payment has been confirmed. Your complete ${isZip ? 'ZIP' : 'file'} is ready. The secure download link works once and has no time expiry.`
+          : 'Your payment has been confirmed. Your complete file is attached below.',
+      allowedMentions: { parse: [] },
+    }));
+    msgUrl = msg.url || null;
+    reachedCustomer = true;
+    sentTo = "the customer's direct messages";
+  } catch (e) {
+    console.error(`Could not DM customer ${d.customerId || 'unknown'} for paid order ${key}:`, e);
+    d.deliveryError = `Could not DM customer: ${String(e.message || e).slice(0, 300)}`;
+    d.paid = true;
+    d.paymentConfirmed = true;
+    saveDeliveries();
+    if (owner) {
+      await owner.send(
+        `Payment was confirmed for **${d.name}**, but I could not DM the customer <@${d.customerId || 'unknown'}>. Their privacy settings may block DMs. The paid order is saved; use /delivery resend after the customer allows DMs.`
+      ).catch(() => {});
+    }
   }
 
   if (sentTo) {
