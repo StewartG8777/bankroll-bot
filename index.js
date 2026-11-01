@@ -2466,10 +2466,10 @@ async function sendStripeCheckout(interaction) {
       embed.addFields({ name: 'Pay by', value: `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
     }
     if (fileData) {
-      embed.addFields({ name: 'File', value: `${fileData.name} (sent here after payment, or press Get my file)` });
+      embed.addFields({ name: 'File', value: `${fileData.name} (sent to the customer by DM after payment)` });
     }
     if (linkUrl) {
-      embed.addFields({ name: 'Download', value: 'Link sent here after payment, or press Get my file' });
+      embed.addFields({ name: 'Download', value: 'Download link sent to the customer by DM after payment' });
     }
     embed
       .addFields(
@@ -2643,8 +2643,8 @@ async function sendMonzoInvoice(interaction) {
       );
     embed.addFields({ name: 'Pay by', value: `<t:${tsec(monzoLedger[key].expiresAt)}:R>` });
     if (MONZO_PAYMENT_DETAILS) embed.addFields({ name: 'Pay to', value: MONZO_PAYMENT_DETAILS.replace(/\\n/g, '\n') });
-    if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (sent here as soon as payment lands, or press Get my file)` });
-    if (linkUrl) embed.addFields({ name: 'Download', value: 'Link sent here as soon as payment lands, or press Get my file' });
+    if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (sent to the customer by DM as soon as payment lands)` });
+    if (linkUrl) embed.addFields({ name: 'Download', value: 'Download link sent to the customer by DM as soon as payment lands' });
     embed
       .addFields(
         { name: 'Generated In Guild', value: where.guild },
