@@ -6122,9 +6122,18 @@ async function cmdSend(interaction) {
     return interaction.reply({ content: 'Only the bot owner can use /send.', ephemeral: true });
   }
   const message = interaction.options.getString('message', true);
-  await interaction.deferReply({ ephemeral: true });
-  await interaction.webhook.send({ content: message, allowedMentions: { parse: [] } });
-  return interaction.editReply({ content: 'Message sent.' });
+  await interaction.reply({ content: 'Sending message…', ephemeral: true });
+  try {
+    await interaction.followUp({
+      content: message,
+      ephemeral: false,
+      allowedMentions: { parse: [] }
+    });
+    return interaction.editReply({ content: 'Message sent publicly.' });
+  } catch (error) {
+    console.error('[/send] Public message failed:', error);
+    return interaction.editReply({ content: 'Could not send the public message. Check that Bankroll has permission to send messages in this chat.' });
+  }
 }
 
 async function cmdSpam(interaction) {
