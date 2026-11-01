@@ -1870,12 +1870,13 @@ const currencyCmd = common(
 const paymentsCmd = common(
   new SlashCommandBuilder()
     .setName('payments')
-    .setDescription('List your most recent card payments')
+    .setDescription('List your most recent card and Monzo payments')
     .addIntegerOption((o) =>
       o
         .setName('count')
-        .setDescription('How many (default 5)')
-        .addChoices({ name: '5', value: 5 }, { name: '10', value: 10 })
+        .setDescription('How many payments to show (1–25, default 5)')
+        .setMinValue(1)
+        .setMaxValue(25)
     )
 );
 
