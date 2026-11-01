@@ -1776,8 +1776,8 @@ const deliveryCmd = common(new SlashCommandBuilder().setName('delivery').setDesc
   .addSubcommand((sub) => sub.setName('resend').setDescription('Resend a paid customer file without charging again').addStringOption((o) => o.setName('order').setDescription('Checkout session ID or Monzo invoice ID').setRequired(true))));
 
 const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription('Remove a customer from Bankroll transaction records and logs (owner only)')
-  .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records'))
-  .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' })));
+  .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' }))
+  .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records')));
 
 const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
 
@@ -3962,6 +3962,14 @@ async function cmdTotal(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
+// Shown by /bot refresh-commands so the owner can see what this deployed version changed. Add a line per update.
+const RECENT_UPDATES = [
+  'Paid delivery: ZIP is attached with the ready embed plus a one-time download link; link only if it cannot be attached.',
+  'Get file button is removed after delivery and can no longer cause a duplicate delivery.',
+  'Owner "File sent" notices trimmed (no Delivery, Download tracking or Message fields).',
+  '/wipe: leave user empty and choose WIPE ALL to wipe every customer, payment record and download record.',
+];
+
 async function cmdBotAdmin(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can use these controls.');
   const sub = interaction.options.getSubcommand();
@@ -4011,7 +4019,12 @@ async function cmdBotAdmin(interaction) {
       }
     }
 
-    await client.application.commands.set(desired);
+    try {
+      await client.application.commands.set(desired);
+    } catch (e) {
+      console.error('Slash command refresh failed:', e);
+      return interaction.editReply(('**Slash command refresh failed.** Discord rejected the command definitions:\n' + String(e?.message || e)).slice(0, 1900));
+    }
     let guildNote = '';
     if (DISCORD_GUILD_ID) {
       const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
@@ -4032,6 +4045,9 @@ async function cmdBotAdmin(interaction) {
       added.length ? 'Added: ' + added.map((n) => '/' + n).join(', ') : 'Added: none',
       removed.length ? 'Removed: ' + removed.map((n) => '/' + n).join(', ') : 'Removed: none',
       changed.length ? 'Changed: ' + changed.join(' | ') : 'Changed: none',
+      '',
+      '**Recent updates in this version:**',
+      ...RECENT_UPDATES.map((u) => '• ' + u),
       '',
       'If all three say none, Discord already had the same definitions as this running Render version. This command cannot load code directly from GitHub; deploy/restart Render first after pushing code changes.',
       guildNote
