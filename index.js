@@ -483,6 +483,64 @@ function saveMonzoReview() {
   catch (e) { console.error('Could not save Monzo review records:', e.message); }
   scheduleBackup();
 }
+
+// One-time owner-supplied mapping for the nine Monzo sales reviewed in newest-to-oldest order.
+// It is applied after startup data recovery, and only when exactly nine reviewed sales exist.
+const MONZO_REVIEW_CUSTOMER_IDS_NEWEST_FIRST = [
+  '474754953722724372',
+  '1316063283526111295',
+  '311970125190397962',
+  '1293026761340354712',
+  '857815213353336892',
+  '803348583701020702',
+  '1394737341716893790',
+  '651001341904420897',
+  '558205144156733460',
+];
+const MONZO_CUSTOMER_ASSIGNMENT_VERSION = 'review-customer-ids-2026-11-01';
+function applyMonzoReviewCustomerIds() {
+  const ids = MONZO_REVIEW_CUSTOMER_IDS_NEWEST_FIRST;
+  if (ids.length !== 9 || ids.some((id) => !/^\\d{17,20}$/.test(id))) {
+    console.error('Monzo customer ID import skipped: the supplied ID list failed validation.');
+    return 0;
+  }
+  const sales = Object.entries(monzoReviewState.reviewed || {})
+    .filter(([txId, record]) => record?.category === 'sale' && monzoReviewState.transactions?.[txId]?.id)
+    .sort(([aId], [a], [bId], [b]) => {
+      const aAt = Date.parse(monzoReviewState.transactions[aId]?.created || monzoReviewState.transactions[aId]?.settled || 0);
+      const bAt = Date.parse(monzoReviewState.transactions[bId]?.created || monzoReviewState.transactions[bId]?.settled || 0);
+      return bAt - aAt || String(bId).localeCompare(String(aId));
+    });
+  if (sales.length !== ids.length) {
+    console.warn('Monzo customer ID import not applied: expected exactly ' + ids.length + ' reviewed sales, found ' + sales.length + '. No records were changed.');
+    return 0;
+  }
+  const alreadyApplied = sales.every(([txId, record], index) =>
+    record.customerId === ids[index] &&
+    record.bulkCustomerAssignmentVersion === MONZO_CUSTOMER_ASSIGNMENT_VERSION &&
+    monzoLedger['monzo_import_' + txId]?.customerId === ids[index]
+  );
+  if (alreadyApplied) return 0;
+  const canApply = sales.every(([txId, record], index) => {
+    const ledgerRecord = monzoLedger['monzo_import_' + txId];
+    return !!ledgerRecord &&
+      (!record.customerId || record.customerId === ids[index]) &&
+      (!ledgerRecord.customerId || ledgerRecord.customerId === ids[index]);
+  });
+  if (!canApply) {
+    console.warn('Monzo customer ID import not applied: at least one reviewed sale already has a different customer ID or is missing its ledger entry. No records were changed.');
+    return 0;
+  }
+  sales.forEach(([txId, record], index) => {
+    record.customerId = ids[index];
+    record.bulkCustomerAssignmentVersion = MONZO_CUSTOMER_ASSIGNMENT_VERSION;
+    monzoLedger['monzo_import_' + txId].customerId = ids[index];
+  });
+  saveMonzo();
+  saveMonzoReview();
+  console.log('Imported customer Discord IDs for ' + sales.length + ' Monzo review sales (newest to oldest).');
+  return sales.length;
+}
 let wipedCustomers = new Set();
 try { const ids = JSON.parse(fs.readFileSync(WIPED_CUSTOMERS_FILE, 'utf8')); if (Array.isArray(ids)) wipedCustomers = new Set(ids.map(String)); } catch {}
 function saveWipedCustomers() { atomicWrite(WIPED_CUSTOMERS_FILE, JSON.stringify([...wipedCustomers], null, 2)); }
@@ -2292,6 +2350,7 @@ const onReady = async () => {
   restorePendingDeliveryRetries();
 
   backfillMonzoLedger();
+  applyMonzoReviewCustomerIds();
   const monzoRebuilt = restoreMonzoReminders();
   restoreReminders().then(async (n) => {
     const total = n + monzoRebuilt;
@@ -4038,13 +4097,10 @@ async function cmdTotal(interaction) {
 
 // Shown by /bot refresh-commands so the owner can see what this deployed version changed. Add a line per update.
 const RECENT_UPDATES = [
-  'Restart-loop warning: you get a DM if the bot starts 3+ times in 10 minutes.',
-  'ZIP/file attachment limit raised to 100 MB; larger files (or a Discord rejection) use the one-time link only.',
-  'Owner "File sent" notice shows Delivery Method: Automatic file delivery, or Get file button on the invoice.',
-  'Paid delivery: ZIP is attached with the ready embed plus a one-time download link; link only if it cannot be attached.',
-  'Get file button is removed after delivery and can no longer cause a duplicate delivery.',
-  'Owner "File sent" notices trimmed (no Delivery, Download tracking or Message fields).',
-  '/wipe: leave user empty and choose WIPE ALL to wipe every customer, payment record and download record.',
+  '/monzo-review: customer Discord ID can be left blank and assigned after all transactions are reviewed.',
+  '/monzo-review: supports this month, last month, this week and last week, with editable transaction dates.',
+  '/bot refresh-commands: compares the full command definition, reports added/removed/changed commands and verifies Discord registration.',
+  'Historical Monzo customer IDs are assigned to the nine reviewed sales in newest-to-oldest order.',
 ];
 
 async function cmdBotAdmin(interaction) {
@@ -4058,14 +4114,15 @@ async function cmdBotAdmin(interaction) {
       return null;
     });
     const current = currentCollection ? [...currentCollection.values()].map((c) => c.toJSON()) : [];
-    const simplify = (o) => {
-      const out = {};
-      for (const k of ['type','name','description','required','autocomplete','min_value','max_value','min_length','max_length']) {
-        if (o[k] !== undefined && o[k] !== null) out[k] = o[k];
-      }
-      if (o.choices) out.choices = o.choices.map((c) => ({ name: c.name, value: c.value }));
-      if (o.options) out.options = o.options.map(simplify);
-      return out;
+    // Compare the complete command schema, not just a small subset of option fields.
+    // Discord adds IDs/version metadata to fetched commands; those are deliberately ignored.
+    const simplify = (value) => {
+      if (Array.isArray(value)) return value.map(simplify);
+      if (!value || typeof value !== 'object') return value;
+      const ignored = new Set(['id', 'application_id', 'guild_id', 'version']);
+      return Object.fromEntries(Object.keys(value).sort()
+        .filter((key) => !ignored.has(key) && value[key] !== undefined && value[key] !== null)
+        .map((key) => [key, simplify(value[key])]));
     };
     const compareOptions = (before = [], after = [], prefix = '') => {
       const a = new Map(before.map((o) => [o.name, o]));
@@ -4102,6 +4159,11 @@ async function cmdBotAdmin(interaction) {
       console.error('Slash command refresh failed:', e);
       return interaction.editReply(('**Slash command refresh failed.** Discord rejected the command definitions:\n' + String(e?.message || e)).slice(0, 1900));
     }
+    const verifiedCollection = await client.application.commands.fetch().catch((e) => {
+      console.error('Could not verify refreshed global commands:', e.message);
+      return null;
+    });
+    const verifiedCount = verifiedCollection?.size ?? null;
     let guildNote = '';
     if (DISCORD_GUILD_ID) {
       const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
@@ -4112,24 +4174,28 @@ async function cmdBotAdmin(interaction) {
         guildNote = '\nRemoved ' + oldGuildCount + ' old server-only command copy/copies.';
       }
     }
-    const lines = [
-      '**Slash commands refreshed.**',
-      '',
-      'Registered ' + desired.length + ' global command(s) from the code currently running on Render.',
-      currentCollection ? '' : 'Could not read the previous command list, so the comparison is unavailable.',
-      '',
-      '**Changes detected:**',
+    const changeLines = [
       added.length ? 'Added: ' + added.map((n) => '/' + n).join(', ') : 'Added: none',
       removed.length ? 'Removed: ' + removed.map((n) => '/' + n).join(', ') : 'Removed: none',
       changed.length ? 'Changed: ' + changed.join(' | ') : 'Changed: none',
+    ];
+    const lines = [
+      '**Slash commands refreshed and sent to Discord.**',
+      'Desired: **' + desired.length + '** global commands' +
+        (verifiedCount === null ? ' • Verification fetch unavailable' : ' • Discord now reports **' + verifiedCount + '**'),
       '',
-      '**Recent updates in this version:**',
+      '**Changes since the previous Discord command list:**',
+      ...changeLines,
+      '',
+      '**Latest code updates (running Render version):**',
       ...RECENT_UPDATES.map((u) => '• ' + u),
       '',
-      'If all three say none, Discord already had the same definitions as this running Render version. This command cannot load code directly from GitHub; deploy/restart Render first after pushing code changes.',
+      'Global command changes can take a little while to appear in every Discord client. This refresh uses the code currently running on Render; deploy first if GitHub has newer code.',
       guildNote
     ].filter(Boolean);
-    return interaction.editReply(lines.join('\n').slice(0, 1900));
+    let response = lines.join('\n');
+    if (response.length > 1900) response = response.slice(0, 1880) + '\n…Use the Render logs for the complete registration result.';
+    return interaction.editReply(response);
   }
 
   if (sub === 'export-index') {
