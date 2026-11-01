@@ -298,6 +298,41 @@ function markWebhookProcessed(id, type) {
   scheduleBackup();
 }
 const deliveryRetryTimers = new Map();
+const deliveryWatchTimers = new Map();
+function startDeliveryWatch(key) {
+  const d = deliveries[key];
+  if (!d || d.deliveryComplete || deliveryWatchTimers.has(key)) return;
+  d.deliveryWatchStartedAt = Number(d.deliveryWatchStartedAt || Date.now());
+  const remaining = Math.max(0, 60000 - (Date.now() - d.deliveryWatchStartedAt));
+  const timer = setTimeout(async () => {
+    deliveryWatchTimers.delete(key);
+    const current = deliveries[key];
+    if (!current || current.deliveryComplete || current.deliverySlowAlertSentAt) return;
+    current.deliverySlowAlertSentAt = Date.now();
+    saveDeliveries();
+    const tag = current.testMode ? '[TEST] ' : '';
+    const message = [
+      '⚠️ ' + tag + 'DELIVERY DELAYED — OVER 1 MINUTE',
+      '',
+      '**File:** ' + String(current.name || 'file') + ' (sent here as soon as payment lands)',
+      '**Customer:** <@' + String(current.customerId || '') + '>',
+      '**Order:** ' + key,
+      '**Attempts:** ' + Number(current.deliveryAttempts || 0),
+      '**Status:** Payment is confirmed, but the file has not been posted to the invoice yet. Automatic retries are continuing.',
+      current.deliveryError ? '**Latest error:** ' + String(current.deliveryError).slice(0, 500) : '',
+    ].filter(Boolean).join('\n');
+    try { const owner = await client.users.fetch(OWNER_ID); await owner.send(message); }
+    catch (e) { console.error('Could not DM owner about delayed delivery:', e.message); }
+    recordNotification('delivery.delayed', 'Paid delivery delayed over one minute', 'Order ' + key + ' for ' + String(current.name || 'file') + ' is still pending.', 'warning');
+  }, remaining);
+  timer.unref?.();
+  deliveryWatchTimers.set(key, timer);
+}
+function clearDeliveryWatch(key) {
+  const timer = deliveryWatchTimers.get(key);
+  if (timer) clearTimeout(timer);
+  deliveryWatchTimers.delete(key);
+}
 function scheduleDeliveryRetry(key, paymentIntentId, delayMs) {
   const d = deliveries[key];
   if (!d || d.deliveryComplete || deliveryRetryTimers.has(key)) return false;
@@ -1069,12 +1104,30 @@ async function updateInvoicePaidMessage(d, key, paymentIntentId = null) {
 
 const activeDeliveryJobs = new Set();
 async function deliverFile(key, paymentIntentId, options = {}) {
-  if (activeDeliveryJobs.has(key)) return false;
   const current = deliveries[key];
   if (!current || (current.deliveryComplete && !options.force)) return false;
+  if (activeDeliveryJobs.has(key)) return false;
   activeDeliveryJobs.add(key);
-  try { return await deliverFileUnlocked(key, paymentIntentId, !!options.force); }
-  finally { activeDeliveryJobs.delete(key); }
+  try {
+    return await deliverFileUnlocked(key, paymentIntentId, !!options.force);
+  } catch (e) {
+    current.deliveryError = String(e?.message || e).slice(0, 500);
+    current.paymentConfirmed = true;
+    current.paid = true;
+    saveDeliveries();
+    const tag = current.testMode ? '[TEST] ' : '';
+    try {
+      const owner = await client.users.fetch(OWNER_ID);
+      await owner.send(['❌ ' + tag + 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED', '',
+        '**File:** ' + String(current.name || 'file'),
+        '**Customer:** <@' + String(current.customerId || '') + '>',
+        '**Order:** ' + key,
+        '**Error:** ' + current.deliveryError, '',
+        'The paid order is saved. Bankroll will keep retrying automatically.'].join('\n'));
+    } catch (dmError) { console.error('Could not DM owner about failed delivery:', dmError.message); }
+    scheduleDeliveryRetry(key, paymentIntentId || current.paymentIntentId || null);
+    return false;
+  } finally { activeDeliveryJobs.delete(key); }
 }
 async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   const d = deliveries[key];
@@ -1087,6 +1140,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   d.paymentConfirmedAt = d.paymentConfirmedAt || Date.now();
   if (paymentIntentId) d.paymentIntentId = paymentIntentId;
   saveDeliveries();
+  startDeliveryWatch(key);
   await updateInvoicePaidMessage(d, key, paymentIntentId);
   if (!wasPaymentConfirmed) {
     await notifyOwner({
@@ -1200,7 +1254,16 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     d.paid = true;
     d.paymentConfirmed = true;
     saveDeliveries();
-    if (owner) await owner.send(`Payment was confirmed for **${d.name}**, but I could not post the download as a reply to invoice ${key}. The paid order is saved and automatic retries will continue.`).catch(() => {});
+    if (owner) await owner.send([
+      '❌ ' + (d.testMode ? '[TEST] ' : '') + 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED',
+      '',
+      '**File:** ' + String(d.name || 'file') + ' (sent here as soon as payment lands)',
+      '**Customer:** <@' + String(d.customerId || '') + '>',
+      '**Invoice:** ' + key,
+      '**Reason:** ' + String(d.deliveryError || 'Could not post the invoice reply').slice(0, 500),
+      '',
+      'The paid order is saved. Bankroll will keep retrying automatically.'
+    ].join('\n')).catch(() => {});
   }
 
   if (sentTo) {
@@ -1217,6 +1280,9 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   }
 
   if (sentTo) {
+    clearDeliveryWatch(key);
+    delete d.deliveryWatchStartedAt;
+    delete d.deliverySlowAlertSentAt;
     const retryTimer = deliveryRetryTimers.get(key); if (retryTimer) clearTimeout(retryTimer); deliveryRetryTimers.delete(key);
     recordDownloadEvent('delivery_sent', { file: d.name, customerId: d.customerId, agentId: d.agentId, detail: `Payment delivery posted as ${sentTo}.` });
     if (paymentIntentId) {
