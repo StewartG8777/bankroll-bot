@@ -3117,7 +3117,9 @@ async function sendMonzoInvoice(interaction) {
       fileData.size = fileData.size || fs.statSync(fileData.path).size;
     }
 
-    const reference = 'BR' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
+    const reference = 'BR' + crypto.randomBytes(4).toString('hex').toUpperCase();
+    const paymentBase = MONZO_LINK ? MONZO_LINK.replace(/\/+$/, '') : '';
+    const paymentUrl = paymentBase ? paymentBase + '/' + amount.toFixed(2) + '?d=' + encodeURIComponent(reference) : null;
     const key = `monzo_${crypto.randomBytes(8).toString('hex')}`;
 
     if (fileData) {
@@ -3154,6 +3156,7 @@ async function sendMonzoInvoice(interaction) {
       currency: 'gbp',
       description,
       reference,
+      paymentUrl,
       createdAt: Date.now(),
       expiresAt: Date.now() + MONZO_OPEN_MS,
       channelId: interaction.channelId,
@@ -3187,8 +3190,7 @@ async function sendMonzoInvoice(interaction) {
 
     const row = new ActionRowBuilder();
     if (MONZO_LINK) {
-      const payUrl = `${MONZO_LINK}/${amount.toFixed(2)}?d=${encodeURIComponent(reference)}`;
-      row.addComponents(new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(payUrl));
+      row.addComponents(new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(paymentUrl));
     }
     if (fileData || linkUrl) {
       row.addComponents(
