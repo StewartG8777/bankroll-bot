@@ -4836,11 +4836,21 @@ async function handleSpamConsent(interaction) {
       return;
     }
     try {
-      await session.sourceMessage.reply({ content: session.message, allowedMentions: { parse: [] } });
+      await session.sourceMessage.channel.send({
+        content: session.message,
+        reply: { messageReference: session.sourceMessage.id, failIfNotExists: false },
+        allowedMentions: { parse: [] }
+      });
       session.sent += 1;
     } catch (error) {
       spamSessions.delete(sessionId);
-      console.error('Timed message reply failed:', error.message);
+      console.error('Timed message reply failed:', error);
+      await session.sourceMessage.edit({
+        embeds: [new EmbedBuilder().setColor(RED).setTitle('Spam failed')
+          .setDescription('Bankroll could not send the repeated message. The session has stopped.')
+          .addFields({ name: 'Discord error', value: String(error.message || 'Unknown error').slice(0, 1000) })],
+        components: []
+      }).catch(() => {});
       return;
     }
     if (Date.now() >= session.endAt) {
