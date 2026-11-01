@@ -4720,9 +4720,11 @@ function monzoReviewPayload(page = 0, period = 'last_month') {
         };
       }));
     components.push(new ActionRowBuilder().addComponents(menu));
+    // Stable, distinct IDs prevent Discord's duplicate-component-ID rejection
+    // when the pending list shrinks to a single page after reviews are saved.
     components.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('monzo_review_page:' + Math.max(0, current - 1)).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(current === 0),
-      new ButtonBuilder().setCustomId('monzo_review_page:' + Math.min(pageCount - 1, current + 1)).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(current >= pageCount - 1)
+      new ButtonBuilder().setCustomId('monzo_review_page_prev').setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(current === 0),
+      new ButtonBuilder().setCustomId('monzo_review_page_next').setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(current >= pageCount - 1)
     ));
   }
   return { embeds: [embed], components, ephemeral: true };
@@ -5616,10 +5618,15 @@ async function onScheduledSendButton(interaction) {
 }
 
 async function onButton(interaction) {
-  if (interaction.customId.startsWith('monzo_review_page:')) {
+  if (interaction.customId === 'monzo_review_page_prev' || interaction.customId === 'monzo_review_page_next') {
     if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'Only the bot owner can review these transactions.', ephemeral: true });
-    const page = Number(interaction.customId.split(':')[1] || 0);
-    return interaction.update(monzoReviewPayload(page, interaction.message?.embeds?.[0]?.description?.includes('This month') ? 'month' : interaction.message?.embeds?.[0]?.description?.includes('This week') ? 'week' : interaction.message?.embeds?.[0]?.description?.includes('Last week') ? 'last_week' : 'last_month'));
+    const embed = interaction.message?.embeds?.[0];
+    const description = embed?.description || '';
+    const period = description.includes('This month') ? 'month' : description.includes('This week') ? 'week' : description.includes('Last week') ? 'last_week' : 'last_month';
+    const pageMatch = /Page (\\d+) of \\d+/.exec(embed?.footer?.text || '');
+    const currentPage = pageMatch ? Math.max(0, Number(pageMatch[1]) - 1) : 0;
+    const targetPage = interaction.customId === 'monzo_review_page_next' ? currentPage + 1 : Math.max(0, currentPage - 1);
+    return interaction.update(monzoReviewPayload(targetPage, period));
   }
   if (interaction.customId.startsWith('testpaid:')) {
     if (interaction.user.id !== OWNER_ID) {
