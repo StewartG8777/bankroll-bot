@@ -1273,6 +1273,55 @@ async function backupDataOnce() {
   }
 }
 
+
+/**
+ * Monzo Review's durable store is Discord, not Render's local filesystem.
+ * Every completed review writes a paired, checksummed snapshot of both files
+ * to #bankroll-backup. Startup recovery already scans these attachments newest
+ * first and restores the newest valid copy of each database.
+ */
+async function backupMonzoReviewToDiscord() {
+  const ch = await resolveBackupChannel();
+  if (!ch) throw new Error('The #bankroll-backup channel could not be found.');
+  const reviewRaw = fs.readFileSync(MONZO_REVIEW_FILE, 'utf8');
+  const ledgerRaw = fs.readFileSync(MONZO_FILE, 'utf8');
+  const review = JSON.parse(reviewRaw);
+  const ledger = JSON.parse(ledgerRaw);
+  if (!review || typeof review !== 'object' || !review.transactions || !review.reviewed ||
+      !ledger || typeof ledger !== 'object' || Array.isArray(ledger)) {
+    throw new Error('Monzo review or payment data failed validation; Discord backup was not sent.');
+  }
+  const files = [
+    { name: 'monzo_review.json', buffer: Buffer.from(reviewRaw) },
+    { name: 'monzo_payments.json', buffer: Buffer.from(ledgerRaw) },
+  ];
+  const manifest = {
+    format: 'bankroll-monzo-review-v1',
+    createdAt: new Date().toISOString(),
+    files: files.map((file) => ({
+      name: file.name,
+      size: file.buffer.length,
+      sha256: crypto.createHash('sha256').update(file.buffer).digest('hex'),
+    })),
+  };
+  const attachments = [
+    ...files.map((file) => new AttachmentBuilder(file.buffer, { name: file.name })),
+    new AttachmentBuilder(Buffer.from(JSON.stringify(manifest, null, 2)), { name: 'monzo-review-backup-manifest.json' }),
+  ];
+  const sent = await ch.send({
+    content: 'BANKROLL_MONZO_REVIEW_SNAPSHOT v1 | ' + manifest.createdAt +
+      ' | ' + Object.keys(review.transactions).length + ' transactions | ' +
+      Object.keys(review.reviewed).length + ' reviewed | paired Monzo review + payment ledger',
+    files: attachments,
+    allowedMentions: { parse: [] },
+  });
+  if (!sent?.id) throw new Error('Discord did not confirm the Monzo review backup message.');
+  lastBackupAt = Date.now();
+  console.log('Monzo Review stored in Discord. Snapshot ' + sent.id +
+    ' contains ' + Object.keys(review.reviewed).length + ' reviewed sale(s).');
+  return sent.id;
+}
+
 function discardPending(key) {
   const d = deliveries[key];
   if (!d) return false;
@@ -5001,6 +5050,19 @@ async function saveMonzoReviewModal(interaction) {
       importedAt: record.reviewedAt,
     };
     saveMonzo();
+  }
+  // Do not report a completed review until both JSON databases are safely stored
+  // as attachments in Discord. Render's local /tmp filesystem is disposable.
+  try {
+    await backupMonzoReviewToDiscord();
+  } catch (backupError) {
+    console.error('Monzo Review Discord storage failed:', backupError.message);
+    return interaction.reply({
+      content: '⚠️ The review is saved in this running instance, but Discord storage failed: ' +
+        backupError.message + '\\nDo not restart or redeploy Bankroll yet. Do not review this transaction again; retry the backup with /downloads backup and check #bankroll-backup.',
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
   }
   const outcome = 'Recorded **' + money(record.amount, record.currency) + '** as a historical sale' + (customerId ? ' for <@' + customerId + '>' : ' with customer ID left blank for later assignment') + ', assigned to you (<@' + OWNER_ID + '>). It is included in Bankroll payment history and totals.';
   return interaction.reply({ content: '✅ ' + outcome + '\n**Transaction:** ' + txId + '\n**Date:** ' + dateText + '\n**Details:** ' + short(sold, 300), ephemeral: true, allowedMentions: { parse: [] } });
