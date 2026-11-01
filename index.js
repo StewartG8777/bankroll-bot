@@ -2001,6 +2001,11 @@ const cancelCmd = common(
     )
 );
 
+const sendCmd = common(
+  new SlashCommandBuilder().setName('send').setDescription('Send a message as Bankroll without showing the command publicly')
+    .addStringOption((o) => o.setName('message').setDescription('The message Bankroll should post').setMaxLength(2000).setRequired(true))
+);
+
 const spamCmd = common(
   new SlashCommandBuilder().setName('spam').setDescription('Post a timed repeated-message embed in this chat or channel')
     .addStringOption((o) => o.setName('message').setDescription('Text or emoji to repeat').setMaxLength(1800).setRequired(true))
@@ -2193,7 +2198,7 @@ const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription(
   .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' }))
   .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records')));
 
-const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
 // are never cached.
@@ -6112,6 +6117,16 @@ async function onDisputeClosed(d) {
 const spamSessions = new Map();
 const spamRequests = new Map();
 
+async function cmdSend(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: 'Only the bot owner can use /send.', ephemeral: true });
+  }
+  const message = interaction.options.getString('message', true);
+  await interaction.deferReply({ ephemeral: true });
+  await interaction.followUp({ content: message, allowedMentions: { parse: [] } });
+  return interaction.editReply({ content: 'Message sent.' });
+}
+
 async function cmdSpam(interaction) {
   const message = interaction.options.getString('message', true);
   const durationMinutes = interaction.options.getInteger('duration', true);
@@ -6331,6 +6346,8 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdWipe(interaction);
       case 'remind':
         return await cmdRemind(interaction);
+      case 'send':
+        return await cmdSend(interaction);
       case 'spam':
         return await cmdSpam(interaction);
       case 'stop':
