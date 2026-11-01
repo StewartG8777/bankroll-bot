@@ -729,8 +729,13 @@ function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download i
   const isZip = /\.zip$/i.test(String(name || ''));
   return new EmbedBuilder().setColor(GREEN).setTitle(label)
     .setDescription(`Your complete **${short(String(name || 'file'), 180)}** is ready. ${isZip ? 'This is one original ZIP archive — no split parts or joining steps.' : 'Your original file is ready to download.'}`)
-    .addFields({ name: 'File type', value: isZip ? 'ZIP archive' : 'File', inline: true }, ...(Number.isFinite(sizeBytes) ? [{ name: 'Size', value: `${(sizeBytes/(1024*1024)).toFixed(2)} MB`, inline: true }] : []), )
-    .setFooter({ text: 'Bankroll secure delivery • One-time download • No time expiry' }).setTimestamp();
+    .addFields(
+      { name: 'File type', value: isZip ? 'ZIP archive' : 'File', inline: true },
+      ...(Number.isFinite(sizeBytes) ? [{ name: 'Size', value: `${(sizeBytes / (1024 * 1024)).toFixed(2)} MB`, inline: true }] : []),
+      ...(expiresAt ? [{ name: 'Link expires', value: `<t:${Math.floor(expiresAt / 1000)}:R>`, inline: true }] : [])
+    )
+    .setFooter({ text: expiresAt ? 'Bankroll secure delivery • One-time download link' : 'Bankroll secure delivery' })
+    .setTimestamp();
 }
 
 async function makeDownloadLink(d, paymentIntentId) {
