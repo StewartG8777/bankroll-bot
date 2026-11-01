@@ -1266,7 +1266,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
 
   // Post the delivery under the original invoice. Inside the 15 minutes after the invoice command, the saved
   // interaction can always post (it works in a private DM the bot is not part of). After that the bot may be
-  // blocked (Missing Access) in that DM, so the owner is given a one-time link to pass on.
+  // blocked (Missing Access) in that DM, so the customer's Get file button on the invoice takes over (the owner also gets a one-time link).
   let blocked = false;
   try {
     const replyText = noFile
@@ -1310,7 +1310,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
       d.lastDeliveryFailureAlertAt = Date.now();
       saveDeliveries();
       await owner.send([
-        (blocked ? '⚠️ ' : '❌ ') + (d.testMode ? '[TEST] ' : '') + (blocked ? 'PAID — SEND THE CUSTOMER THIS LINK' : 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED'),
+        (blocked ? '⚠️ ' : '❌ ') + (d.testMode ? '[TEST] ' : '') + (blocked ? 'PAID — CUSTOMER NEEDS TO PRESS GET FILE' : 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED'),
         '',
         '**File:** ' + String(d.name || 'file'),
         '**Customer:** <@' + String(d.customerId || '') + '>',
@@ -1318,7 +1318,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
         '**Invoice error:** ' + invoiceError,
         '',
         blocked
-          ? 'The bot cannot post in that DM any more (Discord only lets it post there for 15 minutes after the command). The payment is saved. Send the customer this one-time link yourself:\n' + (ownerLink || '(no link could be made: set PUBLIC_URL and use /delivery resend)')
+          ? 'The bot cannot post in that DM any more (Discord only lets it post there for 15 minutes after the command). The payment is saved. The customer can press **Get file** on the invoice, or you can send them this one-time link:\n' + (ownerLink || '(no link could be made: set PUBLIC_URL and use /delivery resend)')
           : 'The paid order is saved. Bankroll will retry by replying to the original invoice only. No customer DM will be sent.',
       ].join('\n')).catch(() => {});
     }
@@ -2652,7 +2652,13 @@ async function sendStripeCheckout(interaction) {
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setLabel('Pay invoice').setStyle(ButtonStyle.Link).setURL(session.url)
     );
-    // No download button on the invoice: the file is posted as a reply once payment lands.
+    if (fileData || linkUrl) {
+      // Backup for when the bot can no longer post in the DM (paid after 15 minutes, or a very big file):
+      // the customer's click lets the bot reply under the invoice with the file or the download embed.
+      row.addComponents(
+        new ButtonBuilder().setCustomId(`getfile:${session.id}`).setLabel('Get file').setStyle(ButtonStyle.Secondary)
+      );
+    }
 
     const sentInvoice = await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
     if (sentInvoice?.url) {
@@ -2821,6 +2827,11 @@ async function sendMonzoInvoice(interaction) {
     if (MONZO_LINK) {
       const payUrl = `${MONZO_LINK}/${amount.toFixed(2)}?d=${encodeURIComponent(reference)}`;
       row.addComponents(new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(payUrl));
+    }
+    if (fileData || linkUrl) {
+      row.addComponents(
+        new ButtonBuilder().setCustomId(`getfile:${key}`).setLabel('Get file').setStyle(ButtonStyle.Secondary)
+      );
     }
 
     const sentInvoice = await interaction.editReply({
