@@ -580,6 +580,29 @@ const monzoPaid = () => Object.values(monzoLedger).filter((m) => m.status === 'p
 // Ensure every historical sale approved in /monzo-review is present in the same
 // paid ledger used by /payments, /total, /customer and financial reports.
 function syncMonzoReviewSalesToLedger() {
+  // Startup backup recovery can replace these JSON files after the module-level
+  // variables were first loaded. Reload them now so this reconciliation uses
+  // the recovered records rather than stale, pre-restore in-memory objects.
+  try {
+    const restoredLedger = JSON.parse(fs.readFileSync(MONZO_FILE, 'utf8'));
+    if (restoredLedger && typeof restoredLedger === 'object' && !Array.isArray(restoredLedger)) {
+      monzoLedger = restoredLedger;
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.error('Could not reload recovered Monzo ledger:', error.message);
+  }
+  try {
+    const restoredReview = JSON.parse(fs.readFileSync(MONZO_REVIEW_FILE, 'utf8'));
+    if (restoredReview && typeof restoredReview === 'object') {
+      monzoReviewState = {
+        transactions: restoredReview.transactions && typeof restoredReview.transactions === 'object' ? restoredReview.transactions : {},
+        reviewed: restoredReview.reviewed && typeof restoredReview.reviewed === 'object' ? restoredReview.reviewed : {},
+      };
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.error('Could not reload recovered Monzo review records:', error.message);
+  }
+
   let added = 0;
   let repaired = 0;
   for (const [txId, review] of Object.entries(monzoReviewState.reviewed || {})) {
