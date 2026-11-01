@@ -1280,24 +1280,59 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     msgUrl = invoiceReply.url || null;
     sentTo = 'a reply to the original invoice';
   } catch (e) {
+    const invoiceError = String(e?.message || e).slice(0, 300);
     console.error(`Could not reply to invoice for paid order ${key}:`, e);
-    d.deliveryError = `Could not reply to original invoice: ${String(e.message || e).slice(0, 300)}`;
-    d.paid = true;
-    d.paymentConfirmed = true;
-    saveDeliveries();
-    if (owner && Date.now() - Number(d.lastDeliveryFailureAlertAt || 0) >= 5 * 60 * 1000) {
-      d.lastDeliveryFailureAlertAt = Date.now();
+
+    // A deleted invoice or missing channel permissions must not trap a paid order
+    // in an endless retry loop. Deliver privately to the exact customer instead.
+    try {
+      if (!d.customerId) throw new Error('The paid order has no saved customer ID.');
+      const customer = await client.users.fetch(String(d.customerId));
+      const dmPayload = payload();
+      dmPayload.content = noFile
+        ? 'Your payment has been received. Thank you!'
+        : dlink
+          ? 'Your payment has been received. Your secure download is ready below.'
+          : 'Your payment has been received. Your complete file is attached below.';
+      dmPayload.allowedMentions = { parse: [] };
+      const dmMessage = await sendWithFallback((p) => customer.send(p));
+      msgUrl = dmMessage?.url || null;
+      sentTo = 'a private DM to the customer';
+      d.deliveryFallbackReason = `Invoice reply unavailable: ${invoiceError}`;
+      d.deliveryError = null;
       saveDeliveries();
-      await owner.send([
-      '❌ ' + (d.testMode ? '[TEST] ' : '') + 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED',
-      '',
-      '**File:** ' + String(d.name || 'file') + ' (sent here as soon as payment lands)',
-      '**Customer:** <@' + String(d.customerId || '') + '>',
-      '**Invoice:** ' + key,
-      '**Reason:** ' + String(d.deliveryError || 'Could not post the invoice reply').slice(0, 500),
-      '',
-      'The paid order is saved. Bankroll will keep retrying automatically.'
-      ].join('\n')).catch(() => {});
+      console.warn(`Paid order ${key} delivered by customer DM because invoice reply failed: ${invoiceError}`);
+      if (owner) {
+        await owner.send([
+          '⚠️ ' + (d.testMode ? '[TEST] ' : '') + 'DELIVERY SENT BY DM — INVOICE REPLY UNAVAILABLE',
+          '',
+          '**File:** ' + String(d.name || 'file'),
+          '**Customer:** <@' + String(d.customerId) + '>',
+          '**Order:** ' + key,
+          '**Invoice issue:** ' + invoiceError,
+          '**Fallback:** The file was successfully sent to the customer by DM.',
+        ].join('\n')).catch(() => {});
+      }
+    } catch (dmError) {
+      d.deliveryError = `Invoice reply failed: ${invoiceError}; customer DM fallback failed: ${String(dmError?.message || dmError).slice(0, 250)}`;
+      d.paid = true;
+      d.paymentConfirmed = true;
+      saveDeliveries();
+      if (owner && Date.now() - Number(d.lastDeliveryFailureAlertAt || 0) >= 5 * 60 * 1000) {
+        d.lastDeliveryFailureAlertAt = Date.now();
+        saveDeliveries();
+        await owner.send([
+          '❌ ' + (d.testMode ? '[TEST] ' : '') + 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED',
+          '',
+          '**File:** ' + String(d.name || 'file'),
+          '**Customer:** <@' + String(d.customerId || '') + '>',
+          '**Order:** ' + key,
+          '**Invoice error:** ' + invoiceError,
+          '**DM fallback error:** ' + String(dmError?.message || dmError).slice(0, 300),
+          '',
+          'The paid order is saved. Bankroll will retry delivery automatically.',
+        ].join('\n')).catch(() => {});
+      }
     }
   }
 
@@ -1333,9 +1368,11 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
         .setDescription(`**File**\n${short(String(d.name || 'file'), 150)} (sent here as soon as payment lands)`)
         .addFields(
           { name: 'Customer', value: `<@${d.customerId}>`, inline: true },
-          { name: 'Delivery', value: dlink ? 'Hosted Download button' : 'Direct Discord attachment', inline: true },
+          { name: 'Delivery', value: dlink ? 'Secure hosted download link' : 'Direct Discord attachment', inline: true },
           { name: 'Download tracking', value: dlink ? 'Successful hosted downloads are confirmed separately' : 'Discord does not report whether an attachment was saved by the customer' },
-          { name: 'Invoice reply', value: msgUrl || 'Posted successfully' }
+          { name: 'Delivery destination', value: sentTo || 'Posted successfully' },
+          ...(msgUrl ? [{ name: 'Message', value: msgUrl }] : []),
+          ...(d.deliveryFallbackReason ? [{ name: 'Invoice fallback reason', value: short(d.deliveryFallbackReason, 500) }] : [])
         ).setTimestamp()]
     }, { notificationType: 'delivery.sent', notificationStatus: 'success' });
   }
