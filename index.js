@@ -411,6 +411,8 @@ function saveSendJobs() {
 
 const BASE_URL = PUBLIC_URL.replace(/\/+$/, '');
 const MAX_FILE_BYTES = (BASE_URL ? 100 : 10) * 1024 * 1024;
+// Largest file sent as a Discord attachment; anything bigger gets the one-time Download ZIP button instead.
+const ATTACH_MAX_BYTES = 9 * 1024 * 1024;
 fs.mkdirSync(FILES_DIR, { recursive: true });
 const TMP_DIR = path.join(DATA_DIR, 'tmp');
 fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -725,7 +727,7 @@ async function verifyZipIntegrity(filePath) {
     });
   });
 }
-function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download is ready') {
+function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download is ready', oneTime = false) {
   const isZip = /\.zip$/i.test(String(name || ''));
   return new EmbedBuilder().setColor(GREEN).setTitle(label)
     .setDescription(`Your complete **${short(String(name || 'file'), 180)}** is ready. ${isZip ? 'This is one original ZIP archive — no split parts or joining steps.' : 'Your original file is ready to download.'}`)
@@ -734,7 +736,7 @@ function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download i
       ...(Number.isFinite(sizeBytes) ? [{ name: 'Size', value: `${(sizeBytes / (1024 * 1024)).toFixed(2)} MB`, inline: true }] : []),
       ...(expiresAt ? [{ name: 'Link expires', value: `<t:${Math.floor(expiresAt / 1000)}:R>`, inline: true }] : [])
     )
-    .setFooter({ text: expiresAt ? 'Bankroll secure delivery • One-time download link' : 'Bankroll secure delivery' })
+    .setFooter({ text: expiresAt || oneTime ? 'Bankroll secure delivery • One-time download link' : 'Bankroll secure delivery' })
     .setTimestamp();
 }
 
@@ -1209,7 +1211,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
 
   if (!dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
     const size = fs.statSync(d.path).size;
-    if (d.mode === 'link' || size > MAX_FILE_BYTES) {
+    if (d.mode === 'link' || size > ATTACH_MAX_BYTES) {
       dlink = await makeDownloadLink(d, paymentIntentId);
       hosted = true;
       d.fallbackLink = dlink;
@@ -1231,7 +1233,8 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     if (dlink) {
       return {
         content: `<@${d.customerId}> payment received. Your complete ${isZip ? 'ZIP' : 'file'} is ready below.`,
-        embeds: [buildCustomerDeliveryEmbed(d.name, deliverySize, dlink)],
+        embeds: [buildDownloadEmbed(d.name, null, deliverySize, `${d.testMode ? '[TEST] ' : ''}Your download is ready`, true)],
+        components: [downloadLinkRow(dlink, isZip ? 'Download ZIP' : 'Download File')],
         allowedMentions: { parse: [] },
       };
     }
@@ -4742,7 +4745,7 @@ async function onGetFile(interaction) {
   }
   if (!dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
     const size = fs.statSync(d.path).size;
-    if (d.mode === 'link' || size > MAX_FILE_BYTES) {
+    if (d.mode === 'link' || size > ATTACH_MAX_BYTES) {
       dlink = await makeDownloadLink(d, checkPi);
       hosted = true;
       d.fallbackLink = dlink;
@@ -4760,7 +4763,7 @@ async function onGetFile(interaction) {
   const getPayload = () => dlink
     ? {
         content: `<@${d.customerId}> here is your secure download. The link works once and has no time expiry.`,
-        embeds: [buildDownloadEmbed(d.name, downloads[dlink.split('/').pop()]?.expiresAt, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined)],
+        embeds: [buildDownloadEmbed(d.name, downloads[dlink.split('/').pop()]?.expiresAt, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined, `${d.testMode ? '[TEST] ' : ''}Your download is ready`, true)],
         components: [downloadLinkRow(dlink, isZip ? 'Download ZIP' : 'Download File')],
         allowedMentions: { parse: [] },
       }
