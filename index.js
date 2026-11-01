@@ -504,7 +504,7 @@ function applyMonzoReviewCustomerIds() {
   const customerIds = MONZO_REVIEW_CUSTOMER_IDS;
   const order = MONZO_REVIEW_CUSTOMER_ORDER_NEWEST_FIRST;
   if (customerIds.length !== 9 || order.length !== 15 ||
-      customerIds.some((id) => !/^\\d{17,20}$/.test(id)) ||
+      customerIds.some((id) => !/^\d{17,20}$/.test(id)) ||
       order.some((number) => !Number.isInteger(number) || number < 1 || number > customerIds.length)) {
     console.error('Monzo customer ID import skipped: the supplied customer list or transaction mapping failed validation.');
     return 0;
