@@ -2101,6 +2101,11 @@ async function autoRestoreOnStartup() {
       try {
         const value = JSON.parse(fs.readFileSync(fp, 'utf8'));
         if (!isValidJsonFor(name, value)) return true;
+        if (name === 'monzo_review.json') {
+          // The valid empty review shape has two top-level keys, so a generic
+          // Object.keys check incorrectly treats it as populated and blocks recovery.
+          return !Object.keys(value.transactions || {}).length && !Object.keys(value.reviewed || {}).length;
+        }
         return Array.isArray(value) ? value.length === 0 : Object.keys(value).length === 0;
       } catch { return true; }
     };
