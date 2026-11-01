@@ -2014,7 +2014,18 @@ const onReady = async () => {
   if (started) return;
   started = true;
   console.log(`Logged in as ${client.user.tag}`);
-  // Slash commands are refreshed explicitly with /bot refresh-commands, not on every restart.
+  // Register the slash commands from this deployed version on every startup.
+  // This ensures new/changed commands are published after a Render deployment.
+  try {
+    await client.application.commands.set(commands.map((c) => c.toJSON()));
+    console.log(`Registered ${commands.length} global slash/context command(s) from the running version.`);
+    if (DISCORD_GUILD_ID) {
+      const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
+      if (guild) await guild.commands.set([]);
+    }
+  } catch (error) {
+    console.error('Automatic slash-command refresh failed:', error);
+  }
   await autoRestoreOnStartup();
   try {
     const status = ['online', 'idle', 'dnd', 'invisible'].includes(savedPresence?.status) ? savedPresence.status : 'online';
@@ -3729,7 +3740,7 @@ async function cmdBotAdmin(interaction) {
         guildNote = '\\nRemoved old server-only command copies.';
       }
     }
-    return interaction.editReply(`**Slash commands refreshed successfully**\n\n**What changed:**\n• **/spam** takes a message and duration only — there is no user/recipient option.\n• **/spam now works in server text channels and direct messages** where the Bankroll app is available (including DMs using the user-installed app).\n• Running /spam posts a Start embed in the chat/channel where you used the command.\n• Clicking **Start** sends your chosen message as a reply to that embed every second, for the selected 1–15 minutes.\n• The session can be stopped with the embed's **Stop** button; the bot owner can use **/stop** in a server or DM to stop all active sessions.\n\n**${commands.length}** command(s) registered globally. Discord should show the latest commands without restarting your client.${guildNote}`);
+    return interaction.editReply(`**Slash commands refreshed successfully.**\n\nRegistered **${commands.length}** global command(s) from the version currently running on Render.\n\nNew or changed command definitions are now submitted to Discord. If you have just pushed code changes, make sure Render has deployed and restarted first; this command cannot load code directly from GitHub. Discord may take a short time to update its command list.${guildNote}`);
   }
 
   if (sub === 'export-index') {
