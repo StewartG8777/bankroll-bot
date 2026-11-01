@@ -1082,11 +1082,23 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
 
   let owner = null;
   try { owner = await client.users.fetch(OWNER_ID); } catch {}
+  const wasPaymentConfirmed = !!d.paymentConfirmed;
   d.paymentConfirmed = true; d.paid = true;
   d.paymentConfirmedAt = d.paymentConfirmedAt || Date.now();
   if (paymentIntentId) d.paymentIntentId = paymentIntentId;
   saveDeliveries();
   await updateInvoicePaidMessage(d, key, paymentIntentId);
+  if (!wasPaymentConfirmed) {
+    await notifyOwner({
+      embeds: [new EmbedBuilder().setColor(GREEN).setTitle(d.testMode ? '[TEST] Payment confirmed' : 'Payment confirmed')
+        .setDescription(`Payment confirmed for **${short(String(d.name || 'purchase'), 120)}**.`)
+        .addFields(
+          { name: 'Customer', value: `<@${d.customerId}>`, inline: true },
+          { name: 'Amount', value: money(Number(d.amount || 0), d.currency || CURRENCY), inline: true },
+          { name: 'Order', value: String(key).slice(0, 100) }
+        ).setTimestamp()]
+    }, { notificationType: 'payment.confirmed', notificationStatus: 'success' });
+  }
 
   const noFile = !d.link && !d.path;
   if (d.path && fs.existsSync(d.path) && d.sha256 && await sha256File(d.path) !== d.sha256) {
@@ -1215,8 +1227,15 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
         delivery_message: msgUrl || '',
       });
     }
-    if (force) await notifyOwner({ content: `Manual resend completed for **${d.name}** as a reply to the original invoice. The original payment was not charged again.` });
-    else await notifyOwner({ content: `Payment received. The ${/\\.zip$/i.test(String(d.name || '')) ? 'ZIP' : 'file'} was posted as a reply to the original invoice.` });
+    await notifyOwner({
+      embeds: [new EmbedBuilder().setColor(GREEN).setTitle(d.testMode ? '[TEST] File sent' : 'File sent')
+        .setDescription(`**${short(String(d.name || 'file'), 150)}** was posted as a reply to the original invoice.`)
+        .addFields(
+          { name: 'Customer', value: `<@${d.customerId}>`, inline: true },
+          { name: 'Delivery', value: dlink ? 'Hosted Download button' : 'Direct Discord attachment', inline: true },
+          { name: 'Invoice reply', value: msgUrl || 'Posted successfully' }
+        ).setTimestamp()]
+    }, { notificationType: 'delivery.sent', notificationStatus: 'success' });
   }
 }
 
@@ -5388,8 +5407,13 @@ app.get('/:name/:token', (req, res) => {
       detail:`${t.testMode ? '[TEST] ' : ''}Completed file transfer: ${expectedBytes} bytes in ${elapsedMs} ms at ${new Date(downloadedAt).toISOString()}.`
     });
     notifyOwner({
-      content: `${t.testMode ? '[TEST] ' : ''}<@${t.customerId}> successfully downloaded **${t.name}**.\nCompleted: <t:${Math.floor(downloadedAt/1000)}:F>\nFile size: ${(expectedBytes/(1024*1024)).toFixed(2)} MB.`
-    });
+      embeds: [new EmbedBuilder().setColor(GREEN).setTitle(t.testMode ? '[TEST] File downloaded' : 'File downloaded')
+        .setDescription(`<@${t.customerId}> successfully downloaded **${short(String(t.name || 'file'), 150)}**.`)
+        .addFields(
+          { name: 'Completed', value: `<t:${Math.floor(downloadedAt/1000)}:F>`, inline: true },
+          { name: 'File size', value: `${(expectedBytes/(1024*1024)).toFixed(2)} MB`, inline: true }
+        ).setTimestamp()]
+    }, { notificationType: 'download.completed', notificationStatus: 'success' });
     recordInStripe(t.paymentIntentId, {
       downloaded_at: new Date(downloadedAt).toISOString(),
       downloaded_file: String(t.name || '').slice(0,100),
@@ -9562,8 +9586,13 @@ app.get('/:name/:token', (req, res) => {
       detail:`${t.testMode ? '[TEST] ' : ''}Completed file transfer: ${expectedBytes} bytes in ${elapsedMs} ms at ${new Date(downloadedAt).toISOString()}.`
     });
     notifyOwner({
-      content: `${t.testMode ? '[TEST] ' : ''}<@${t.customerId}> successfully downloaded **${t.name}**.\nCompleted: <t:${Math.floor(downloadedAt/1000)}:F>\nFile size: ${(expectedBytes/(1024*1024)).toFixed(2)} MB.`
-    });
+      embeds: [new EmbedBuilder().setColor(GREEN).setTitle(t.testMode ? '[TEST] File downloaded' : 'File downloaded')
+        .setDescription(`<@${t.customerId}> successfully downloaded **${short(String(t.name || 'file'), 150)}**.`)
+        .addFields(
+          { name: 'Completed', value: `<t:${Math.floor(downloadedAt/1000)}:F>`, inline: true },
+          { name: 'File size', value: `${(expectedBytes/(1024*1024)).toFixed(2)} MB`, inline: true }
+        ).setTimestamp()]
+    }, { notificationType: 'download.completed', notificationStatus: 'success' });
     recordInStripe(t.paymentIntentId, {
       downloaded_at: new Date(downloadedAt).toISOString(),
       downloaded_file: String(t.name || '').slice(0,100),
