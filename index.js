@@ -739,7 +739,7 @@ function buildDownloadEmbed(name, expiresAt, sizeBytes, label = 'Your download i
 }
 
 function buildCustomerDeliveryEmbed(name, sizeBytes, downloadUrl = null) {
-  const isZip = /\\.zip$/i.test(String(name || ''));
+  const isZip = /\.zip$/i.test(String(name || ''));
   const safeName = short(String(name || 'file'), 180);
   const embed = new EmbedBuilder()
     .setColor(GREEN)
@@ -747,7 +747,7 @@ function buildCustomerDeliveryEmbed(name, sizeBytes, downloadUrl = null) {
     .setTitle(isZip ? 'Your ZIP is ready!' : 'Your file is ready!')
     .setDescription(
       'Your purchase has been successfully processed. Your complete file is ready to download.' +
-      (downloadUrl ? `\\n\\n[Download ${isZip ? 'ZIP' : 'file'}](${downloadUrl}) — secure one-time link.` : '')
+      (downloadUrl ? `\n\n[Download ${isZip ? 'ZIP' : 'file'}](${downloadUrl}) — secure one-time link.` : '')
     )
     .addFields(
       { name: 'File', value: safeName, inline: false },
