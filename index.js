@@ -1266,8 +1266,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
 
   // Post the delivery under the original invoice. Inside the 15 minutes after the invoice command, the saved
   // interaction can always post (it works in a private DM the bot is not part of). After that the bot may be
-  // blocked (Missing Access) in that DM, so the customer's Download ZIP / Get my file button on the invoice
-  // takes over: their click is allowed to post there.
+  // blocked (Missing Access) in that DM, so the owner is given a one-time link to pass on.
   let blocked = false;
   try {
     const replyText = noFile
@@ -1300,14 +1299,18 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     d.deliveryError = `Invoice reply failed: ${invoiceError}`;
     d.paid = true;
     d.paymentConfirmed = true;
-    if (blocked) d.awaitingCustomerButton = true;
+    if (blocked) d.awaitingOwnerHandoff = true;
     saveDeliveries();
+    let ownerLink = null;
+    if (blocked && d.path && fs.existsSync(d.path) && BASE_URL) {
+      try { ownerLink = d.fallbackLink || (d.fallbackLink = await makeDownloadLink(d, paymentIntentId)); saveDeliveries(); } catch (linkErr) { console.error('Could not make hand-off link:', linkErr.message); }
+    }
 
     if (owner && Date.now() - Number(d.lastDeliveryFailureAlertAt || 0) >= 5 * 60 * 1000) {
       d.lastDeliveryFailureAlertAt = Date.now();
       saveDeliveries();
       await owner.send([
-        (blocked ? '⚠️ ' : '❌ ') + (d.testMode ? '[TEST] ' : '') + (blocked ? 'PAID — CUSTOMER MUST PRESS THE BUTTON' : 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED'),
+        (blocked ? '⚠️ ' : '❌ ') + (d.testMode ? '[TEST] ' : '') + (blocked ? 'PAID — SEND THE CUSTOMER THIS LINK' : 'DELIVERY FAILED — AUTOMATIC RETRY SCHEDULED'),
         '',
         '**File:** ' + String(d.name || 'file'),
         '**Customer:** <@' + String(d.customerId || '') + '>',
@@ -1315,14 +1318,14 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
         '**Invoice error:** ' + invoiceError,
         '',
         blocked
-          ? 'The bot cannot post in that DM any more (Discord only lets it post there for 15 minutes after the command). The payment is saved: tell the customer to press **Download ZIP** on the invoice and the file is sent straight away.'
+          ? 'The bot cannot post in that DM any more (Discord only lets it post there for 15 minutes after the command). The payment is saved. Send the customer this one-time link yourself:\n' + (ownerLink || '(no link could be made: set PUBLIC_URL and use /delivery resend)')
           : 'The paid order is saved. Bankroll will retry by replying to the original invoice only. No customer DM will be sent.',
       ].join('\n')).catch(() => {});
     }
   }
 
   if (!sentTo && blocked) {
-    // Retrying cannot help: wait for the customer's button press instead of retrying forever.
+    // Retrying cannot help: the owner has been given the link, so stop retrying.
     clearDeliveryWatch(key);
     const retryTimer = deliveryRetryTimers.get(key); if (retryTimer) clearTimeout(retryTimer); deliveryRetryTimers.delete(key);
     return false;
@@ -2649,14 +2652,7 @@ async function sendStripeCheckout(interaction) {
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setLabel('Pay invoice').setStyle(ButtonStyle.Link).setURL(session.url)
     );
-    if (fileData || linkUrl) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setCustomId(`getfile:${session.id}`)
-          .setLabel(fileData && /\.zip$/i.test(fileData.name || '') ? 'Download ZIP' : 'Download File')
-          .setStyle(ButtonStyle.Secondary)
-      );
-    }
+    // No download button on the invoice: the file is posted as a reply once payment lands.
 
     const sentInvoice = await interaction.editReply({ content: `<@${customer.id}>`, embeds: [embed], components: [row] });
     if (sentInvoice?.url) {
@@ -2825,11 +2821,6 @@ async function sendMonzoInvoice(interaction) {
     if (MONZO_LINK) {
       const payUrl = `${MONZO_LINK}/${amount.toFixed(2)}?d=${encodeURIComponent(reference)}`;
       row.addComponents(new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(payUrl));
-    }
-    if (fileData || linkUrl) {
-      row.addComponents(
-        new ButtonBuilder().setCustomId(`getfile:${key}`).setLabel(fileData && /\.zip$/i.test(fileData.name || '') ? 'Download ZIP' : 'Download File').setStyle(ButtonStyle.Secondary)
-      );
     }
 
     const sentInvoice = await interaction.editReply({
