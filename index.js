@@ -500,7 +500,7 @@ const MONZO_REVIEW_CUSTOMER_IDS_NEWEST_FIRST = [
 const MONZO_CUSTOMER_ASSIGNMENT_VERSION = 'review-customer-ids-2026-11-01';
 function applyMonzoReviewCustomerIds() {
   const ids = MONZO_REVIEW_CUSTOMER_IDS_NEWEST_FIRST;
-  if (ids.length !== 9 || ids.some((id) => !/^\\d{17,20}$/.test(id))) {
+  if (ids.length !== 9 || ids.some((id) => !/^\d{17,20}$/.test(id))) {
     console.error('Monzo customer ID import skipped: the supplied ID list failed validation.');
     return 0;
   }
