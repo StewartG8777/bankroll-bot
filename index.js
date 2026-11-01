@@ -4576,7 +4576,7 @@ async function showMonzoReviewModal(interaction) {
     .setTitle('Review Monzo sale');
   const customer = new TextInputBuilder()
     .setCustomId('customer_id')
-    .setLabel('Customer Discord ID (optional — can be added later)')
+    .setLabel('Customer Discord ID (optional)')
     .setStyle(TextInputStyle.Short)
     .setRequired(false)
     .setMaxLength(25);
