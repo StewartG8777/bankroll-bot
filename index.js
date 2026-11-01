@@ -1685,7 +1685,7 @@ const vaultCmd = common(
 
 const sendfileCmd = new SlashCommandBuilder()
   .setName('sendfile')
-  .setDescription('Schedule a vault ZIP for delivery in this private DM')
+  .setDescription('Schedule a vault ZIP for delivery in this DM or group DM')
   .setIntegrationTypes([ApplicationIntegrationType.UserInstall])
   .setContexts([InteractionContextType.PrivateChannel])
   .addIntegerOption((o) => o.setName('size').setDescription('How long to wait before sending').setMinValue(1).setMaxValue(720).setRequired(true))
@@ -5296,8 +5296,10 @@ function sendfileButton(jobId) {
   );
 }
 async function startScheduledSend(interaction) {
-  if (interaction.inGuild() || interaction.channel?.type !== ChannelType.DM) {
-    return interaction.reply({ content: 'Run /sendfile inside a one-to-one private DM, not in a server or group DM.', ephemeral: true });
+  // User-installed application commands can run in group DMs as well as one-to-one DMs.
+  // Accept any DM-based channel, but never allow this private file-scheduling command in a server.
+  if (interaction.inGuild() || !interaction.channel?.isDMBased?.()) {
+    return interaction.reply({ content: 'Run /sendfile inside a private DM or group DM with Bankroll, not in a server.', ephemeral: true });
   }
   let key = interaction.options.getString('file');
   if (!key) {
