@@ -1306,10 +1306,23 @@ const addTestPurchaseOptions = (sub, isCard) => {
     .addAttachmentOption((o) => o.setName('file').setDescription('File to deliver after simulated payment'))
     .addStringOption((o) => o.setName('vault_file').setDescription('Or choose a saved vault file').setAutocomplete(true))
     .addStringOption((o) => o.setName('delivery').setDescription('Direct file first, or hosted download link')
-      .addChoices({ name: 'Direct file upload (fallback to link if needed)', value: 'direct' }, { name: 'Hosted one-time link', value: 'link' }));
+      .addChoices({ name: 'Direct file upload with link fallback', value: 'direct' }, { name: 'Hosted one-time link', value: 'link' }));
   if (isCard) {
     sub.addStringOption((o) => o.setName('currency').setDescription('Invoice currency')
-      .addChoices({ name: 'GBP £', value: 'gbp' }, { name: 'USD 
+      .addChoices({ name: 'GBP', value: 'gbp' }, { name: 'US dollars', value: 'usd' }, { name: 'Euros', value: 'eur' }));
+  }
+  sub.addStringOption((o) => o.setName('link').setDescription('External download link instead of a file'));
+  if (isCard) sub.addStringOption((o) => o.setName('expires').setDescription('Invoice expiry, e.g. 30m, 2h, 24h, or 7d'));
+  return sub;
+};
+
+const testCmd = common(
+  new SlashCommandBuilder()
+    .setName('test')
+    .setDescription('Create a real-layout test invoice with simulated payment (owner only)')
+    .addSubcommand((sub) => addTestPurchaseOptions(sub.setName('bankroll').setDescription('Test a Stripe/card invoice'), true))
+    .addSubcommand((sub) => addTestPurchaseOptions(sub.setName('monzo').setDescription('Test a Monzo invoice'), false))
+);
 
 const monzoCmd = common(
   new SlashCommandBuilder()
