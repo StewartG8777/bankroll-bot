@@ -1685,13 +1685,13 @@ const vaultCmd = common(
 
 const sendfileCmd = new SlashCommandBuilder()
   .setName('sendfile')
-  .setDescription('Schedule a vault ZIP for delivery in this DM or group DM')
+  .setDescription('Schedule any vault file for delivery in this DM or group DM')
   .setIntegrationTypes([ApplicationIntegrationType.UserInstall])
   .setContexts([InteractionContextType.PrivateChannel])
   .addIntegerOption((o) => o.setName('size').setDescription('How long to wait before sending').setMinValue(1).setMaxValue(720).setRequired(true))
   .addStringOption((o) => o.setName('disk').setDescription('M = minutes, H = hours').setRequired(true)
     .addChoices({ name: 'M', value: 'm' }, { name: 'H', value: 'h' }))
-  .addStringOption((o) => o.setName('file').setDescription('Vault ZIP to send (default: newest ZIP in your vault)').setAutocomplete(true));
+  .addStringOption((o) => o.setName('file').setDescription('Vault file to send (default: newest file in your vault)').setAutocomplete(true));
 
 const cancelCmd = common(
   new SlashCommandBuilder()
@@ -1823,18 +1823,10 @@ const previewCmd = common(
   new SlashCommandBuilder().setName('preview').setDescription('Select a customer and preview their Bankroll experience')
 );
 
-const exportCmd = common(
-  new SlashCommandBuilder()
-    .setName('export')
-    .setDescription('Export Bankroll source files to the private log channel')
-    .addSubcommand((sub) => sub.setName('index').setDescription('Post the raw running index.js file to #bankroll-index-logs'))
-);
-
 const botAdminCmd = common(
   new SlashCommandBuilder()
     .setName('bot')
     .setDescription('Owner controls for the Bankroll bot')
-    .addSubcommand((sub) => sub.setName('export-index').setDescription('Send the currently running index.js file privately'))
     .addSubcommand((sub) => sub.setName('refresh-commands').setDescription('Refresh all Discord slash commands immediately'))
     .addSubcommand((sub) => sub.setName('redeploy').setDescription('Trigger a new deployment from the latest GitHub commit on Render'))
     .addSubcommand((sub) => sub.setName('restart').setDescription('Restart the running Render service'))
@@ -1904,7 +1896,7 @@ const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription(
   .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' }))
   .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records')));
 
-const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -4107,86 +4099,10 @@ const RECENT_UPDATES = [
   '/monzo-review: customer Discord ID can be left blank and assigned after all transactions are reviewed.',
   '/monzo-review: supports this month, last month, this week and last week, with editable transaction dates.',
   '/bot refresh-commands: compares the full command definition, reports added/removed/changed commands and verifies Discord registration.',
+  '/sendfile: accepts any file type stored in the vault, not only ZIP archives.',
+  'Removed the unused /export index and /bot export-index commands.',
   'Historical Monzo customer IDs are assigned to the nine reviewed sales in newest-to-oldest order.',
 ];
-
-async function cmdExport(interaction) {
-  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can export source files.');
-  const sub = interaction.options.getSubcommand();
-  if (sub !== 'index') return interaction.editReply('Unknown export type.');
-
-  const indexPath = path.join(__dirname, 'index.js');
-  if (!fs.existsSync(indexPath)) return interaction.editReply('Could not find the running index.js file on this instance.');
-
-  let target = null;
-  const expectedName = 'bankroll-index-logs';
-  const guilds = [...client.guilds.cache.values()];
-
-  // Reuse the dedicated channel if it already exists in any server.
-  for (const guild of guilds) {
-    let channels = guild.channels.cache;
-    if (!channels.size) channels = await guild.channels.fetch().catch(() => channels);
-    target = channels.find((channel) =>
-      channel?.name?.toLowerCase().replace(/\s+/g, '-') === expectedName &&
-      channel.isTextBased?.() && typeof channel.send === 'function'
-    ) || null;
-    if (target) break;
-  }
-
-  // Create the channel automatically if it does not exist. It is private:
-  // only Bankroll and the configured owner can view it.
-  if (!target) {
-    const createGuild = guilds.find((guild) => {
-      const me = guild.members.me;
-      return me?.permissions?.has(PermissionFlagsBits.ManageChannels) &&
-        me?.permissions?.has(PermissionFlagsBits.ViewChannel);
-    });
-    if (!createGuild) {
-      return interaction.editReply('I could not find **#bankroll-index-logs** or a server where I have permission to create it. Give Bankroll **Manage Channels** and **View Channel**, then run /export index again.');
-    }
-
-    target = await createGuild.channels.create({
-      name: expectedName,
-      type: ChannelType.GuildText,
-      topic: 'Private Bankroll source-code export and audit log. Created automatically by /export index.',
-      permissionOverwrites: [
-        {
-          id: createGuild.roles.everyone.id,
-          deny: [PermissionFlagsBits.ViewChannel],
-        },
-        {
-          id: client.user.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.AttachFiles,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.ManageChannels,
-          ],
-        },
-        {
-          id: OWNER_ID,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.AttachFiles,
-          ],
-        },
-      ],
-      reason: 'Create private Bankroll index export and audit channel',
-    });
-  }
-
-  const stat = fs.statSync(indexPath);
-  if (!stat.size) return interaction.editReply('The running index.js file is empty; nothing was exported.');
-  await target.send({
-    content: 'index.js export • requested by <@' + interaction.user.id + '> • <t:' + Math.floor(Date.now() / 1000) + ':F>',
-    files: [new AttachmentBuilder(indexPath, { name: 'index.js' })],
-    allowedMentions: { parse: [] },
-  });
-  return interaction.editReply('✅ The raw **index.js** file has been exported to ' + target.toString() + ' and the export is logged there.');
-}
 
 async function cmdBotAdmin(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can use these controls.');
@@ -4281,12 +4197,6 @@ async function cmdBotAdmin(interaction) {
     let response = lines.join('\n');
     if (response.length > 1900) response = response.slice(0, 1880) + '\n…Use the Render logs for the complete registration result.';
     return interaction.editReply(response);
-  }
-
-  if (sub === 'export-index') {
-    const indexPath = path.join(__dirname, 'index.js');
-    if (!fs.existsSync(indexPath)) return interaction.editReply('Could not find the running index.js file on this instance.');
-    return interaction.editReply({ content: 'Here is the current index.js from this running bot instance.', files: [new AttachmentBuilder(indexPath, { name: 'index.js' })] });
   }
 
   if (sub === 'avatar') {
@@ -5388,12 +5298,12 @@ async function startScheduledSend(interaction) {
   }
   let key = interaction.options.getString('file');
   if (!key) {
-    // No file picked: use the newest ZIP in the vault.
+    // No file picked: use the newest available file in the vault.
     const newest = Object.entries(vault)
-      .filter(([, v]) => v?.path && /\.zip$/i.test(String(v.originalName || v.path)) && fs.existsSync(v.path))
+      .filter(([, v]) => v?.path && fs.existsSync(v.path))
       .sort((a, b) => (b[1].addedAt || 0) - (a[1].addedAt || 0))[0];
     if (!newest) {
-      return interaction.reply({ content: 'There is no ZIP in your vault yet. Add one with /vault add first.', ephemeral: true });
+      return interaction.reply({ content: 'There are no files in your vault yet. Add one with /vault add first.', ephemeral: true });
     }
     key = newest[0];
   }
@@ -5401,11 +5311,6 @@ async function startScheduledSend(interaction) {
   if (!item || !item.path || !fs.existsSync(item.path)) {
     return interaction.reply({ content: `Vault file \`${key}\` is unavailable. Check it with /vault verify.`, ephemeral: true });
   }
-  if (!/\.zip$/i.test(String(item.originalName || item.path))) {
-    return interaction.reply({ content: ' /sendfile currently accepts ZIP files only. Add a .zip file to the vault first.', ephemeral: true });
-  }
-  try { new AdmZip(item.path).getEntries(); }
-  catch { return interaction.reply({ content: 'That vault item is not a readable ZIP file. Check it with /vault verify.', ephemeral: true }); }
   const amount = interaction.options.getInteger('size', true);
   const unit = interaction.options.getString('disk', true);
   const multiplier = unit === 'h' ? 60 * 60 * 1000 : 60 * 1000;
@@ -5456,8 +5361,6 @@ async function onScheduledSendButton(interaction) {
   if (!item?.path || !fs.existsSync(item.path)) {
     return interaction.update({ content: `The scheduled time has arrived, but vault file \`${job.vaultKey}\` is missing. Re-add it, then contact the bot owner.`, components: [sendfileButton(jobId)] });
   }
-  try{await verifyZipIntegrity(item.path);}catch(e){recordDownloadEvent('verification_failed',{file:job.originalName,customerId:interaction.user.id,detail:e.message});return interaction.update({content:`I stopped this delivery because the ZIP failed its integrity check: ${short(e.message,180)}. Please contact the bot owner.`,components:[]});}
-
   job.status = 'sending';
   await interaction.update({ content: `${sendfileProgress(job)}\n\nPreparing your complete ZIP now...`, components: [], allowedMentions: { parse: [] } });
 
@@ -5478,36 +5381,36 @@ async function onScheduledSendButton(interaction) {
       description: 'scheduled-vault-file',
     }, null);
     await interaction.followUp({
-      content: `**${job.originalName}** is ready. This is the original complete ZIP; the secure link works once and has no time expiry.`,
-      embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Your ZIP is ready').setDescription('Use the button below to download the complete original archive.')],
-      components: [downloadLinkRow(link, 'Download ZIP')],
+      content: `**${job.originalName}** is ready. This is the original file; the secure link works once and has no time expiry.`,
+      embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Your file is ready').setDescription('Use the button below to download the original file.')],
+      components: [downloadLinkRow(link, 'Download File')],
       allowedMentions: { parse: [] },
     });
     recordDownloadEvent('delivery_sent', { file: job.originalName, customerId: interaction.user.id, agentId: OWNER_ID, detail: 'Scheduled ZIP delivery link sent.' });
-    await finish('link_sent', 'One-time Download ZIP button sent below.');
+    await finish('link_sent', 'One-time Download File button sent below.');
   };
 
   try {
     const fileSize = fs.statSync(item.path).size;
     if (fileSize > MAX_FILE_BYTES) {
-      if (!BASE_URL) throw new Error('The ZIP exceeds Discord upload limits and PUBLIC_URL is not configured.');
+      if (!BASE_URL) throw new Error('The file exceeds Discord upload limits and PUBLIC_URL is not configured.');
       return await sendHostedLink();
     }
     try {
       await interaction.followUp({
-        content: `**${job.originalName}** - scheduled delivery complete. The original ZIP is attached below.`,
+        content: `**${job.originalName}** - scheduled delivery complete. The original file is attached below.`,
         files: [new AttachmentBuilder(item.path, { name: path.basename(job.originalName) })],
         allowedMentions: { parse: [] },
       });
-      recordDownloadEvent('delivery_sent', { file: job.originalName, customerId: interaction.user.id, agentId: OWNER_ID, detail: 'Complete ZIP attachment sent directly.' });
-      return await finish('sent', 'Complete ZIP sent below.');
+      recordDownloadEvent('delivery_sent', { file: job.originalName, customerId: interaction.user.id, agentId: OWNER_ID, detail: 'Original file attachment sent directly.' });
+      return await finish('sent', 'Complete file sent below.');
     } catch (uploadError) {
-      console.error('Scheduled ZIP attachment failed:', uploadError.message);
+      console.error('Scheduled file attachment failed:', uploadError.message);
       if (!BASE_URL) throw uploadError;
       return await sendHostedLink();
     }
   } catch (error) {
-    console.error('Scheduled ZIP delivery failed:', error.message);
+    console.error('Scheduled file delivery failed:', error.message);
     job.status = 'waiting';
     saveSendJobs();
     const failure = `I couldn't deliver **${job.originalName}**. ${error.message} Press **Check progress / Get File** to retry.`;
@@ -5862,9 +5765,6 @@ client.on('interactionCreate', async (interaction) => {
         return await cmdRefund(interaction);
       case 'setup':
         return await cmdSetup(interaction);
-      case 'export':
-        await interaction.deferReply({ ephemeral: true });
-        return await cmdExport(interaction);
       case 'bot':
         await interaction.deferReply({ ephemeral: true });
         return await cmdBotAdmin(interaction);
