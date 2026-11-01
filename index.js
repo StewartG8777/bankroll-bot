@@ -4339,13 +4339,14 @@ async function cmdWipe(interaction) {
     for (const m of Object.values(monzoLedger)) if (m?.customerId) ids.add(String(m.customerId));
     for (const d of Object.values(downloads)) if (!d?.backupDownload && d?.customerId) ids.add(String(d.customerId));
     for (const h of downloadHistory) if (h?.customerId) ids.add(String(h.customerId));
+    for (const h of Object.values(monzoReviewState.reviewed || {})) if (h?.customerId) ids.add(String(h.customerId));
     try {
       const all = await stripe.paymentIntents.list({ limit: 100 }).autoPagingToArray({ limit: 5000 });
       for (const pi of all) if (pi.metadata?.agent_id && pi.metadata?.customer_id) ids.add(String(pi.metadata.customer_id));
     } catch (e) { console.error('Could not list Stripe payments for wipe:', e.message); }
   }
   const id = user ? String(user.id) : 'ALL';
-  let monzoCount = 0, deliveryCount = 0, downloadCount = 0, historyCount = 0, logCount = 0;
+  let monzoCount = 0, deliveryCount = 0, downloadCount = 0, historyCount = 0, logCount = 0, reviewCount = 0;
   const removedDeliveryKeys = Object.entries(deliveries).filter(([, d]) => ids.has(String(d?.customerId || ''))).map(([key]) => key);
   const removedDownloadTokens = Object.entries(downloads).filter(([, d]) => !d?.backupDownload && ids.has(String(d?.customerId || ''))).map(([token]) => token);
   const removedDownloadPaths = removedDownloadTokens.map((token) => downloads[token]?.path).filter(Boolean);
@@ -4373,6 +4374,12 @@ async function cmdWipe(interaction) {
   const oldHistoryLength = downloadHistory.length;
   downloadHistory = downloadHistory.filter((entry) => !ids.has(String(entry?.customerId || '')));
   historyCount = oldHistoryLength - downloadHistory.length;
+  for (const [txId, record] of Object.entries(monzoReviewState.reviewed || {})) {
+    if (!ids.has(String(record?.customerId || ''))) continue;
+    delete monzoReviewState.reviewed[txId];
+    reviewCount++;
+  }
+  if (reviewCount) saveMonzoReview();
 
   const referencedPaths = new Set([
     ...Object.values(vault).map((v) => path.resolve(String(v?.path || ''))),
@@ -4429,6 +4436,7 @@ async function cmdWipe(interaction) {
       'Delivery/order records removed: **' + deliveryCount + '**',
       'Download links removed: **' + downloadCount + '**',
       'Download history entries removed: **' + historyCount + '**',
+      'Historical Monzo review records removed: **' + reviewCount + '**',
       'Bot-authored log messages deleted: **' + logCount + '**',
       '',
       'Their card payments are now hidden from Bankroll reports. Actual Stripe payments and Monzo bank statements remain unchanged.',
@@ -4571,7 +4579,7 @@ async function showMonzoReviewModal(interaction) {
     .setMaxLength(25);
   const category = new TextInputBuilder()
     .setCustomId('category')
-    .setLabel('Category: sale / refund / expense / personal / other')
+    .setLabel('Category: sale/refund/expense/personal/other')
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setMaxLength(20)
