@@ -7607,86 +7607,122 @@ async function cmdPaymentTest(interaction) {
   if (interaction.user.id !== OWNER_ID) {
     return interaction.reply({ content: 'Only the bot owner can run payment simulations.', ephemeral: true });
   }
-  if (!BASE_URL) {
-    return interaction.reply({
-      content: 'Payment test needs PUBLIC_URL configured so the test ZIP can use the real hosted-download route. No test invoice was created.',
-      ephemeral: true,
-    });
-  }
 
   const method = interaction.options.getSubcommand();
   const customer = interaction.options.getUser('customer', true);
   const agent = interaction.user;
   await interaction.deferReply();
-  let sourcePath = null;
-  let token = null;
+
   let testKey = null;
+  let createdPath = null;
   try {
+    const amount = Math.round(interaction.options.getNumber('amount', true) * 100) / 100;
+    const description = interaction.options.getString('description', true);
+    const currency = method === 'monzo' ? 'gbp' : (interaction.options.getString('currency') || CURRENCY).toLowerCase();
+    const file = interaction.options.getAttachment('file');
+    const vaultKey = interaction.options.getString('vault_file');
+    const linkRaw = interaction.options.getString('link');
+    const mode = interaction.options.getString('delivery') || 'direct';
+    const expiresInput = method === 'bankroll' ? interaction.options.getString('expires') : null;
+
+    if ((file && vaultKey) || (file && linkRaw) || (vaultKey && linkRaw)) {
+      throw new Error('Use only one of: attached file, vault file, or download link.');
+    }
+    if (mode === 'link' && !BASE_URL && (file || vaultKey)) {
+      throw new Error('Hosted links are not configured. Add PUBLIC_URL to Render or choose Direct file upload.');
+    }
+
+    let expiresMins = null;
+    if (expiresInput) {
+      expiresMins = parseExpiresToMinutes(expiresInput);
+      if (!expiresMins || expiresMins < 1 || expiresMins > 30 * 24 * 60) {
+        throw new Error('Invalid expiry. Use something like 30m, 2h, 24h, or 7d.');
+      }
+    }
+
+    let externalLink = null;
+    if (linkRaw) {
+      try {
+        const u = new URL(linkRaw.trim());
+        if (!/^https?:$/.test(u.protocol)) throw new Error();
+        externalLink = u.href;
+      } catch {
+        throw new Error('That link is invalid. It must start with http:// or https://.');
+      }
+    }
+
+    let fileData = null;
+    if (file) {
+      fileData = await downloadAttachment(file, mode === 'link');
+    } else if (vaultKey) {
+      const item = vault[vaultKey];
+      if (!item || !item.path || !fs.existsSync(item.path)) throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
+      fileData = { path: item.path, temp: false, name: item.originalName, size: item.size, sha256: item.sha256 };
+    }
+
+    if (fileData && !BASE_URL && mode !== 'link' && fs.statSync(fileData.path).size > MAX_FILE_BYTES) {
+      throw new Error('This file is too large for a direct Discord attachment, and PUBLIC_URL is not configured for the download-link fallback.');
+    }
+
     const testId = crypto.randomBytes(5).toString('hex').toUpperCase();
-    const fileName = 'Bankroll_' + method.toUpperCase() + '_TEST.zip';
-    sourcePath = path.join(FILES_DIR, 'bankroll_test_source_' + testId + '.zip');
-    const testZip = new AdmZip();
-    testZip.addFile('BANKROLL_TEST.txt', Buffer.from(
-      'Bankroll ' + method.toUpperCase() + ' delivery test\\nTest ID: ' + testId + '\\nThis is a fake test file. No payment was taken.\\n',
-      'utf8'
-    ));
-    testZip.writeZip(sourcePath);
-
-    const testUrl = await makeDownloadLink({
-      path: sourcePath,
-      name: fileName,
-      customerId: customer.id,
-      agentId: agent.id,
-      description: 'test-' + method,
-      testMode: true,
-    }, null);
-    token = testUrl.split('/').pop();
-    try { fs.unlinkSync(sourcePath); } catch {}
-    sourcePath = null;
-
-    const amount = 1.23;
-    const description = 'Bankroll payment and download delivery test';
-    const reference = 'TEST-' + method.toUpperCase() + '-' + testId;
     testKey = (method === 'monzo' ? 'monzo_test_' : 'stripe_test_') + testId.toLowerCase();
-    const expiresAt = method === 'monzo' ? Date.now() + MONZO_OPEN_MS : Math.floor(Date.now() / 1000) + 24 * 60 * 60;
-    const where = whereFrom(interaction, customer);
+    const reference = 'TEST-' + method.toUpperCase() + '-' + testId;
+    const expiresAt = method === 'monzo'
+      ? Date.now() + MONZO_OPEN_MS
+      : (expiresMins ? Math.floor(Date.now() / 1000) + expiresMins * 60 : null);
 
-    // Keep the real invoice layout and fields. Only the payment action is
-    // replaced with a test-only button that simulates the payment confirmation.
+    if (fileData) {
+      saveDelivery(testKey, fileData, interaction, customer);
+      createdPath = deliveries[testKey]?.path || null;
+      if (vaultKey) deliveries[testKey].vaultKey = vaultKey;
+    } else if (externalLink) {
+      saveLinkDelivery(testKey, externalLink, interaction, customer);
+    } else {
+      deliveries[testKey] = {
+        name: description,
+        description,
+        channelId: interaction.channelId,
+        customerId: customer.id,
+        agentId: agent.id,
+        savedAt: Date.now(),
+      };
+    }
+
+    Object.assign(deliveries[testKey], {
+      type: method === 'monzo' ? 'monzo' : 'stripe',
+      paid: false,
+      paymentConfirmed: false,
+      amount,
+      currency,
+      reference,
+      txId: reference,
+      testMode: true,
+      testMethod: method,
+    });
+    saveDeliveries();
+
+    const where = whereFrom(interaction, customer);
+    const fileLabel = fileData?.name || (externalLink ? 'External download link' : 'No file attached');
     const embed = new EmbedBuilder()
       .setColor(GREEN)
-      .setTitle(method === 'monzo' ? 'Bankroll Monzo Invoice Created' : 'Bankroll Invoice Created')
-      .setDescription(method === 'monzo'
-        ? 'Awaiting payment. Pay the exact amount below and include the reference.'
-        : 'Please use the link below to complete your purchase.')
+      .setTitle(method === 'monzo' ? 'Bankroll Monzo Test Invoice' : 'Bankroll Card Test Invoice')
+      .setDescription('TEST MODE — no real payment will be taken. The owner can simulate payment using the button below.')
       .addFields(
-        { name: 'Sales Agent', value: `<@${agent.id}>` },
-        { name: 'Customer', value: `<@${customer.id}>` },
-        { name: 'Amount', value: money(amount, method === 'monzo' ? 'gbp' : CURRENCY), ...(method === 'monzo' ? { inline: true } : {}) }
+        { name: 'Sales Agent', value: `<@${agent.id}>`, inline: true },
+        { name: 'Customer', value: `<@${customer.id}>`, inline: true },
+        { name: 'Amount', value: money(amount, currency), inline: true },
+        { name: 'Description', value: description }
       );
-
-    if (method === 'monzo') {
-      embed.addFields(
-        { name: 'Payment reference', value: `\`${reference}\``, inline: true },
-        { name: 'Description', value: description },
-        { name: 'Pay by', value: `<t:${tsec(expiresAt)}:R>` }
-      );
-      if (MONZO_PAYMENT_DETAILS) embed.addFields({ name: 'Pay to', value: MONZO_PAYMENT_DETAILS.replace(/\\n/g, '\n') });
-    } else {
-      embed.addFields({ name: 'Description', value: description });
-      embed.addFields({ name: 'Pay by', value: `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
-    }
-    embed.addFields({ name: 'File', value: `${fileName} (posted as a reply to this invoice as soon as payment lands)` });
+    if (method === 'monzo') embed.addFields({ name: 'Payment reference', value: `\`${reference}\``, inline: true });
+    if (expiresAt) embed.addFields({ name: 'Pay by', value: method === 'monzo' ? `<t:${tsec(expiresAt)}:R>` : `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
+    if (fileData || externalLink) embed.addFields({ name: 'File / delivery', value: `${fileLabel} — ${mode === 'link' ? 'hosted link' : 'direct attachment first; hosted link if Discord rejects the file'}` });
     embed.addFields(
       { name: 'Generated In Guild', value: where.guild },
       { name: 'Generated In Channel', value: where.channel }
     ).setFooter({ text: `Created by ${agent.username} | ID: ${testKey} | TEST MODE` });
 
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('testpaid:' + testKey)
-        .setLabel('Mark as Paid (TEST)')
-        .setStyle(ButtonStyle.Success)
+      new ButtonBuilder().setCustomId('testpaid:' + testKey).setLabel('Mark as Paid (TEST)').setStyle(ButtonStyle.Success)
     );
     const invoiceMessage = await interaction.editReply({
       content: `<@${customer.id}>`,
@@ -7694,81 +7730,41 @@ async function cmdPaymentTest(interaction) {
       components: [row],
       allowedMentions: { parse: [] },
     });
-
-    deliveries[testKey] = {
-      link: testUrl,
-      name: fileName,
-      description,
-      channelId: interaction.channelId,
-      msgId: invoiceMessage.id,
-      msgChannelId: invoiceMessage.channelId,
-      customerId: customer.id,
-      agentId: agent.id,
-      savedAt: Date.now(),
-      type: method === 'monzo' ? 'monzo' : 'stripe',
-      paid: false,
-      paymentConfirmed: false,
-      amount,
-      currency: method === 'monzo' ? 'gbp' : CURRENCY,
-      reference,
-      txId: reference,
-      testMode: true,
-    };
+    deliveries[testKey].msgId = invoiceMessage.id;
+    deliveries[testKey].msgChannelId = invoiceMessage.channelId;
     saveDeliveries();
 
     if (method === 'monzo') {
       monzoLedger[testKey] = {
-        key: testKey,
-        status: 'open',
-        customerId: customer.id,
-        agentId: agent.id,
-        amount,
-        currency: 'gbp',
-        description,
-        reference,
-        createdAt: Date.now(),
-        expiresAt,
-        channelId: interaction.channelId,
-        fileName,
-        msgUrl: invoiceMessage.url,
-        testMode: true,
+        key: testKey, status: 'open', customerId: customer.id, agentId: agent.id,
+        amount, currency: 'gbp', description, reference, createdAt: Date.now(),
+        expiresAt, channelId: interaction.channelId, fileName: fileLabel,
+        msgUrl: invoiceMessage.url, testMode: true,
       };
       saveMonzo();
     }
 
     liveInteractions.set(testKey, { interaction, at: Date.now() });
     setTimeout(() => liveInteractions.delete(testKey), 14 * 60 * 1000);
-    recordNotification('test.invoice_created', 'Test invoice created', method + ' test invoice ' + testKey + ' created for customer ' + customer.id + '.', 'success');
     recordDownloadEvent('test_invoice_created', {
-      file: fileName,
-      customerId: customer.id,
-      agentId: agent.id,
-      token,
-      detail: 'Test invoice mirrors the real invoice layout. Payment awaits the owner clicking Mark as Paid (TEST).',
+      file: fileLabel, customerId: customer.id, agentId: agent.id,
+      detail: 'Test invoice created using the real invoice file, vault, link, amount, description and delivery options.',
     });
     return interaction.followUp({
-      content: 'Test invoice posted. Click **Mark as Paid (TEST)** on the invoice when you are ready to simulate payment. This will run the normal paid-invoice reply, download delivery and owner notification flow. No real payment is taken.',
+      content: 'Test invoice posted. Click **Mark as Paid (TEST)** to simulate payment. The selected vault file or attachment will be delivered as a reply to this invoice; if Discord rejects the attachment, Bankroll will use a hosted Download button. No real payment is taken.',
       ephemeral: true,
     });
   } catch (err) {
     if (testKey && deliveries[testKey]) {
       deliveries[testKey].deliveryError = String(err.message || err).slice(0, 300);
       saveDeliveries();
+    } else if (createdPath) {
+      try { fs.unlinkSync(createdPath); } catch {}
     }
-    if (token && downloads[token] && !deliveries[testKey]?.deliveryComplete) {
-      try { fs.unlinkSync(downloads[token].path); } catch {}
-      delete downloads[token];
-      saveDownloads();
-    }
-    if (sourcePath) { try { fs.unlinkSync(sourcePath); } catch {} }
     console.error('Payment test failed:', err);
-    if (interaction.deferred || interaction.replied) {
-      return interaction.followUp({ content: 'Payment test failed: ' + err.message, ephemeral: true }).catch(() => {});
-    }
-    return interaction.reply({ content: 'Payment test failed: ' + err.message, ephemeral: true });
+    return interaction.followUp({ content: 'Payment test failed: ' + err.message, ephemeral: true }).catch(() => {});
   }
 }
-
 async function cmdNotifications(interaction) {
   const sub = interaction.options.getSubcommand();
   if (sub === 'test') {
