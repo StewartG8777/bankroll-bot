@@ -367,6 +367,7 @@ function restorePendingDeliveryRetries() {
   let count = 0;
   for (const [key,d] of Object.entries(deliveries)) {
     if (!d || d.deliveryComplete || !(d.paymentConfirmed || d.paid)) continue;
+    startDeliveryWatch(key);
     if (scheduleDeliveryRetry(key, d.paymentIntentId || null, Math.max(1000, Number(d.nextDeliveryRetryAt || Date.now()) - Date.now()))) count++;
   }
   if (count) console.log(`Restored ${count} pending paid-delivery retry(s).`);
