@@ -4789,15 +4789,50 @@ async function cmdMonzoReview(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can review historical Monzo transactions.');
   const period = interaction.options.getString('period') || 'last_month';
   const transactions = (await fetchMonzoReviewTransactions(period)).filter((tx) => Number(tx.amount) > 0);
+  let recoveredFromLedger = 0;
   for (const tx of transactions) {
     if (!monzoReviewState.transactions[tx.id]) monzoReviewState.transactions[tx.id] = tx;
+
+    // A completed review also creates a paid monzo_import_<transaction id>
+    // entry in monzo_payments.json. Rebuild missing review metadata from that
+    // durable financial record so the review screen cannot show 0 reviewed
+    // when the corresponding sale is already saved in the ledger.
+    if (!monzoReviewState.reviewed[tx.id]) {
+      const ledger = monzoLedger['monzo_import_' + tx.id] ||
+        Object.values(monzoLedger).find((entry) => entry?.txId === tx.id && entry?.imported && entry?.status === 'paid');
+      if (ledger && ledger.status === 'paid' && ledger.imported) {
+        const dateMs = Number(ledger.paidAt || ledger.createdAt || Date.parse(tx.created || tx.settled || '') || Date.now());
+        monzoReviewState.reviewed[tx.id] = {
+          transactionId: tx.id,
+          amount: Number(ledger.amount || Number(tx.amount || 0) / 100),
+          currency: String(ledger.currency || tx.currency || 'gbp').toLowerCase(),
+          transactionDescription: String(ledger.originalDescription || tx.description || ''),
+          counterparty: String(ledger.counterparty || tx.counterparty?.name || tx.merchant?.name || ''),
+          sold: String(ledger.description || tx.description || 'Historical Monzo sale'),
+          category: 'sale',
+          customerId: String(ledger.customerId || ''),
+          agentId: String(ledger.agentId || OWNER_ID),
+          createdAt: Number(ledger.createdAt || dateMs),
+          settledAt: Number(ledger.paidAt || dateMs),
+          transactionDate: new Date(dateMs).toISOString().slice(0, 10),
+          reviewedAt: Number(ledger.importedAt || ledger.paidAt || dateMs),
+          reviewedBy: OWNER_ID,
+          recoveredFromLedger: true,
+        };
+        recoveredFromLedger++;
+      }
+    }
   }
   saveMonzoReview();
+  if (recoveredFromLedger) {
+    console.log('Recovered ' + recoveredFromLedger + ' Monzo review record(s) from existing paid financial ledger entries.');
+  }
   const reviewedCount = transactions.filter((tx) => !!monzoReviewState.reviewed[tx.id]).length;
   const payload = monzoReviewPayload(0, period);
   payload.embeds[0].addFields(
     { name: 'Transactions fetched this run', value: String(transactions.length), inline: true },
-    { name: 'Already reviewed', value: String(reviewedCount), inline: true }
+    { name: 'Already reviewed', value: String(reviewedCount), inline: true },
+    { name: 'Recovered from financial records', value: String(recoveredFromLedger), inline: true }
   );
   return interaction.editReply(payload);
 }
