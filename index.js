@@ -4620,10 +4620,7 @@ async function saveMonzoReviewModal(interaction) {
     return interaction.reply({ content: 'Enter a valid transaction date in YYYY-MM-DD format.', ephemeral: true });
   }
   if (!/^\d{17,20}$/.test(customerId)) {
-    return interaction.reply({ content: 'A sale needs a valid customer Discord ID (17–20 digits). Nothing has been saved yet.', ephemeral: true });
-  }
-  if (!/^\d{17,20}$/.test(customerId)) {
-    return interaction.reply({ content: 'Enter a valid customer Discord ID (17–20 digits).', ephemeral: true });
+    return interaction.reply({ content: 'Enter a valid customer Discord ID (17–20 digits). Nothing has been saved yet.', ephemeral: true });
   }
   if (Number(tx.amount) <= 0) {
     return interaction.reply({ content: 'Only incoming Monzo transactions are included as sales.', ephemeral: true });
