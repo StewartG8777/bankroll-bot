@@ -2047,14 +2047,30 @@ const onReady = async () => {
 
   backfillMonzoLedger();
   const monzoRebuilt = restoreMonzoReminders();
-  restoreReminders().then((n) => {
+  restoreReminders().then(async (n) => {
     const total = n + monzoRebuilt;
     console.log(`Startup recovery complete. Reminders rebuilt: ${total}.${recoveryNote}`);
-    // Avoid a routine owner DM on every restart. Only DM when a real recovery problem needs attention.
-    if (recoveryInfo?.lost?.length || /Backup restore failed/i.test(recoveryNote)) {
-      return notifyOwner({ content: `Bankroll startup recovery needs attention. Reminders rebuilt: ${total}.${recoveryNote}` }, { log: false });
-    }
-  }).catch((error) => console.error('Could not restore reminders:', error.message));
+    const deployedCommit = process.env.RENDER_GIT_COMMIT || process.env.GITHUB_SHA || process.env.SOURCE_VERSION || 'Not supplied by hosting platform';
+    const hasRecoveryIssue = !!recoveryInfo?.lost?.length || /Backup restore failed/i.test(recoveryNote);
+    const startupEmbed = new EmbedBuilder()
+      .setColor(hasRecoveryIssue ? RED : GREEN)
+      .setTitle(hasRecoveryIssue ? 'Bankroll online — recovery needs attention' : 'Bankroll is back online')
+      .setDescription('The bot has connected to Discord and completed its startup recovery.')
+      .addFields(
+        { name: 'Deployed commit', value: String(deployedCommit).slice(0, 100), inline: false },
+        { name: 'Reminders rebuilt', value: String(total), inline: true },
+        { name: 'Backup recovery', value: short(recoveryNote.trim() || 'No recovery details reported.', 900), inline: false }
+      )
+      .setTimestamp();
+    await notifyOwner({ embeds: [startupEmbed] }, {
+      log: false,
+      notificationType: 'system.startup',
+      notificationStatus: hasRecoveryIssue ? 'error' : 'success'
+    });
+  }).catch(async (error) => {
+    console.error('Could not restore reminders:', error.message);
+    await alertOwner('Startup reminder recovery failed', error);
+  });
   setTimeout(backupData, 2 * 60 * 1000);
   setInterval(backupData, 6 * 60 * 60 * 1000);
   setInterval(async () => {
@@ -4807,6 +4823,7 @@ async function handleSpamConsent(interaction) {
   const session = {
     ownerId: request.ownerId,
     sourceMessage: interaction.message,
+    interactionWebhook: interaction.webhook,
     message: request.message,
     endAt: Date.now() + request.durationMinutes * 60000,
     intervalMs: 1000,
@@ -4836,19 +4853,19 @@ async function handleSpamConsent(interaction) {
       return;
     }
     try {
-      // First try to post as a reply to the setup embed.
+      const messagePayload = { content: session.message, allowedMentions: { parse: [] } };
+      // Prefer a real reply. User-installed apps may not have channel Send Messages
+      // permission, so fall back to the interaction webhook, which can send follow-ups.
       try {
-        await session.sourceMessage.reply({
-          content: session.message,
-          allowedMentions: { parse: [] }
-        });
+        await session.sourceMessage.reply(messagePayload);
       } catch (replyError) {
-        // If Discord rejects the reply reference, still deliver the message in the channel.
-        console.warn('Spam reply failed; trying a normal channel message:', replyError.message);
-        await session.sourceMessage.channel.send({
-          content: session.message,
-          allowedMentions: { parse: [] }
-        });
+        console.warn('Spam reply failed; trying channel send:', replyError.message);
+        try {
+          await session.sourceMessage.channel.send(messagePayload);
+        } catch (channelError) {
+          console.warn('Spam channel send failed; trying interaction follow-up:', channelError.message);
+          await session.interactionWebhook.send(messagePayload);
+        }
       }
       session.sent += 1;
     } catch (error) {
