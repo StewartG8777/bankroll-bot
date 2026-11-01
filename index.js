@@ -1050,7 +1050,7 @@ async function updateInvoicePaidMessage(d, key, paymentIntentId = null) {
     );
   const rows = [];
   // Once payment is confirmed, remove the old Download ZIP interaction button.
-  // The customer receives one delivery message with the actual secure download link.
+  // The paid status is shown on the invoice; the actual download is posted as a reply to that invoice.
   for (const row of invoice.components || []) {
     const kept = (row.components || []).filter((component) =>
       component.customId && !String(component.customId).startsWith('getfile:')
@@ -1162,55 +1162,51 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
 
   let sentTo = null;
   let msgUrl = null;
-  let reachedCustomer = false;
+  let invoiceReply = null;
 
-  // Paid files must be delivered directly to the customer, not posted as a
-  // reply in the seller's DM/channel where the invoice was created.
+  // Keep the paid notification and download attached to the original invoice.
+  // This works in the invoice's original server channel or DM and does not require
+  // the bot and customer to share a server or allow customer DMs.
   try {
-    if (!d.customerId) throw new Error('This order has no saved customer ID.');
-    const customer = await client.users.fetch(d.customerId);
-    const msg = await sendWithFallback((p) => customer.send({
+    const invoice = await getInvoiceMessage(d, key);
+    if (!invoice) throw new Error('The original invoice message could not be found.');
+    invoiceReply = await sendWithFallback((p) => invoice.reply({
       ...p,
       content: noFile
-        ? 'Your payment has been confirmed. Thank you!'
+        ? 'Payment received — thank you!'
         : dlink
-          ? `Your payment has been confirmed. Your complete ${isZip ? 'ZIP' : 'file'} is ready. The secure download link works once and has no time expiry.`
-          : 'Your payment has been confirmed. Your complete file is attached below.',
+          ? `Payment received — your complete ${isZip ? 'ZIP' : 'file'} is ready to download below.`
+          : 'Payment received — your complete file is attached below.',
       allowedMentions: { parse: [] },
+      failIfNotExists: true,
     }));
-    msgUrl = msg.url || null;
-    reachedCustomer = true;
-    sentTo = "the customer's direct messages";
+    msgUrl = invoiceReply.url || null;
+    sentTo = 'a reply to the original invoice';
   } catch (e) {
-    console.error(`Could not DM customer ${d.customerId || 'unknown'} for paid order ${key}:`, e);
-    d.deliveryError = `Could not DM customer: ${String(e.message || e).slice(0, 300)}`;
+    console.error(`Could not reply to invoice for paid order ${key}:`, e);
+    d.deliveryError = `Could not reply to original invoice: ${String(e.message || e).slice(0, 300)}`;
     d.paid = true;
     d.paymentConfirmed = true;
     saveDeliveries();
-    if (owner) {
-      await owner.send(
-        `Payment was confirmed for **${d.name}**, but I could not DM the customer <@${d.customerId || 'unknown'}>. Their privacy settings may block DMs. The paid order is saved; use /delivery resend after the customer allows DMs.`
-      ).catch(() => {});
-    }
+    if (owner) await owner.send(`Payment was confirmed for **${d.name}**, but I could not post the download as a reply to invoice ${key}. The paid order is saved and automatic retries will continue.`).catch(() => {});
   }
 
   if (sentTo) {
-    if (!reachedCustomer) {
-      d.paid = true;
-      saveDeliveries();
-    } else {
-      d.deliveryComplete = true;
-      d.deliveredAt = Date.now();
-      d.deliveryMessageUrl = msgUrl || null;
-      d.deliveryMethod = sentTo;
-      delete d.deliveryError;
-      saveDeliveries();
-    }
+    d.deliveryComplete = true;
+    d.deliveredAt = Date.now();
+    d.deliveryMessageUrl = msgUrl || null;
+    d.deliveryMethod = sentTo;
+    delete d.deliveryError;
+    saveDeliveries();
+  } else {
+    if (d.deliveryAttempts == null) d.deliveryAttempts = 0;
+    scheduleDeliveryRetry(key, paymentIntentId);
+    return false;
   }
 
-  if (reachedCustomer) {
+  if (sentTo) {
     const retryTimer = deliveryRetryTimers.get(key); if (retryTimer) clearTimeout(retryTimer); deliveryRetryTimers.delete(key);
-    recordDownloadEvent('delivery_sent', { file: d.name, customerId: d.customerId, agentId: d.agentId, detail: `Payment delivery message sent via ${sentTo}.` });
+    recordDownloadEvent('delivery_sent', { file: d.name, customerId: d.customerId, agentId: d.agentId, detail: `Payment delivery posted as ${sentTo}.` });
     if (paymentIntentId) {
       await recordInStripe(paymentIntentId, {
         delivered_at: new Date().toISOString(),
@@ -1219,12 +1215,8 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
         delivery_message: msgUrl || '',
       });
     }
-    if (force) await notifyOwner({ content: `Manual resend completed for **${d.name}** to <@${d.customerId}>. The original payment was not charged again.` });
-    else await notifyOwner({ content: `Payment received. The ${/\\.zip$/i.test(String(d.name || '')) ? 'ZIP' : 'file'} was delivered successfully to <@${d.customerId}>.` });
-  } else {
-    if (!sentTo && owner) await owner.send(`I could not deliver "${d.name}" to <@${d.customerId}>. The paid delivery is saved and automatic retries will continue.`).catch(() => {});
-    if (d.deliveryAttempts == null) d.deliveryAttempts = 0;
-    scheduleDeliveryRetry(key, paymentIntentId);
+    if (force) await notifyOwner({ content: `Manual resend completed for **${d.name}** as a reply to the original invoice. The original payment was not charged again.` });
+    else await notifyOwner({ content: `Payment received. The ${/\\.zip$/i.test(String(d.name || '')) ? 'ZIP' : 'file'} was posted as a reply to the original invoice.` });
   }
 }
 
@@ -2643,8 +2635,8 @@ async function sendMonzoInvoice(interaction) {
       );
     embed.addFields({ name: 'Pay by', value: `<t:${tsec(monzoLedger[key].expiresAt)}:R>` });
     if (MONZO_PAYMENT_DETAILS) embed.addFields({ name: 'Pay to', value: MONZO_PAYMENT_DETAILS.replace(/\\n/g, '\n') });
-    if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (sent to the customer by DM as soon as payment lands)` });
-    if (linkUrl) embed.addFields({ name: 'Download', value: 'Download link sent to the customer by DM as soon as payment lands' });
+    if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (posted as a reply to this invoice as soon as payment lands)` });
+    if (linkUrl) embed.addFields({ name: 'Download', value: 'Download link posted as a reply to this invoice as soon as payment lands' });
     embed
       .addFields(
         { name: 'Generated In Guild', value: where.guild },
