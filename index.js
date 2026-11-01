@@ -3377,7 +3377,6 @@ async function cmdPaymentTest(interaction) {
     sourcePath = null;
 
     const owner = await client.users.fetch(OWNER_ID);
-    const customer = await client.users.fetch(selectedCustomer.id);
     const paidAt = Date.now();
     const reference = 'TEST-' + method.toUpperCase() + '-' + testId;
     const methodLabel = method === 'monzo' ? 'Monzo' : 'Bankroll card';
@@ -3406,24 +3405,25 @@ async function cmdPaymentTest(interaction) {
     });
     recordNotification('test.delivery_ready', 'Test delivery confirmation sent', fileName + ' seller confirmation sent for customer ' + selectedCustomer.id + '.', 'success');
 
-    // Customer-side delivery goes only to the selected customer.
+    // Customer-facing test delivery is posted in the command channel, never by DM.
     const download = downloads[token];
     const customerEmbed = new EmbedBuilder()
       .setColor(GREEN)
-      .setTitle('[TEST] Payment received')
-      .setDescription('Your simulated payment was successful. Your test ZIP is ready to download.')
+      .setTitle('[TEST] PAID — Download ready')
+      .setDescription('Simulated payment successful. The test ZIP is ready below.')
       .addFields(
+        { name: 'Customer', value: '<@' + selectedCustomer.id + '>', inline: true },
         { name: 'File', value: fileName, inline: true },
         { name: 'Amount', value: money(1.23, 'gbp'), inline: true },
         { name: 'Reference', value: reference }
       )
       .setFooter({ text: 'TEST MODE • No real payment was taken' })
       .setTimestamp();
-    await customer.send({
-      content: 'Your Bankroll test payment is confirmed. Your ZIP is ready below.',
+    const testDeliveryMessage = await interaction.channel.send({
+      content: '<@' + selectedCustomer.id + '> [TEST] Payment received — your ZIP is ready to download below.',
       embeds: [customerEmbed, buildDownloadEmbed(fileName, download?.expiresAt, fs.statSync(download.path).size)],
       components: [downloadLinkRow(testUrl, 'Download Test ZIP')],
-      allowedMentions: { parse: [] },
+      allowedMentions: { users: [selectedCustomer.id] },
     });
 
     recordDownloadEvent('test_payment_simulated', {
@@ -3431,14 +3431,14 @@ async function cmdPaymentTest(interaction) {
       customerId: selectedCustomer.id,
       agentId: OWNER_ID,
       token: token,
-      detail: 'Simulated ' + method + ' payment and customer DM delivery to ' + selectedCustomer.id + '. No live invoice, Stripe payment, Monzo transaction, delivery record or vault item was created.',
+      detail: 'Simulated ' + method + ' payment and posted the test ZIP download button in the command channel (message ' + testDeliveryMessage.id + '). No customer DM, live invoice, Stripe payment, Monzo transaction, delivery record or vault item was created.',
     });
 
     return interaction.editReply(
       'Test started for **' + methodLabel + '**.\\n' +
-      '• Seller PAID and delivery-confirmation DMs sent to you.\\n' +
-      '• Customer delivery DM sent to <@' + selectedCustomer.id + '>.\\n' +
-      '• The customer received a one-time test ZIP download button.\\n' +
+      '• Seller PAID notification sent to you.\\n' +
+      '• Test PAID confirmation and download button posted in this channel for <@' + selectedCustomer.id + '>.\\n' +
+      '• No customer DM was sent.\\n' +
       'No real payment was taken and no live invoice or vault data was changed.'
     );
   } catch (err) {
