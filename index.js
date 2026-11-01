@@ -1174,7 +1174,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   if (paymentIntentId) d.paymentIntentId = paymentIntentId;
   saveDeliveries();
   startDeliveryWatch(key);
-  await updateInvoicePaidMessage(d, key, paymentIntentId);
+  // The original invoice message is left untouched; the delivery is posted as a reply under it.
   if (!wasPaymentConfirmed) {
     await notifyOwner({
       embeds: [new EmbedBuilder().setColor(GREEN).setTitle(d.testMode ? '[TEST] Payment confirmed' : 'Payment confirmed')
@@ -4728,7 +4728,7 @@ async function onGetFile(interaction) {
   d.paymentConfirmedAt = d.paymentConfirmedAt || d.paidAt;
   if (checkPi) d.paymentIntentId = checkPi;
   saveDeliveries();
-  await updateInvoicePaidMessage(d, key, checkPi);
+  // The original invoice message is left untouched.
 
   let dlink = d.link || null;
   let hosted = false;
