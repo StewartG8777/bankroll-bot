@@ -1228,6 +1228,12 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
 
   const isZip = /\.zip$/i.test(String(d.name || ''));
   const deliverySize = d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined;
+  // When the file is attached directly, also include a one-time download link next to it.
+  let attachLink = null;
+  if (!noFile && !dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
+    try { attachLink = await makeDownloadLink(d, paymentIntentId); d.fallbackLink = attachLink; saveDeliveries(); }
+    catch (linkErr) { console.error('Could not make one-time link to send beside the attachment:', linkErr.message); }
+  }
   const payload = () => {
     if (noFile) return { content: `<@${d.customerId}> payment received. Thank you!`, allowedMentions: { parse: [] } };
     if (dlink) {
@@ -1242,6 +1248,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
       content: `<@${d.customerId}> payment received. Your complete file is attached below.`,
       embeds: [buildCustomerDeliveryEmbed(d.name, deliverySize)],
       files: [new AttachmentBuilder(d.path, { name: path.basename(d.name || 'download.zip') })],
+      ...(attachLink ? { components: [downloadLinkRow(attachLink, isZip ? 'Download ZIP' : 'Download File')] } : {}),
       allowedMentions: { parse: [] },
     };
   };
@@ -1251,7 +1258,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
       return await send(payload());
     } catch (attachmentError) {
       if (noFile || dlink || !BASE_URL || !d.path || !fs.existsSync(d.path)) throw attachmentError;
-      dlink = await makeDownloadLink(d, paymentIntentId);
+      dlink = attachLink || await makeDownloadLink(d, paymentIntentId);
       hosted = true;
       d.fallbackLink = dlink;
       saveDeliveries();
@@ -4796,6 +4803,12 @@ async function onGetFile(interaction) {
 
   await interaction.deferUpdate();
   const isZip = /\.zip$/i.test(String(d.name || ''));
+  // Attached file: also include a one-time download link next to it.
+  let attachLink = null;
+  if (!dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
+    try { attachLink = await makeDownloadLink(d, checkPi); d.fallbackLink = attachLink; saveDeliveries(); }
+    catch (linkErr) { console.error('Could not make one-time link to send beside the attachment:', linkErr.message); }
+  }
   const getPayload = () => dlink
     ? {
         content: `<@${d.customerId}> here is your secure download. The link works once and has no time expiry.`,
@@ -4807,6 +4820,7 @@ async function onGetFile(interaction) {
         content: `<@${d.customerId}> here is your complete file.`,
         embeds: [buildDownloadEmbed(d.name, null, d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined)],
         files: [new AttachmentBuilder(d.path, { name: path.basename(d.name || 'download.zip') })],
+        ...(attachLink ? { components: [downloadLinkRow(attachLink, isZip ? 'Download ZIP' : 'Download File')] } : {}),
         allowedMentions: { parse: [] },
       };
 
@@ -4819,7 +4833,7 @@ async function onGetFile(interaction) {
       return interaction.followUp({ content: `Discord could not send the file (${short(attachmentError.message, 180)}). Your paid file is still saved; please contact the seller.`, ephemeral: true });
     }
     try {
-      dlink = await makeDownloadLink(d, checkPi);
+      dlink = attachLink || await makeDownloadLink(d, checkPi);
       hosted = true;
       d.fallbackLink = dlink;
       saveDeliveries();
