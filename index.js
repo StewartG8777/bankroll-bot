@@ -512,11 +512,11 @@ function applyMonzoReviewCustomerIds() {
 
   const sales = Object.entries(monzoReviewState.reviewed || {})
     .filter(([txId, record]) => record?.category === 'sale' && monzoReviewState.transactions?.[txId]?.id)
-    .sort(([aId], [bId]) => {
-      const aAt = Date.parse(monzoReviewState.transactions[aId]?.created || monzoReviewState.transactions[aId]?.settled || 0);
-      const bAt = Date.parse(monzoReviewState.transactions[bId]?.created || monzoReviewState.transactions[bId]?.settled || 0);
-      return bAt - aAt || String(bId).localeCompare(String(aId));
-    });
+    // Match the user's supplied sequence to review order: last reviewed first.
+    .sort(([aId, aRecord], [bId, bRecord]) =>
+      Number(bRecord?.reviewedAt || 0) - Number(aRecord?.reviewedAt || 0) ||
+      String(bId).localeCompare(String(aId))
+    );
 
   if (sales.length !== order.length) {
     console.warn('Monzo customer ID import not applied: expected exactly ' + order.length + ' reviewed sales for the supplied numbered mapping, found ' + sales.length + '. No records were changed.');
