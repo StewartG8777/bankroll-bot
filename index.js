@@ -1708,6 +1708,12 @@ const monzoReviewCmd = common(
     )
 );
 
+const monzoRebuildCmd = common(
+  new SlashCommandBuilder()
+    .setName('monzo-rebuild')
+    .setDescription('Rebuild the 15 historical Monzo sales and customer links from Monzo (owner only)')
+);
+
 const vaultCmd = common(
   new SlashCommandBuilder()
     .setName('vault')
@@ -1991,7 +1997,7 @@ const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription(
   .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' }))
   .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records')));
 
-const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, monzoRebuildCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 let started = false;
 async function autoRestoreOnStartup() {
@@ -4759,6 +4765,47 @@ async function fetchMonzoReviewTransactions(period = 'last_month') {
   return [...found.values()].sort((a, b) => Date.parse(a.created || a.settled || 0) - Date.parse(b.created || b.settled || 0));
 }
 
+async function cmdMonzoRebuild(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can rebuild historical Monzo sales.');
+  if (!MONZO_ACCESS_TOKEN || !MONZO_ACCOUNT_ID) return interaction.editReply('Monzo history access is not configured. Set MONZO_ACCESS_TOKEN and MONZO_ACCOUNT_ID in Render.');
+  const [lastMonth, thisMonth] = await Promise.all([fetchMonzoReviewTransactions('last_month'), fetchMonzoReviewTransactions('month')]);
+  const byId = new Map();
+  for (const tx of [...lastMonth, ...thisMonth]) if (tx && tx.id && Number(tx.amount) > 0) byId.set(tx.id, tx);
+  const candidates = [...byId.values()].sort((a, b) => Date.parse(b.created || b.settled || 0) - Date.parse(a.created || a.settled || 0));
+  if (candidates.length !== 15) {
+    const preview = candidates.slice(0, 15).map((tx, i) => {
+      const date = new Date(tx.created || tx.settled || 0).toLocaleDateString('en-GB');
+      const amount = money(Number(tx.amount || 0) / 100, String(tx.currency || 'GBP').toLowerCase());
+      return (i + 1) + '. ' + date + ' — ' + amount + ' — ' + short(String(tx.description || tx.counterparty?.name || 'Monzo transaction'), 65);
+    });
+    return interaction.editReply({ content: '**No records were changed.** Monzo returned **' + candidates.length + '** incoming transactions across this month and last month, but your customer mapping is for exactly 15. I will not assign IDs to the wrong payments.' + (preview.length ? '\n\n**Newest incoming transactions:**\n' + preview.join('\n') : ''), ephemeral: true });
+  }
+  const customerIds = MONZO_REVIEW_CUSTOMER_IDS;
+  const order = MONZO_REVIEW_CUSTOMER_ORDER_NEWEST_FIRST;
+  if (customerIds.length !== 9 || order.length !== 15 || customerIds.some((id) => !/^\d{17,20}$/.test(id)) || order.some((n) => !Number.isInteger(n) || n < 1 || n > customerIds.length)) return interaction.editReply('The saved customer ID mapping failed validation. No records were changed.');
+  const now = Date.now();
+  for (let i = 0; i < candidates.length; i++) {
+    const tx = candidates[i];
+    const customerId = customerIds[order[i] - 1];
+    const dateMs = Date.parse(tx.created || tx.settled || '');
+    if (!Number.isFinite(dateMs) || !Number.isFinite(Number(tx.amount)) || Number(tx.amount) <= 0) return interaction.editReply('Monzo returned an invalid transaction in the rebuild set. No records were changed.');
+    const amount = Number(tx.amount) / 100;
+    const currency = String(tx.currency || 'GBP').toLowerCase();
+    const description = String(tx.description || tx.counterparty?.name || 'Historical Monzo sale');
+    const key = 'monzo_import_' + tx.id;
+    const reviewedAt = now - i;
+    monzoReviewState.transactions[tx.id] = tx;
+    monzoReviewState.reviewed[tx.id] = { transactionId: tx.id, amount, currency, transactionDescription: String(tx.description || ''), counterparty: String(tx.counterparty?.name || tx.merchant?.name || ''), sold: description, category: 'sale', customerId, agentId: OWNER_ID, createdAt: dateMs, settledAt: dateMs, transactionDate: new Date(dateMs).toISOString().slice(0, 10), reviewedAt, reviewedBy: OWNER_ID, bulkCustomerAssignmentVersion: MONZO_CUSTOMER_ASSIGNMENT_VERSION };
+    monzoLedger[key] = { ...(monzoLedger[key] || {}), key, status: 'paid', imported: true, recordType: 'sale', source: 'Monzo historical transaction rebuild', customerId, agentId: OWNER_ID, amount, currency, description, originalDescription: String(tx.description || ''), counterparty: String(tx.counterparty?.name || tx.merchant?.name || ''), reference: String(tx.notes || ''), txId: tx.id, createdAt: dateMs, paidAt: dateMs, importedAt: reviewedAt };
+  }
+  saveMonzo();
+  saveMonzoReview();
+  const total = candidates.reduce((sum, tx) => sum + Number(tx.amount || 0) / 100, 0);
+  console.log('Rebuilt 15 historical Monzo sales from the live Monzo API and applied the supplied customer mapping (newest to oldest).');
+  const dates = candidates.map((tx) => Date.parse(tx.created || tx.settled || 0));
+  return interaction.editReply({ content: '✅ **Rebuilt 15 historical Monzo sales.**\nAll 15 have been added to the paid financial ledger used by `/total`, `/payments`, `/customer` and payment history.\nCustomer IDs follow your supplied newest-to-oldest sequence; sales agent is set to you.\n**Combined amount:** ' + money(total, 'gbp') + '\n**Date range:** ' + new Date(Math.min(...dates)).toLocaleDateString('en-GB') + ' – ' + new Date(Math.max(...dates)).toLocaleDateString('en-GB') + '\n\n**Note:** Original manually entered product descriptions and manually edited dates cannot be recovered from Monzo; Monzo transaction descriptions and actual dates have been used.', ephemeral: true });
+}
+
 async function cmdMonzoReview(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can review historical Monzo transactions.');
   const period = interaction.options.getString('period') || 'last_month';
@@ -5861,6 +5908,9 @@ client.on('interactionCreate', async (interaction) => {
       case 'monzo-review':
         await interaction.deferReply({ ephemeral: true });
         return await cmdMonzoReview(interaction);
+      case 'monzo-rebuild':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdMonzoRebuild(interaction);
       case 'test':
         return await cmdPaymentTest(interaction);
       case 'vault':
