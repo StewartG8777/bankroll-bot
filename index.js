@@ -1776,8 +1776,8 @@ const deliveryCmd = common(new SlashCommandBuilder().setName('delivery').setDesc
   .addSubcommand((sub) => sub.setName('resend').setDescription('Resend a paid customer file without charging again').addStringOption((o) => o.setName('order').setDescription('Checkout session ID or Monzo invoice ID').setRequired(true))));
 
 const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription('Remove a customer from Bankroll transaction records and logs (owner only)')
-  .addUserOption((o) => o.setName('user').setDescription('Customer whose Bankroll records should be wiped').setRequired(true))
-  .addStringOption((o) => o.setName('confirm').setDescription('Type WIPE to confirm this permanent action').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' })));
+  .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records'))
+  .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' })));
 
 const commands = [spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, botAdminCmd, wipeCmd];
 
@@ -4238,14 +4238,31 @@ async function cmdDelivery(interaction) {
 
 async function cmdWipe(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can wipe customer records.');
-  const user = interaction.options.getUser('user', true);
-  if (user.bot) return interaction.editReply('Choose a real customer account, not a bot.');
-  if (interaction.options.getString('confirm') !== 'WIPE') return interaction.editReply('Wipe cancelled. Choose WIPE to confirm.');
+  const user = interaction.options.getUser('user');
+  if (user?.bot) return interaction.editReply('Choose a real customer account, not a bot.');
+  const wipeAll = !user;
+  const confirmValue = interaction.options.getString('confirm');
+  if (confirmValue !== (wipeAll ? 'WIPE ALL' : 'WIPE')) {
+    return interaction.editReply(wipeAll ? 'Wipe cancelled. To wipe ALL customers and payments, choose WIPE ALL.' : 'Wipe cancelled. Choose WIPE to confirm.');
+  }
 
-  const id = String(user.id);
+  // Which customers are being wiped: one chosen customer, or every customer Bankroll has a record of.
+  const ids = new Set();
+  if (user) ids.add(String(user.id));
+  else {
+    for (const d of Object.values(deliveries)) if (d?.customerId) ids.add(String(d.customerId));
+    for (const m of Object.values(monzoLedger)) if (m?.customerId) ids.add(String(m.customerId));
+    for (const d of Object.values(downloads)) if (!d?.backupDownload && d?.customerId) ids.add(String(d.customerId));
+    for (const h of downloadHistory) if (h?.customerId) ids.add(String(h.customerId));
+    try {
+      const all = await stripe.paymentIntents.list({ limit: 100 }).autoPagingToArray({ limit: 5000 });
+      for (const pi of all) if (pi.metadata?.agent_id && pi.metadata?.customer_id) ids.add(String(pi.metadata.customer_id));
+    } catch (e) { console.error('Could not list Stripe payments for wipe:', e.message); }
+  }
+  const id = user ? String(user.id) : 'ALL';
   let monzoCount = 0, deliveryCount = 0, downloadCount = 0, historyCount = 0, logCount = 0;
-  const removedDeliveryKeys = Object.entries(deliveries).filter(([, d]) => String(d?.customerId || '') === id).map(([key]) => key);
-  const removedDownloadTokens = Object.entries(downloads).filter(([, d]) => !d?.backupDownload && String(d?.customerId || '') === id).map(([token]) => token);
+  const removedDeliveryKeys = Object.entries(deliveries).filter(([, d]) => ids.has(String(d?.customerId || ''))).map(([key]) => key);
+  const removedDownloadTokens = Object.entries(downloads).filter(([, d]) => !d?.backupDownload && ids.has(String(d?.customerId || ''))).map(([token]) => token);
   const removedDownloadPaths = removedDownloadTokens.map((token) => downloads[token]?.path).filter(Boolean);
 
   for (const key of removedDeliveryKeys) {
@@ -4257,7 +4274,7 @@ async function cmdWipe(interaction) {
     deliveryCount++;
   }
   for (const key of Object.keys(monzoLedger)) {
-    if (String(monzoLedger[key]?.customerId || '') !== id) continue;
+    if (!ids.has(String(monzoLedger[key]?.customerId || ''))) continue;
     for (const pct of CHECKIN_PCTS) {
       const timerKey = key + ':' + pct;
       const timer = monzoReminderTimers.get(timerKey);
@@ -4269,7 +4286,7 @@ async function cmdWipe(interaction) {
   }
   for (const token of removedDownloadTokens) { delete downloads[token]; downloadCount++; }
   const oldHistoryLength = downloadHistory.length;
-  downloadHistory = downloadHistory.filter((entry) => String(entry?.customerId || '') !== id);
+  downloadHistory = downloadHistory.filter((entry) => !ids.has(String(entry?.customerId || '')));
   historyCount = oldHistoryLength - downloadHistory.length;
 
   const referencedPaths = new Set([
@@ -4284,7 +4301,7 @@ async function cmdWipe(interaction) {
     }
   }
 
-  wipedCustomers.add(id);
+  for (const wipedId of ids) wipedCustomers.add(wipedId);
   saveWipedCustomers();
   saveMonzo();
   saveDeliveries();
@@ -4306,7 +4323,7 @@ async function cmdWipe(interaction) {
             ...(e.fields || []).flatMap((field) => [field.name || '', field.value || '']),
           ])];
           const body = parts.join(' ');
-          if (body.includes(id) || body.includes('<@' + id + '>') || body.includes('<@!' + id + '>')) {
+          if ([...ids].some((wipedId) => body.includes(wipedId))) {
             if (await message.delete().then(() => true).catch(() => false)) logCount++;
           }
         }
@@ -4317,12 +4334,12 @@ async function cmdWipe(interaction) {
   } catch (error) { console.error('Customer log cleanup failed:', error.message); }
 
   recordNotification('customer.wipe', 'Customer records wiped',
-    'Removed Bankroll-local Monzo, delivery, download and audit records for customer ' + id + '. Provider-side payment records are not deleted.', 'warning');
+    'Removed Bankroll-local Monzo, delivery, download and audit records for ' + (user ? 'customer ' + id : ids.size + ' customers (wipe all)') + '. Provider-side payment records are not deleted.', 'warning');
   await backupData();
   return interaction.editReply({
     content: [
       '**Customer records wiped**',
-      'Customer: <@' + id + '> (' + id + ')',
+      user ? 'Customer: <@' + id + '> (' + id + ')' : 'Customers wiped: **' + ids.size + '** (everyone)',
       'Monzo records removed: **' + monzoCount + '**',
       'Delivery/order records removed: **' + deliveryCount + '**',
       'Download links removed: **' + downloadCount + '**',
@@ -4331,7 +4348,7 @@ async function cmdWipe(interaction) {
       '',
       'Their card payments are now hidden from Bankroll reports. Actual Stripe payments and Monzo bank statements remain unchanged.',
     ].join('\n'),
-    allowedMentions: { users: [id] },
+    allowedMentions: { users: user ? [id] : [] },
   });
 }
 
