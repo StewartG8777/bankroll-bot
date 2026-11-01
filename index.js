@@ -4776,8 +4776,8 @@ async function onButton(interaction) {
       return interaction.reply({ content: 'This test invoice has already been marked as paid.', ephemeral: true });
     }
     await interaction.deferUpdate();
-    const delivered = await deliverFile(key, null);
-    if (delivered && deliveries[key]?.deliveryComplete) {
+    await deliverFile(key, null);
+    if (deliveries[key]?.deliveryComplete) {
       return interaction.followUp({ content: 'Test payment marked as paid. The invoice has been updated, the download has been posted as a reply, and the owner notification has been triggered.', ephemeral: true });
     }
     return interaction.followUp({ content: 'The test invoice was marked as paid, but delivery has not completed. Check /delivery status for order ' + key + '.', ephemeral: true });
