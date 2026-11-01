@@ -6123,7 +6123,7 @@ async function cmdSend(interaction) {
   }
   const message = interaction.options.getString('message', true);
   await interaction.deferReply({ ephemeral: true });
-  await interaction.followUp({ content: message, allowedMentions: { parse: [] } });
+  await interaction.webhook.send({ content: message, allowedMentions: { parse: [] } });
   return interaction.editReply({ content: 'Message sent.' });
 }
 
