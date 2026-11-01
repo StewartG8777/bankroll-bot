@@ -4576,9 +4576,9 @@ async function showMonzoReviewModal(interaction) {
     .setTitle('Review Monzo sale');
   const customer = new TextInputBuilder()
     .setCustomId('customer_id')
-    .setLabel('Customer Discord ID')
+    .setLabel('Customer Discord ID (optional — can be added later)')
     .setStyle(TextInputStyle.Short)
-    .setRequired(true)
+    .setRequired(false)
     .setMaxLength(25);
   const sold = new TextInputBuilder()
     .setCustomId('sold')
@@ -4619,8 +4619,8 @@ async function saveMonzoReviewModal(interaction) {
   if (!Number.isFinite(dateMs) || new Date(dateMs).toISOString().slice(0, 10) !== dateText) {
     return interaction.reply({ content: 'Enter a valid transaction date in YYYY-MM-DD format.', ephemeral: true });
   }
-  if (!/^\d{17,20}$/.test(customerId)) {
-    return interaction.reply({ content: 'Enter a valid customer Discord ID (17–20 digits). Nothing has been saved yet.', ephemeral: true });
+  if (customerId && !/^\d{17,20}$/.test(customerId)) {
+    return interaction.reply({ content: 'That customer Discord ID is not valid. Use the numeric ID or leave it blank to assign later.', ephemeral: true });
   }
   if (Number(tx.amount) <= 0) {
     return interaction.reply({ content: 'Only incoming Monzo transactions are included as sales.', ephemeral: true });
@@ -4667,7 +4667,7 @@ async function saveMonzoReviewModal(interaction) {
     saveMonzo();
   }
   saveMonzoReview();
-  const outcome = 'Recorded **' + money(record.amount, record.currency) + '** as a historical sale for <@' + customerId + '>, assigned to you (<@' + OWNER_ID + '>). It is included in Bankroll customer history, payment history and totals.';
+  const outcome = 'Recorded **' + money(record.amount, record.currency) + '** as a historical sale' + (customerId ? ' for <@' + customerId + '>' : ' with customer ID left blank for later assignment') + ', assigned to you (<@' + OWNER_ID + '>). It is included in Bankroll payment history and totals.';
   return interaction.reply({ content: '✅ ' + outcome + '\n**Transaction:** ' + txId + '\n**Date:** ' + dateText + '\n**Details:** ' + short(sold, 300), ephemeral: true, allowedMentions: { parse: [] } });
 }
 
