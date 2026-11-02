@@ -1288,9 +1288,17 @@ function dataFilePaths() {
 let backupChain = Promise.resolve();
 let backupRetryTimer = null;
 let backupHealthWarningSent = false;
+let backupFailureAlertSent = false;
 function backupData() {
   backupChain = backupChain.then(() => backupDataOnce()).catch((e) => {
     console.error('Backup failed:', e.message);
+    // Alert the owner once per failure streak; never send backup diagnostics to customers.
+    if (!backupFailureAlertSent) {
+      backupFailureAlertSent = true;
+      void alertOwner('Automatic backup failed', e).catch((alertError) => {
+        console.error('Could not alert owner about backup failure:', alertError.message);
+      });
+    }
     // A failed run must not silently wait for the next six-hour cycle.
     if (!shuttingDown && !backupRetryTimer) {
       backupRetryTimer = setTimeout(() => {
@@ -1461,6 +1469,7 @@ async function backupDataOnce() {
     if (!files.length) throw new Error('No database files were available to back up; refusing to mark the backup healthy.');
     lastBackupAt = Date.now();
     backupHealthWarningSent = false;
+    backupFailureAlertSent = false;
   } catch (e) {
     throw e;
   }
