@@ -57,6 +57,7 @@ const {
   RENDER_SERVICE_ID = '',
   RENDER_OWNER_ID = '',
   RENDER_WEBHOOK_SECRET = '',
+  RENDER_ALERT_CHANNEL_ID = '',
 } = process.env;
 
 const MONZO_LINK = (MONZO_ME_URL || (MONZO_USERNAME ? `https://monzo.me/${MONZO_USERNAME.replace(/^\/+|\/+$/g, '')}` : '')).replace(/\/+$/, '');
@@ -243,12 +244,30 @@ async function notifyOwner(payload, { log = true, notificationType = 'owner.noti
     firstEmbed?.description || payload.content || '',
     notificationStatus
   );
-  try {
-    const owner = await client.users.fetch(OWNER_ID);
-    await owner.send(payload);
-  } catch (e) {
-    console.error('Owner DM failed:', e.message);
-    recordNotification('delivery.owner_dm_failed', 'Owner DM failed', e.message, 'error');
+  let deliveredToDeployChannel = false;
+  if (notificationType.startsWith('render.') && RENDER_ALERT_CHANNEL_ID) {
+    try {
+      const channel = await client.channels.fetch(RENDER_ALERT_CHANNEL_ID);
+      if (!channel || !channel.isTextBased() || !channel.send) throw new Error('Configured deployment alert channel is unavailable or not text-based.');
+      await channel.send({
+        content: OWNER_ID ? '<@' + OWNER_ID + '>' : undefined,
+        embeds: payload.embeds,
+        allowedMentions: { users: OWNER_ID ? [OWNER_ID] : [] }
+      });
+      deliveredToDeployChannel = true;
+    } catch (e) {
+      console.error('Render deployment channel alert failed:', e.message);
+      recordNotification('delivery.render_channel_failed', 'Render alert channel delivery failed', e.message, 'error');
+    }
+  }
+  if (!deliveredToDeployChannel) {
+    try {
+      const owner = await client.users.fetch(OWNER_ID);
+      await owner.send(payload);
+    } catch (e) {
+      console.error('Owner DM failed:', e.message);
+      recordNotification('delivery.owner_dm_failed', 'Owner DM failed', e.message, 'error');
+    }
   }
   if (log) await logToServer({ content: payload.content, embeds: payload.embeds });
 }
@@ -2113,6 +2132,7 @@ const botAdminCmd = common(
     .addSubcommand((sub) => sub.setName('refresh-commands').setDescription('Refresh all Discord slash commands immediately'))
     .addSubcommand((sub) => sub.setName('redeploy').setDescription('Trigger a new deployment from the latest GitHub commit on Render'))
     .addSubcommand((sub) => sub.setName('restart').setDescription('Restart the running Render service'))
+    .addSubcommand((sub) => sub.setName('setup-deploy-alerts').setDescription('Create a private deployment channel that pings you'))
     .addSubcommand((sub) => sub.setName('env-list').setDescription('List Render environment variable names (values stay hidden)'))
     .addSubcommand((sub) => sub.setName('env-add').setDescription('Add a Render environment variable securely').addStringOption((o) => o.setName('key').setDescription('Environment variable name').setRequired(true)))
     .addSubcommand((sub) => sub.setName('env-edit').setDescription('Edit a Render environment variable securely').addStringOption((o) => o.setName('key').setDescription('Environment variable name').setRequired(true)))
@@ -4635,6 +4655,48 @@ async function cmdBotAdmin(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can use these controls.');
   const sub = interaction.options.getSubcommand();
 
+  if (sub === 'setup-deploy-alerts') {
+    if (!interaction.guild) return interaction.editReply('Run this command inside your Discord server.');
+    if (!RENDER_API_KEY || !RENDER_SERVICE_ID) {
+      return interaction.editReply('I need RENDER_API_KEY and RENDER_SERVICE_ID configured before I can connect the channel to Render.');
+    }
+    let channel = interaction.guild.channels.cache.find((c) => c.name === 'bankroll-deployments' && c.type === ChannelType.GuildText);
+    try {
+      if (!channel) {
+        const view = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
+        channel = await interaction.guild.channels.create({
+          name: 'bankroll-deployments',
+          type: ChannelType.GuildText,
+          topic: 'Private Render deployment status, failures, build diagnostics and duration alerts.',
+          permissionOverwrites: [
+            { id: interaction.guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+            { id: OWNER_ID, allow: [...view, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks] },
+            { id: client.user.id, allow: [...view, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks] }
+          ]
+        });
+      }
+      await renderApiRequest(
+        'https://api.render.com/v1/services/' + encodeURIComponent(RENDER_SERVICE_ID) + '/env-vars/RENDER_ALERT_CHANNEL_ID',
+        'PUT',
+        { value: channel.id }
+      );
+      const deploy = await renderApiRequest(
+        'https://api.render.com/v1/services/' + encodeURIComponent(RENDER_SERVICE_ID) + '/deploys',
+        'POST',
+        {}
+      );
+      const deployId = deploy.id || deploy.deploy?.id || '';
+      await channel.send({
+        content: '<@' + OWNER_ID + '> **Bankroll deployment alerts are being configured.** This channel will report deployment starts, successes, failures, slow deployments and available build diagnostics. A Render redeploy has been requested.' + (deployId ? '\\nDeploy: `' + String(deployId).slice(0, 100) + '`' : ''),
+        allowedMentions: { users: [OWNER_ID] }
+      });
+      return interaction.editReply('Created/configured <#' + channel.id + '> and saved it to Render as RENDER_ALERT_CHANNEL_ID. Render accepted a redeployment request. Once the new version starts, deployment alerts will be posted here and ping you.');
+    } catch (error) {
+      console.error('Deployment alert channel setup failed:', error.stack || error);
+      return interaction.editReply('The channel is ' + (channel ? 'available at <#' + channel.id + '>, but ' : 'not confirmed, and ') + 'I could not finish the Render setup: ' + String(error.message || error).slice(0, 500));
+    }
+  }
+
   if (sub === 'env-list') {
     if (!RENDER_API_KEY || !RENDER_SERVICE_ID) return interaction.editReply('Set RENDER_API_KEY and RENDER_SERVICE_ID in Render first.');
     const vars = await renderApiGet(`https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}/env-vars?limit=100`);
@@ -6714,17 +6776,87 @@ async function fetchRenderFailureLogs(deployId, startedAt) {
   return result;
 }
 
+const renderObservedDeployments = new Map();
+let renderMonitorInitialized = false;
+
 async function monitorRenderDeployments() {
   if (renderMonitorBusy || !RENDER_API_KEY || !RENDER_SERVICE_ID) return;
   renderMonitorBusy = true;
   try {
     const params = new URLSearchParams({ limit: '10' });
-    const response = await renderApiGet(`https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}/deploys?${params.toString()}`);
+    const response = await renderApiGet('https://api.render.com/v1/services/' + encodeURIComponent(RENDER_SERVICE_ID) + '/deploys?' + params.toString());
     const rows = Array.isArray(response) ? response : [];
+    const observed = rows.map((row) => row?.deploy || row).filter((deploy) => deploy?.id);
     const activeStatuses = new Set(['created', 'queued', 'build_in_progress', 'update_in_progress', 'pre_deploy_in_progress']);
-    for (const row of rows) {
-      const deploy = row?.deploy || row;
-      const deployId = String(deploy?.id || '');
+    const successStatuses = new Set(['live', 'succeeded']);
+    const failureStatuses = new Set(['failed', 'canceled', 'build_failed', 'update_failed', 'pre_deploy_failed']);
+
+    // On first startup, establish a baseline rather than announcing an old deployment as new.
+    if (!renderMonitorInitialized) {
+      for (const deploy of observed) renderObservedDeployments.set(String(deploy.id), String(deploy.status || 'unknown'));
+      renderMonitorInitialized = true;
+    } else {
+      for (const deploy of observed) {
+        const deployId = String(deploy.id);
+        const status = String(deploy.status || 'unknown');
+        const previousStatus = renderObservedDeployments.get(deployId);
+        if (previousStatus === undefined) {
+          renderObservedDeployments.set(deployId, status);
+          const commit = deploy.commit?.id ? String(deploy.commit.id).slice(0, 12) : 'Not supplied';
+          const embed = new EmbedBuilder()
+            .setColor(0x3498db)
+            .setTitle('🚀 RENDER | DEPLOYMENT STARTED')
+            .setDescription([
+              '**A new Bankroll deployment was detected.**',
+              '**Status:** ' + status.toUpperCase(),
+              '**Deploy ID:** ' + deployId,
+              '**Commit:** ' + commit,
+              deploy.createdAt ? '**Created:** <t:' + Math.floor(Date.parse(deploy.createdAt) / 1000) + ':F>' : null
+            ].filter(Boolean).join('\n'))
+            .setTimestamp();
+          await notifyOwner({ embeds: [embed] }, { log: true, notificationType: 'render.deploy_started_api', notificationStatus: 'info' });
+        } else if (previousStatus !== status) {
+          renderObservedDeployments.set(deployId, status);
+          const commit = deploy.commit?.id ? String(deploy.commit.id).slice(0, 12) : 'Not supplied';
+          const isFailure = failureStatuses.has(status);
+          const isSuccess = successStatuses.has(status);
+          if (isFailure || isSuccess) {
+            const diagnostics = isFailure ? await fetchRenderFailureLogs(deployId, deploy.startedAt || deploy.createdAt) : null;
+            const embed = new EmbedBuilder()
+              .setColor(isFailure ? RED : GREEN)
+              .setTitle(isFailure ? '❌ RENDER | DEPLOYMENT FAILED' : '✅ RENDER | DEPLOYMENT SUCCEEDED')
+              .setDescription([
+                isFailure ? '**Bankroll deployment failed.**' : '**Bankroll is running the newly deployed version.**',
+                '**Previous status:** ' + previousStatus.toUpperCase(),
+                '**Final status:** ' + status.toUpperCase(),
+                '**Deploy ID:** ' + deployId,
+                '**Commit:** ' + commit,
+                deploy.finishedAt ? '**Finished:** <t:' + Math.floor(Date.parse(deploy.finishedAt) / 1000) + ':F>' : null
+              ].filter(Boolean).join('\n'))
+              .setTimestamp();
+            if (diagnostics?.logs) embed.addFields({ name: 'Build/application logs', value: diagnostics.logs.slice(0, 1000) });
+            if (diagnostics?.note) embed.addFields({ name: 'Diagnostics', value: diagnostics.note.slice(0, 1000) });
+            await notifyOwner({ embeds: [embed] }, {
+              log: true,
+              notificationType: isFailure ? 'render.deploy_failed_api' : 'render.deploy_succeeded_api',
+              notificationStatus: isFailure ? 'error' : 'success'
+            });
+          }
+        }
+      }
+    }
+
+    // Preserve a small in-memory history; only the latest 30 deployments are relevant.
+    if (renderObservedDeployments.size > 30) {
+      const keep = new Set(observed.map((deploy) => String(deploy.id)));
+      for (const id of renderObservedDeployments.keys()) {
+        if (!keep.has(id)) renderObservedDeployments.delete(id);
+      }
+    }
+
+    // Alert once per deployment if it remains active for more than 60 seconds.
+    for (const deploy of observed) {
+      const deployId = String(deploy.id || '');
       if (!deployId || !activeStatuses.has(String(deploy.status || ''))) continue;
       if (renderLongDeployAlerts[deployId]) continue;
       const started = Date.parse(deploy.startedAt || deploy.createdAt || deploy.updatedAt || '');
@@ -6740,18 +6872,14 @@ async function monitorRenderDeployments() {
           '**A deployment has been running for over 1 minute.**',
           'This can indicate a slow build, a stuck deploy, or a deployment loop. It is an alert only; Bankroll will not automatically cancel or restart it.',
           '',
-          `**Status:** ${String(deploy.status).toUpperCase()}`,
-          `**Duration:** ${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`,
-          `**Deploy ID:** ${deployId}`,
-          `**Commit:** ${commit}`,
-          `**Started:** <t:${Math.floor(started / 1000)}:F>`
+          '**Status:** ' + String(deploy.status).toUpperCase(),
+          '**Duration:** ' + Math.floor(elapsedSeconds / 60) + 'm ' + (elapsedSeconds % 60) + 's',
+          '**Deploy ID:** ' + deployId,
+          '**Commit:** ' + commit,
+          '**Started:** <t:' + Math.floor(started / 1000) + ':F>'
         ].join('\n'))
         .setTimestamp();
-      await notifyOwner({ embeds: [embed] }, {
-        log: true,
-        notificationType: 'render.deploy_slow',
-        notificationStatus: 'warning'
-      });
+      await notifyOwner({ embeds: [embed] }, { log: true, notificationType: 'render.deploy_slow', notificationStatus: 'warning' });
     }
   } catch (error) {
     if (Date.now() - lastRenderMonitorErrorAt > 10 * 60 * 1000) {
@@ -6762,7 +6890,6 @@ async function monitorRenderDeployments() {
     renderMonitorBusy = false;
   }
 }
-
 // ---------- Render deployment webhook ----------
 const app = express();
 // Bind the HTTP port immediately so Render detects the service even while the
