@@ -2131,7 +2131,7 @@ const botAdminCmd = common(
     .addSubcommand((sub) => sub.setName('refresh-commands').setDescription('Refresh all Discord slash commands immediately'))
     .addSubcommand((sub) => sub.setName('redeploy').setDescription('Trigger a new deployment from the latest GitHub commit on Render'))
     .addSubcommand((sub) => sub.setName('restart').setDescription('Restart the running Render service'))
-    .addSubcommand((sub) => sub.setName('setup-deploy-alerts').setDescription('Create a private deployment channel that pings you'))
+    .addSubcommand((sub) => sub.setName('setup-deploy-alerts').setDescription('Create a private channel for deployment updates'))
     .addSubcommand((sub) => sub.setName('setup-payout-webhook').setDescription('Enable Stripe payout notifications on the existing live webhook'))
     .addSubcommand((sub) => sub.setName('env-list').setDescription('List Render environment variable names (values stay hidden)'))
     .addSubcommand((sub) => sub.setName('env-add').setDescription('Add a Render environment variable securely').addStringOption((o) => o.setName('key').setDescription('Environment variable name').setRequired(true)))
@@ -4702,8 +4702,19 @@ async function cmdBotAdmin(interaction) {
     if (!/^(sk|rk)_live_/.test(String(STRIPE_SECRET_KEY || ''))) return interaction.editReply('Bankroll is not using a Live-mode Stripe API key. No webhook settings were changed.');
     const targetUrl = BASE_URL + '/webhook';
     try {
-      const listed = await stripe.webhookEndpoints.list({ limit: 100 });
-      const endpoints = await listed.autoPagingToArray({ limit: 1000 });
+      // Stripe's list response is a page object; use cursor pagination rather than
+      // autoPagingToArray (which is not available on this response in the installed SDK).
+      const endpoints = [];
+      let startingAfter;
+      while (endpoints.length < 1000) {
+        const page = await stripe.webhookEndpoints.list({
+          limit: Math.min(100, 1000 - endpoints.length),
+          ...(startingAfter ? { starting_after: startingAfter } : {})
+        });
+        endpoints.push(...(page.data || []));
+        if (!page.has_more || !page.data?.length) break;
+        startingAfter = page.data[page.data.length - 1].id;
+      }
       const matches = endpoints.filter((endpoint) => endpoint.livemode === true && (endpoint.url === targetUrl || endpoint.url === targetUrl + '/'));
       if (!matches.length) return interaction.editReply('I could not find an existing Live Stripe webhook matching ' + targetUrl + '. No changes were made. Check PUBLIC_URL in Render.');
       const requiredEvents = ['payout.paid', 'payout.failed', 'payout.canceled'];
