@@ -7220,6 +7220,46 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     }
   }
 
+  if (['payout.paid', 'payout.failed', 'payout.canceled'].includes(event.type)) {
+    const payout = event.data.object;
+    const amount = Number(payout.amount || 0) / 100;
+    const currency = String(payout.currency || CURRENCY).toLowerCase();
+    const payoutId = String(payout.id || 'Unknown');
+    const arrival = payout.arrival_date
+      ? '<t:' + String(payout.arrival_date) + ':F>'
+      : 'Not provided by Stripe';
+    const isPaid = event.type === 'payout.paid';
+    const isFailed = event.type === 'payout.failed';
+    const title = isPaid
+      ? '✅ STRIPE PAYOUT PROCESSED'
+      : (isFailed ? '❌ STRIPE PAYOUT FAILED' : '⚠️ STRIPE PAYOUT CANCELED');
+    const embed = new EmbedBuilder()
+      .setColor(isPaid ? GREEN : RED)
+      .setTitle(title)
+      .setDescription(isPaid
+        ? 'Stripe has marked this payout as paid and sent it to your bank. Your bank may take additional time to show the funds.'
+        : (isFailed
+          ? 'Stripe reports that this payout failed. Check your Stripe dashboard for the failure reason and bank details.'
+          : 'Stripe reports that this payout was canceled; the funds should remain in your Stripe balance.'))
+      .addFields(
+        { name: 'Amount', value: money(amount, currency), inline: true },
+        { name: 'Status', value: String(payout.status || (isPaid ? 'paid' : event.type.split('.')[1])).toUpperCase(), inline: true },
+        { name: 'Expected arrival', value: arrival, inline: true },
+        { name: 'Payout ID', value: payoutId }
+      )
+      .setTimestamp(event.created ? new Date(event.created * 1000) : new Date());
+    if (isFailed && payout.failure_code) {
+      embed.addFields({ name: 'Failure code', value: String(payout.failure_code).slice(0, 200), inline: true });
+    }
+    if (isFailed && payout.failure_message) {
+      embed.addFields({ name: 'Failure reason', value: String(payout.failure_message).slice(0, 1000) });
+    }
+    await notifyOwner({ embeds: [embed] }, {
+      notificationType: event.type === 'payout.paid' ? 'stripe.payout_paid' : 'stripe.payout_failed',
+      notificationStatus: isPaid ? 'success' : 'error'
+    });
+  }
+
   if (event.type === 'charge.refunded') {
     const charge = event.data.object;
     const piId = typeof charge.payment_intent === 'string' ? charge.payment_intent : charge.payment_intent?.id;
