@@ -6602,29 +6602,32 @@ async function fetchRenderFailureLogs(deployId, startedAt) {
       result.note = 'Add RENDER_OWNER_ID in Render Environment to include build error log lines.';
       return result;
     }
-    const params = new URLSearchParams({
-      ownerId: RENDER_OWNER_ID,
-      startTime: from.toISOString(),
-      endTime: to.toISOString(),
-      direction: 'backward',
-      limit: '50',
-      type: 'build',
-      resource: RENDER_SERVICE_ID,
-    });
-    let payload = await renderApiGet(`https://api.render.com/v1/logs?${params.toString()}`);
-    let entries = Array.isArray(payload.logs) ? payload.logs : [];
-    const errors = entries.filter((entry) => (entry.labels || []).some((label) =>
+    const allEntries = [];
+    for (const logType of ['build', 'app']) {
+      const params = new URLSearchParams({
+        ownerId: RENDER_OWNER_ID,
+        startTime: from.toISOString(),
+        endTime: to.toISOString(),
+        direction: 'backward',
+        limit: '50',
+        type: logType,
+        resource: RENDER_SERVICE_ID,
+      });
+      const payload = await renderApiGet(`https://api.render.com/v1/logs?${params.toString()}`);
+      for (const entry of (Array.isArray(payload.logs) ? payload.logs : [])) {
+        allEntries.push({ ...entry, _logType: logType });
+      }
+    }
+    const errors = allEntries.filter((entry) => (entry.labels || []).some((label) =>
       label.name === 'level' && /error|critical|alert|emergency/i.test(label.value)
     ));
-    if (errors.length) entries = errors;
-    else if (!entries.length) {
-      result.note = 'Render returned no build log lines for this deployment.';
-    }
-    result.logs = entries.slice(0, 12).reverse().map((entry) => {
+    const entries = (errors.length ? errors : allEntries).sort((a, b) => Date.parse(a.timestamp || 0) - Date.parse(b.timestamp || 0));
+    if (!entries.length) result.note = 'Render returned no build or application log lines for this deployment.';
+    result.logs = entries.slice(-12).map((entry) => {
       const stamp = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString('en-GB', { timeZone: 'Europe/London' }) : '';
-      return `[${stamp}] ${String(entry.message || '').trim()}`;
+      return `[${stamp}] [${entry._logType}] ${String(entry.message || '').trim()}`;
     }).filter((line) => line.trim()).join('\n').slice(-3500);
-    if (entries.length && !errors.length) result.note = 'No error-level build lines were tagged; showing recent build output instead.';
+    if (entries.length && !errors.length) result.note = 'No error-level lines were tagged; showing recent build/application output instead.';
   } catch (error) {
     result.note = `Could not retrieve Render logs: ${String(error.message || error).slice(0, 350)}`;
     console.error('Render deployment log retrieval failed:', error.stack || error);
