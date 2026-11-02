@@ -4638,7 +4638,16 @@ async function cmdBotAdmin(interaction) {
       console.error('Could not fetch existing global slash commands:', e.message);
       return null;
     });
-    const current = currentCollection ? [...currentCollection.values()].map((c) => c.toJSON()) : [];
+    const discordCurrent = currentCollection ? [...currentCollection.values()].map((c) => c.toJSON()) : [];
+    const COMMAND_SNAPSHOT_FILE = path.join(DATA_DIR, 'registered_commands_snapshot.json');
+    let savedCommandSnapshot = null;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(COMMAND_SNAPSHOT_FILE, 'utf8'));
+      if (Array.isArray(parsed)) savedCommandSnapshot = parsed;
+    } catch {}
+    // Prefer our last successfully registered schema. Discord's fetched representation can
+    // normalize defaults and otherwise make unchanged options appear modified on every refresh.
+    const current = savedCommandSnapshot || discordCurrent;
     // Compare the complete command schema, not just a small subset of option fields.
     // Discord adds IDs/version metadata to fetched commands; those are deliberately ignored.
     const simplify = (value) => {
@@ -4680,6 +4689,9 @@ async function cmdBotAdmin(interaction) {
 
     try {
       await client.application.commands.set(desired);
+      // Save only after Discord accepts the update so the next refresh compares against
+      // the last successfully published command schema, not a partially applied attempt.
+      atomicWrite(COMMAND_SNAPSHOT_FILE, JSON.stringify(desired, null, 2));
     } catch (e) {
       console.error('Slash command refresh failed:', e);
       return interaction.editReply(('**Slash command refresh failed.** Discord rejected the command definitions:\n' + String(e?.message || e)).slice(0, 1900));
@@ -4699,27 +4711,18 @@ async function cmdBotAdmin(interaction) {
         guildNote = '\nRemoved ' + oldGuildCount + ' old server-only command copy/copies.';
       }
     }
-    const changeLines = [
-      added.length ? 'Added: ' + added.map((n) => '/' + n).join(', ') : 'Added: none',
-      removed.length ? 'Removed: ' + removed.map((n) => '/' + n).join(', ') : 'Removed: none',
-      changed.length ? 'Changed: ' + changed.join(' | ') : 'Changed: none',
-    ];
+    const changeLines = [];
+    if (added.length) changeLines.push('**Added:** ' + added.map((n) => '/' + n).join(', '));
+    if (removed.length) changeLines.push('**Removed:** ' + removed.map((n) => '/' + n).join(', '));
+    if (changed.length) changeLines.push('**Changed:** ' + changed.join(' | '));
     const lines = [
-      '**Slash commands refreshed and sent to Discord.**',
-      'Desired: **' + desired.length + '** global commands' +
-        (verifiedCount === null ? ' • Verification fetch unavailable' : ' • Discord now reports **' + verifiedCount + '**'),
-      '',
-      '**Changes since the previous Discord command list:**',
-      ...changeLines,
-      '',
-      '**Latest code updates (running Render version):**',
-      ...RECENT_UPDATES.map((u) => '• ' + u),
-      '',
-      'Global command changes can take a little while to appear in every Discord client. This refresh uses the code currently running on Render; deploy first if GitHub has newer code.',
+      '**Slash commands refreshed.**',
+      'Discord: **' + (verifiedCount === null ? 'verification unavailable' : verifiedCount + ' commands') + '**',
+      ...(changeLines.length ? ['', ...changeLines] : ['', savedCommandSnapshot ? 'No new command changes.' : 'Initial command snapshot saved; future refreshes will show only new changes.']),
       guildNote
     ].filter(Boolean);
     let response = lines.join('\n');
-    if (response.length > 1900) response = response.slice(0, 1880) + '\n…Use the Render logs for the complete registration result.';
+    if (response.length > 1900) response = response.slice(0, 1880) + '\n…Additional changes are recorded in the Render logs.';
     return interaction.editReply(response);
   }
 
