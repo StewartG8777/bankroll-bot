@@ -6290,11 +6290,44 @@ async function cmdBankrollFinance(interaction) {
     const balance = await stripe.balance.retrieve();
     const available = stripeBalanceLines(balance.available);
     const pending = stripeBalanceLines(balance.pending);
+
+    // Stripe balance transactions include the date each pending amount is expected to become available.
+    const pendingByCurrencyAndDate = new Map();
+    let startingAfter;
+    for (let page = 0; page < 10; page++) {
+      const params = { limit: 100 };
+      if (startingAfter) params.starting_after = startingAfter;
+      const transactions = await stripe.balanceTransactions.list(params);
+      for (const transaction of (transactions.data || [])) {
+        if (transaction.status !== 'pending') continue;
+        const currency = String(transaction.currency || '').toLowerCase();
+        const availableOn = Number(transaction.available_on || 0);
+        if (!currency || !availableOn) continue;
+        const key = currency + ':' + availableOn;
+        pendingByCurrencyAndDate.set(key, (pendingByCurrencyAndDate.get(key) || 0) + Number(transaction.amount || 0));
+      }
+      if (!transactions.has_more || !transactions.data?.length) break;
+      startingAfter = transactions.data[transactions.data.length - 1].id;
+    }
+
+    const expectedLines = [...pendingByCurrencyAndDate.entries()]
+      .filter(([, amount]) => amount !== 0)
+      .sort((a, b) => Number(a[0].split(':')[1]) - Number(b[0].split(':')[1]))
+      .map(([key, amount]) => {
+        const [currency, timestamp] = key.split(':');
+        return money(amount / 100, currency) + ' — <t:' + timestamp + ':D> (<t:' + timestamp + ':R>)';
+      });
+    const pendingTotal = (balance.pending || []).reduce((sum, item) => sum + Number(item.amount || 0), 0);
+    const expectedAvailability = expectedLines.length
+      ? expectedLines.join('\n').slice(0, 1024)
+      : (pendingTotal > 0 ? 'Stripe has not provided an availability date for these pending funds yet.' : 'No pending funds.');
+
     const embed = new EmbedBuilder().setColor(GREEN).setTitle('BANKROLL | STRIPE BALANCE')
       .setDescription('Live balance returned directly by Stripe.')
       .addFields(
         { name: 'Available to withdraw', value: available.join('\n') || '£0.00', inline: true },
-        { name: 'Pending', value: pending.join('\n') || '£0.00', inline: true }
+        { name: 'Pending', value: pending.join('\n') || '£0.00', inline: true },
+        { name: 'Expected availability', value: expectedAvailability, inline: false }
       ).setTimestamp();
     return interaction.editReply({ embeds: [embed] });
   }
@@ -6343,7 +6376,7 @@ async function handleBankrollPayoutButton(interaction) {
   const action = parts[1];
   const requestId = parts[2];
   const request = pendingStripePayouts.get(requestId);
-  if (!request) return interaction.reply({ content: 'This payout confirmation has expired. Run /bk payout again to get a fresh balance.', ephemeral: true });
+  if (!request) return interaction.reply({ content: 'This payout confirmation has expired. Run /bankroll payout again to get a fresh balance.', ephemeral: true });
   if (interaction.user.id !== OWNER_ID || interaction.user.id !== request.ownerId) {
     return interaction.reply({ content: 'Only the Bankroll owner can confirm this payout.', ephemeral: true });
   }
