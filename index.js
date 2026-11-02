@@ -6765,7 +6765,7 @@ app.post('/render-webhook', express.raw({ type: 'application/json' }), async (re
       .setTimestamp();
     if (failureDiagnostics?.status) embed.addFields({ name: 'Render deploy status', value: failureDiagnostics.status, inline: true });
     if (failureDiagnostics?.commit) embed.addFields({ name: 'Commit', value: failureDiagnostics.commit.slice(0, 100), inline: true });
-    if (failureDiagnostics?.logs) embed.addFields({ name: 'Build error logs / recent output', value: 'Recent Render build output:\\n' + failureDiagnostics.logs.slice(0, 980) });
+    if (failureDiagnostics?.logs) embed.addFields({ name: 'Build error logs / recent output', value: 'Recent Render build output: ' + failureDiagnostics.logs.slice(0, 980) });
     if (failureDiagnostics?.note) embed.addFields({ name: 'Diagnostics note', value: failureDiagnostics.note.slice(0, 1000) });
     await notifyOwner({ embeds: [embed] }, {
       log: true,
