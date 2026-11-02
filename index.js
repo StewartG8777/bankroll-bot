@@ -1344,7 +1344,14 @@ async function backupDataOnce() {
           allowedMentions: { parse: [] },
         });
         lastBackupHash = hash;
-        lastBackupAt = Date.now();
+      } else {
+        // Persist a lightweight heartbeat in Discord. In-memory timestamps are
+        // lost on Render restarts, so an unchanged dataset still needs a durable
+        // proof that the backup channel was reachable and the backup cycle ran.
+        await ch.send({
+          content: `BANKROLL_BACKUP_HEARTBEAT | ${new Date().toISOString()} | ${files.length} database files verified unchanged`,
+          allowedMentions: { parse: [] },
+        });
       }
     }
 
@@ -1403,10 +1410,9 @@ async function backupDataOnce() {
     // A run is successful even when nothing changed and no new Discord message
     // was needed. Refresh the health timestamp only after every required upload
     // has completed; this prevents stale warnings on unchanged data.
-    if (files.length) {
-      lastBackupAt = Date.now();
-      backupHealthWarningSent = false;
-    }
+    if (!files.length) throw new Error('No database files were available to back up; refusing to mark the backup healthy.');
+    lastBackupAt = Date.now();
+    backupHealthWarningSent = false;
   } catch (e) {
     throw e;
   }
@@ -2649,7 +2655,10 @@ async function autoRestoreOnStartup() {
     // the first real snapshot and leaves this deployment with no recovery point.
     // backupDataOnce sets lastBackupHash only after Discord confirms a snapshot.
     lastBackupHash = '';
-    lastBackupAt = msgs.find((m) => trusted(m) && String(m.content || '').startsWith('BANKROLL_BACKUP_SNAPSHOT'))?.createdTimestamp || lastBackupAt;
+    lastBackupAt = msgs.find((m) => trusted(m) && (
+      String(m.content || '').startsWith('BANKROLL_BACKUP_SNAPSHOT') ||
+      String(m.content || '').startsWith('BANKROLL_BACKUP_HEARTBEAT')
+    ))?.createdTimestamp || lastBackupAt;
     recoveryInfo = { ready: wanted.length - lost.length, total: wanted.length, restored: recovered, lost: [...lost], scannedMessages: msgs.length, jsonRestored };
     recoveryNote = ` Scanned ${msgs.length} messages in #${ch.name}; restored ${jsonRestored} database file(s) and ${recovered} stored file(s); ${alreadyPresent} file(s) were already present.` +
       (lost.length ? ` Could not recover: ${lost.join(', ')}.` : ' All indexed files are available.');
