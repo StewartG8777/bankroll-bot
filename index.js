@@ -1247,8 +1247,20 @@ function dataFilePaths() {
 }
 
 let backupChain = Promise.resolve();
+let backupRetryTimer = null;
+let backupHealthWarningSent = false;
 function backupData() {
-  backupChain = backupChain.then(() => backupDataOnce()).catch((e) => console.error('Backup failed:', e.message));
+  backupChain = backupChain.then(() => backupDataOnce()).catch((e) => {
+    console.error('Backup failed:', e.message);
+    // A failed run must not silently wait for the next six-hour cycle.
+    if (!shuttingDown && !backupRetryTimer) {
+      backupRetryTimer = setTimeout(() => {
+        backupRetryTimer = null;
+        void backupData();
+      }, 5 * 60 * 1000);
+      backupRetryTimer.unref?.();
+    }
+  });
   return backupChain;
 }
 async function resolveBackupChannel() {
@@ -1284,8 +1296,7 @@ async function backupDataOnce() {
   lastBackupRunAt = Date.now();
   const ch = await resolveBackupChannel();
   if (!ch) {
-    console.error('Backup channel not found. Set BACKUP_CHANNEL_ID or create #bankroll-backup.');
-    return;
+    throw new Error('Backup channel not found. Set BACKUP_CHANNEL_ID or create #bankroll-backup.');
   }
 
   try {
@@ -1385,13 +1396,19 @@ async function backupDataOnce() {
         lastBackupAt = Date.now();
         console.log(`Backed up ${rel} to Discord as ${total} verified part(s).`);
       } catch (attachmentError) {
-        console.error(`Discord attachment backup failed for ${rel}:`, attachmentError.message);
-        scheduleBackup();
-        break;
+        throw new Error(`Discord attachment backup failed for ${rel}: ${attachmentError.message}`);
       }
     }
+
+    // A run is successful even when nothing changed and no new Discord message
+    // was needed. Refresh the health timestamp only after every required upload
+    // has completed; this prevents stale warnings on unchanged data.
+    if (files.length) {
+      lastBackupAt = Date.now();
+      backupHealthWarningSent = false;
+    }
   } catch (e) {
-    console.error('Backup failed:', e.message);
+    throw e;
   }
 }
 
@@ -2765,7 +2782,14 @@ const onReady = async () => {
   setInterval(async () => {
     try {
       fs.accessSync(DATA_DIR, fs.constants.W_OK);
-      if (restoreDone && lastBackupAt && Date.now() - lastBackupAt > 18*60*60*1000) await alertOwner('Backup health warning', new Error('No successful backup has been recorded in over 18 hours.'));
+      if (restoreDone && (!lastBackupAt || Date.now() - lastBackupAt > 18 * 60 * 60 * 1000) && !backupHealthWarningSent) {
+        backupHealthWarningSent = true;
+        await alertOwner('Backup health warning', new Error(lastBackupAt
+          ? 'No successful backup has been recorded in over 18 hours.'
+          : 'No successful backup has been confirmed since startup.'));
+        // Attempt a recovery backup immediately; backupData also schedules a retry if it fails.
+        void backupData();
+      }
       for (const [key,d] of Object.entries(deliveries)) {
         if ((d?.paymentConfirmed || d?.paid) && !deliveryRetryTimers.has(key) && !d.deliveryComplete) {
           if (d.deliveryError && d.deliveryError.includes('missing from storage') && d.path && fs.existsSync(d.path)) delete d.deliveryError;
