@@ -250,9 +250,8 @@ async function notifyOwner(payload, { log = true, notificationType = 'owner.noti
       const channel = await client.channels.fetch(RENDER_ALERT_CHANNEL_ID);
       if (!channel || !channel.isTextBased() || !channel.send) throw new Error('Configured deployment alert channel is unavailable or not text-based.');
       await channel.send({
-        content: OWNER_ID ? '<@' + OWNER_ID + '>' : undefined,
         embeds: payload.embeds,
-        allowedMentions: { users: OWNER_ID ? [OWNER_ID] : [] }
+        allowedMentions: { parse: [] }
       });
       deliveredToDeployChannel = true;
     } catch (e) {
@@ -6839,7 +6838,7 @@ async function monitorRenderDeployments() {
             latest.finishedAt ? '**Finished:** <t:' + Math.floor(Date.parse(latest.finishedAt) / 1000) + ':F>' : null
           ].filter(Boolean).join('\\n'))
           .setTimestamp();
-        await notifyOwner({ embeds: [embed] }, { log: true, notificationType: 'render.deploy_succeeded_api', notificationStatus: 'success' });
+        await notifyOwner({ embeds: [embed] }, { log: false, notificationType: 'render.deploy_succeeded_api', notificationStatus: 'success' });
       }
     } else {
       for (const deploy of observed) {
@@ -6860,7 +6859,7 @@ async function monitorRenderDeployments() {
               deploy.createdAt ? '**Created:** <t:' + Math.floor(Date.parse(deploy.createdAt) / 1000) + ':F>' : null
             ].filter(Boolean).join('\n'))
             .setTimestamp();
-          await notifyOwner({ embeds: [embed] }, { log: true, notificationType: 'render.deploy_started_api', notificationStatus: 'info' });
+          await notifyOwner({ embeds: [embed] }, { log: false, notificationType: 'render.deploy_started_api', notificationStatus: 'info' });
         } else if (previousStatus !== status) {
           renderObservedDeployments.set(deployId, status);
           const commit = deploy.commit?.id ? String(deploy.commit.id).slice(0, 12) : 'Not supplied';
@@ -6925,7 +6924,7 @@ async function monitorRenderDeployments() {
           '**Started:** <t:' + Math.floor(started / 1000) + ':F>'
         ].join('\n'))
         .setTimestamp();
-      await notifyOwner({ embeds: [embed] }, { log: true, notificationType: 'render.deploy_slow', notificationStatus: 'warning' });
+      await notifyOwner({ embeds: [embed] }, { log: false, notificationType: 'render.deploy_slow', notificationStatus: 'warning' });
     }
   } catch (error) {
     if (Date.now() - lastRenderMonitorErrorAt > 10 * 60 * 1000) {
