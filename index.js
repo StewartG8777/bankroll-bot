@@ -4687,8 +4687,8 @@ async function cmdBotAdmin(interaction) {
       );
       const deployId = deploy.id || deploy.deploy?.id || '';
       await channel.send({
-        content: '<@' + OWNER_ID + '> **Bankroll deployment alerts are being configured.** This channel will report deployment starts, successes, failures, slow deployments and available build diagnostics. A Render redeploy has been requested.' + (deployId ? '\\nDeploy: `' + String(deployId).slice(0, 100) + '`' : ''),
-        allowedMentions: { users: [OWNER_ID] }
+        content: '**Bankroll deployment alerts are being configured.** This channel will report deployment starts, successes, failures and slow deployments without pings. A Render redeploy has been requested.' + (deployId ? '\\nDeploy: `' + String(deployId).slice(0, 100) + '`' : ''),
+        allowedMentions: { parse: [] }
       });
       return interaction.editReply('Created/configured <#' + channel.id + '> and saved it to Render as RENDER_ALERT_CHANNEL_ID. Render accepted a redeployment request. Once the new version starts, deployment alerts will be posted here and ping you.');
     } catch (error) {
@@ -6810,6 +6810,10 @@ async function fetchRenderFailureLogs(deployId, startedAt) {
   return result;
 }
 
+function renderDeploymentCommitName(deploy) {
+  return String(deploy?.commit?.message || deploy?.commit?.name || deploy?.commitMessage || deploy?.message || 'Not supplied').slice(0, 180);
+}
+
 const renderObservedDeployments = new Map();
 let renderMonitorInitialized = false;
 
@@ -6845,7 +6849,8 @@ async function monitorRenderDeployments() {
             '**Bankroll has started on the newly deployed version.**',
             '**Final status:** ' + latestStatus.toUpperCase(),
             '**Deploy ID:** ' + String(latest.id),
-            '**Commit:** ' + (latestCommit ? latestCommit.slice(0, 12) : 'Not supplied'),
+            '**Commit name:** ' + renderDeploymentCommitName(latest),
+            '**Commit ID:** ' + (latestCommit ? latestCommit.slice(0, 12) : 'Not supplied'),
             latest.finishedAt ? '**Finished:** <t:' + Math.floor(Date.parse(latest.finishedAt) / 1000) + ':F>' : null
           ].filter(Boolean).join('\\n'))
           .setTimestamp();
@@ -6866,7 +6871,8 @@ async function monitorRenderDeployments() {
               '**A new Bankroll deployment was detected.**',
               '**Status:** ' + status.toUpperCase(),
               '**Deploy ID:** ' + deployId,
-              '**Commit:** ' + commit,
+              '**Commit name:** ' + renderDeploymentCommitName(deploy),
+              '**Commit ID:** ' + commit,
               deploy.createdAt ? '**Created:** <t:' + Math.floor(Date.parse(deploy.createdAt) / 1000) + ':F>' : null
             ].filter(Boolean).join('\n'))
             .setTimestamp();
@@ -6886,14 +6892,15 @@ async function monitorRenderDeployments() {
                 '**Previous status:** ' + previousStatus.toUpperCase(),
                 '**Final status:** ' + status.toUpperCase(),
                 '**Deploy ID:** ' + deployId,
-                '**Commit:** ' + commit,
+                '**Commit name:** ' + renderDeploymentCommitName(deploy),
+                '**Commit ID:** ' + commit,
                 deploy.finishedAt ? '**Finished:** <t:' + Math.floor(Date.parse(deploy.finishedAt) / 1000) + ':F>' : null
               ].filter(Boolean).join('\n'))
               .setTimestamp();
             if (diagnostics?.logs) embed.addFields({ name: 'Build/application logs', value: diagnostics.logs.slice(0, 1000) });
             if (diagnostics?.note) embed.addFields({ name: 'Diagnostics', value: diagnostics.note.slice(0, 1000) });
             await notifyOwner({ embeds: [embed] }, {
-              log: true,
+              log: false,
               notificationType: isFailure ? 'render.deploy_failed_api' : 'render.deploy_succeeded_api',
               notificationStatus: isFailure ? 'error' : 'success'
             });
@@ -6931,7 +6938,8 @@ async function monitorRenderDeployments() {
           '**Status:** ' + String(deploy.status).toUpperCase(),
           '**Duration:** ' + Math.floor(elapsedSeconds / 60) + 'm ' + (elapsedSeconds % 60) + 's',
           '**Deploy ID:** ' + deployId,
-          '**Commit:** ' + commit,
+          '**Commit name:** ' + renderDeploymentCommitName(deploy),
+          '**Commit ID:** ' + commit,
           '**Started:** <t:' + Math.floor(started / 1000) + ':F>'
         ].join('\n'))
         .setTimestamp();
@@ -7026,6 +7034,8 @@ app.post('/render-webhook', express.raw({ type: 'application/json' }), async (re
       '**Event:** ' + title,
       status ? '**Result:** ' + statusLabel : null,
       event?.timestamp ? '**Time:** ' + new Date(event.timestamp).toLocaleString('en-GB', { timeZone: 'Europe/London' }) : null,
+      event?.data?.commit?.message ? '**Commit name:** ' + String(event.data.commit.message).slice(0, 180) : null,
+      event?.data?.commit?.id ? '**Commit ID:** ' + String(event.data.commit.id).slice(0, 12) : null,
       '**Event ID:** ' + eventId
     ].filter(Boolean).join('\n');
     let failureDiagnostics = null;
@@ -7042,7 +7052,7 @@ app.post('/render-webhook', express.raw({ type: 'application/json' }), async (re
     if (failureDiagnostics?.logs) embed.addFields({ name: 'Build error logs / recent output', value: 'Recent Render build output: ' + failureDiagnostics.logs.slice(0, 980) });
     if (failureDiagnostics?.note) embed.addFields({ name: 'Diagnostics note', value: failureDiagnostics.note.slice(0, 1000) });
     await notifyOwner({ embeds: [embed] }, {
-      log: true,
+      log: false,
       notificationType: 'render.' + type,
       notificationStatus: isFailure ? 'error' : (status === 'succeeded' ? 'success' : 'info')
     });
