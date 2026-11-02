@@ -2113,6 +2113,9 @@ const botAdminCmd = common(
     .addSubcommand((sub) => sub.setName('refresh-commands').setDescription('Refresh all Discord slash commands immediately'))
     .addSubcommand((sub) => sub.setName('redeploy').setDescription('Trigger a new deployment from the latest GitHub commit on Render'))
     .addSubcommand((sub) => sub.setName('restart').setDescription('Restart the running Render service'))
+    .addSubcommand((sub) => sub.setName('env-list').setDescription('List Render environment variable names (values stay hidden)'))
+    .addSubcommand((sub) => sub.setName('env-add').setDescription('Add a Render environment variable securely').addStringOption((o) => o.setName('key').setDescription('Environment variable name').setRequired(true)))
+    .addSubcommand((sub) => sub.setName('env-edit').setDescription('Edit a Render environment variable securely').addStringOption((o) => o.setName('key').setDescription('Environment variable name').setRequired(true)))
     .addSubcommand((sub) => sub.setName('avatar').setDescription('Change the bot profile picture').addAttachmentOption((o) => o.setName('image').setDescription('PNG, JPG or GIF image').setRequired(true)))
     .addSubcommand((sub) => sub.setName('status').setDescription('Change the bot online presence').addStringOption((o) => o.setName('presence').setDescription('Discord presence colour/status').setRequired(true).addChoices(
       { name: 'Online (green)', value: 'online' },
@@ -4632,6 +4635,15 @@ async function cmdBotAdmin(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can use these controls.');
   const sub = interaction.options.getSubcommand();
 
+  if (sub === 'env-list') {
+    if (!RENDER_API_KEY || !RENDER_SERVICE_ID) return interaction.editReply('Set RENDER_API_KEY and RENDER_SERVICE_ID in Render first.');
+    const vars = await renderApiGet(`https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}/env-vars?limit=100`);
+    const entries = Array.isArray(vars) ? vars.map((x) => x.envVar || x).filter((x) => x.key) : [];
+    if (!entries.length) return interaction.editReply('No service-level environment variables were returned. Linked environment-group variables are not included.');
+    const names = entries.map((x) => '`' + String(x.key).replace(/[`]/g, '') + '`').sort();
+    return interaction.editReply({ content: '**Render environment variables** (' + names.length + ')\\n' + names.join(', ').slice(0, 1850) + '\\n\\nValues are hidden for security. Linked environment-group variables are not included.' });
+  }
+
   if (sub === 'refresh-commands') {
     const desired = commands.map((c) => c.toJSON());
     const currentCollection = await client.application.commands.fetch().catch((e) => {
@@ -6452,6 +6464,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton()) return await onButton(interaction);
     if (interaction.isStringSelectMenu() && interaction.customId === 'monzo_review_select') return await showMonzoReviewModal(interaction);
     if (interaction.isStringSelectMenu() && interaction.customId === 'customer_preview_select') return await onCustomerPreviewSelect(interaction);
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('render_env_modal:')) return await saveRenderEnvModal(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith('monzo_review_modal:')) return await saveMonzoReviewModal(interaction);
     if (!interaction.isChatInputCommand()) return;
     if (!commands.some((c) => c.name === interaction.commandName)) return;
@@ -6534,9 +6547,14 @@ client.on('interactionCreate', async (interaction) => {
       case 'export':
         await interaction.deferReply({ ephemeral: true });
         return await cmdExport(interaction);
-      case 'bot':
+      case 'bot': {
+        const botSubcommand = interaction.options.getSubcommand();
+        if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'Only the bot owner can use these controls.', ephemeral: true });
+        if (botSubcommand === 'env-add') return await showRenderEnvModal(interaction, 'add');
+        if (botSubcommand === 'env-edit') return await showRenderEnvModal(interaction, 'edit');
         await interaction.deferReply({ ephemeral: true });
         return await cmdBotAdmin(interaction);
+      }
       default:
         await interaction.deferReply({ ephemeral: true });
         if (interaction.commandName === 'payments') return await cmdPayments(interaction);
@@ -6578,15 +6596,73 @@ function saveRenderLongDeployAlerts() {
   }
 }
 
-async function renderApiGet(url) {
+async function renderApiRequest(url, method = 'GET', payload) {
   if (!RENDER_API_KEY) throw new Error('RENDER_API_KEY is not configured.');
   const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${RENDER_API_KEY}`, Accept: 'application/json' },
-    signal: AbortSignal.timeout(12000),
+    method,
+    headers: {
+      Authorization: `Bearer ${RENDER_API_KEY}`,
+      Accept: 'application/json',
+      ...(payload === undefined ? {} : { 'Content-Type': 'application/json' }),
+    },
+    ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
+    signal: AbortSignal.timeout(20000),
   });
   const body = await response.text();
   if (!response.ok) throw new Error(`Render API HTTP ${response.status}: ${body.slice(0, 500)}`);
-  try { return body ? JSON.parse(body) : {}; } catch { throw new Error('Render API returned invalid JSON.'); }
+  if (!body) return {};
+  try { return JSON.parse(body); } catch { throw new Error('Render API returned invalid JSON.'); }
+}
+async function renderApiGet(url) { return renderApiRequest(url); }
+
+function showRenderEnvModal(interaction, mode) {
+  if (!RENDER_API_KEY || !RENDER_SERVICE_ID) {
+    return interaction.reply({ content: 'Set RENDER_API_KEY and RENDER_SERVICE_ID in Render first.', ephemeral: true });
+  }
+  const key = String(interaction.options.getString('key') || '').trim().toUpperCase();
+  if (!/^[A-Z][A-Z0-9_]{0,99}$/.test(key)) {
+    return interaction.reply({ content: 'Invalid variable name. Use letters, numbers and underscores; it must start with a letter.', ephemeral: true });
+  }
+  const modal = new ModalBuilder()
+    .setCustomId(`render_env_modal:${mode}:${key}`)
+    .setTitle(mode === 'add' ? 'Add Render variable' : 'Edit Render variable');
+  const keyInput = new TextInputBuilder()
+    .setCustomId('env_key').setLabel('Variable name').setStyle(TextInputStyle.Short)
+    .setValue(key).setRequired(true).setMaxLength(100);
+  const valueInput = new TextInputBuilder()
+    .setCustomId('env_value').setLabel('Variable value (kept private)').setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder('Paste the value here — it will not be shown in the response.')
+    .setRequired(true).setMaxLength(4000);
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(keyInput),
+    new ActionRowBuilder().addComponents(valueInput)
+  );
+  return interaction.showModal(modal);
+}
+
+async function saveRenderEnvModal(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'Only the bot owner can change Render environment variables.', ephemeral: true });
+  if (!RENDER_API_KEY || !RENDER_SERVICE_ID) return interaction.reply({ content: 'Set RENDER_API_KEY and RENDER_SERVICE_ID in Render first.', ephemeral: true });
+  const [, mode, originalKey] = interaction.customId.split(':');
+  const key = String(interaction.fields.getTextInputValue('env_key') || '').trim().toUpperCase();
+  const value = interaction.fields.getTextInputValue('env_value');
+  if (!['add', 'edit'].includes(mode) || key !== originalKey || !/^[A-Z][A-Z0-9_]{0,99}$/.test(key)) {
+    return interaction.reply({ content: 'Invalid environment variable details. Reopen the command and try again.', ephemeral: true });
+  }
+  if (!value || !value.trim()) return interaction.reply({ content: 'The value cannot be empty.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const endpoint = `https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}/env-vars/${encodeURIComponent(key)}`;
+  try {
+    await renderApiRequest(endpoint, 'PUT', { value });
+    const deploy = await renderApiRequest(`https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}/deploys`, 'POST', {});
+    const deployId = deploy.id || deploy.deploy?.id || deploy.deployId || '';
+    return interaction.editReply({
+      content: `**${mode === 'add' ? 'Added' : 'Updated'} ${key}.** Render accepted the variable and a deployment was requested.${deployId ? `\\nDeployment: \`${String(deployId).slice(0, 100)}\`` : ''}\\nThe value has not been displayed or logged by Bankroll.`
+    });
+  } catch (error) {
+    console.error(`Render environment update failed for key ${key}:`, error.message);
+    return interaction.editReply(`Could not update ${key}: ${String(error.message || error).slice(0, 500)}. The value was not logged.`);
+  }
 }
 
 async function fetchRenderFailureLogs(deployId, startedAt) {
