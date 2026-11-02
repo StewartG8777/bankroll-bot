@@ -6728,7 +6728,7 @@ app.post('/render-webhook', express.raw({ type: 'application/json' }), async (re
     const deployId = String(event?.data?.deployId || event?.data?.id || '');
     const deployStartedAt = event?.data?.startedAt || event?.timestamp || new Date().toISOString();
     const serviceName = String(event?.data?.serviceName || 'Bankroll');
-    const isFailure = status === 'failed' || status === 'canceled' ||
+    const isFailure = ['failed', 'canceled', 'build_failed', 'update_failed', 'pre_deploy_failed'].includes(status) ||
       ['server_failed', 'image_pull_failed', 'pipeline_minutes_exhausted'].includes(type);
     const labels = {
       deploy_started: 'Deployment started',
@@ -6765,7 +6765,7 @@ app.post('/render-webhook', express.raw({ type: 'application/json' }), async (re
       .setTimestamp();
     if (failureDiagnostics?.status) embed.addFields({ name: 'Render deploy status', value: failureDiagnostics.status, inline: true });
     if (failureDiagnostics?.commit) embed.addFields({ name: 'Commit', value: failureDiagnostics.commit.slice(0, 100), inline: true });
-    if (failureDiagnostics?.logs) embed.addFields({ name: 'Build error logs / recent output', value: '\\`\\`\\`\\n' + failureDiagnostics.logs.slice(0, 1000) + '\\n\\`\\`\\`' });
+    if (failureDiagnostics?.logs) embed.addFields({ name: 'Build error logs / recent output', value: 'Recent Render build output:\\n' + failureDiagnostics.logs.slice(0, 980) });
     if (failureDiagnostics?.note) embed.addFields({ name: 'Diagnostics note', value: failureDiagnostics.note.slice(0, 1000) });
     await notifyOwner({ embeds: [embed] }, {
       log: true,
