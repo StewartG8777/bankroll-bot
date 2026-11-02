@@ -1795,47 +1795,26 @@ const common = (b) =>
 const bankrollCmd = common(
   new SlashCommandBuilder()
     .setName('bankroll')
-    .setDescription('Create a payment link / invoice for a customer')
-    .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
-    .addNumberOption((o) =>
-      o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true)
-    )
-    .addStringOption((o) =>
-      o.setName('description').setDescription('What the purchase is for').setRequired(true)
-    )
-    .addAttachmentOption((o) =>
-      o.setName('file').setDescription('File to send the customer once they have paid')
-    )
-    .addStringOption((o) =>
-      o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true)
-    )
-    .addStringOption((o) =>
-      o
-        .setName('delivery')
-        .setDescription('How to deliver the file (only used with a file)')
-        .addChoices(
-          { name: 'Hosted one-time link', value: 'link' },
-          { name: 'Direct file upload', value: 'direct' }
-        )
-    )
-    .addStringOption((o) =>
-      o
-        .setName('currency')
-        .setDescription('Currency for this invoice (default: your usual one)')
-        .addChoices(
-          { name: 'GBP £', value: 'gbp' },
-          { name: 'USD dollars', value: 'usd' },
-          { name: 'EUR €', value: 'eur' }
-        )
-    )
-    .addStringOption((o) =>
-      o.setName('link').setDescription('Download link to send once they have paid (for big files)')
-    )
-    .addStringOption((o) =>
-      o
-        .setName('expires')
-        .setDescription('Expiration time, e.g. 30m, 2h, 24h, or 7d (default: no expiry)')
-    )
+    .setDescription('Bankroll invoices, Stripe balance and payouts')
+    .addSubcommand((sub) => sub
+      .setName('checkout')
+      .setDescription('Create a payment link / invoice for a customer')
+      .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
+      .addNumberOption((o) => o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true))
+      .addStringOption((o) => o.setName('description').setDescription('What the purchase is for').setRequired(true))
+      .addAttachmentOption((o) => o.setName('file').setDescription('File to send the customer once they have paid'))
+      .addStringOption((o) => o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true))
+      .addStringOption((o) => o.setName('delivery').setDescription('How to deliver the file (only used with a file)')
+        .addChoices({ name: 'Hosted one-time link', value: 'link' }, { name: 'Direct file upload', value: 'direct' }))
+      .addStringOption((o) => o.setName('currency').setDescription('Currency for this invoice (default: your usual one)')
+        .addChoices({ name: 'GBP £', value: 'gbp' }, { name: 'USD dollars', value: 'usd' }, { name: 'EUR €', value: 'eur' }))
+      .addStringOption((o) => o.setName('link').setDescription('Download link to send once they have paid (for big files)'))
+      .addStringOption((o) => o.setName('expires').setDescription('Expiration time, e.g. 30m, 2h, 24h, or 7d (default: no expiry)')))
+    .addSubcommand((sub) => sub.setName('balance').setDescription('Show available and pending Stripe balances'))
+    .addSubcommand((sub) => sub.setName('payout').setDescription('Withdraw all available funds in a currency to your linked bank account')
+      .addStringOption((o) => o.setName('currency').setDescription('Currency to withdraw (default: GBP)')
+        .addChoices({ name: 'GBP £', value: 'gbp' }, { name: 'USD dollars', value: 'usd' }, { name: 'EUR €', value: 'eur' })))
+    .addSubcommand((sub) => sub.setName('cashlogs').setDescription('Show your recent Stripe payout history'))
 );
 
 const addTestPurchaseOptions = (sub, isCard) => {
@@ -2198,21 +2177,7 @@ const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription(
   .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' }))
   .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records')));
 
-const bkCmd = common(
-  new SlashCommandBuilder()
-    .setName('bk')
-    .setDescription('Bankroll Stripe balance and payouts')
-    .addSubcommand((sub) => sub.setName('balance').setDescription('Show available and pending Stripe balances'))
-    .addSubcommand((sub) => sub.setName('payout').setDescription('Withdraw all available funds in a currency to your linked bank account')
-      .addStringOption((o) => o.setName('currency').setDescription('Currency to withdraw (default: GBP)').addChoices(
-        { name: 'GBP £', value: 'gbp' },
-        { name: 'USD $', value: 'usd' },
-        { name: 'EUR €', value: 'eur' }
-      )))
-    .addSubcommand((sub) => sub.setName('payouts').setDescription('Show your recent Stripe payouts'))
-);
-
-const commands = [sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd, bkCmd];
+const commands = [sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
 // are never cached.
@@ -6334,7 +6299,7 @@ async function cmdBankrollFinance(interaction) {
     return interaction.editReply({ embeds: [embed] });
   }
 
-  if (sub === 'payouts') {
+  if (sub === 'cashlogs') {
     const result = await stripe.payouts.list({ limit: 10 });
     if (!result.data.length) return interaction.editReply('No Stripe payouts were found.');
     const embed = new EmbedBuilder().setColor(GREEN).setTitle('BANKROLL | RECENT STRIPE PAYOUTS')
@@ -6458,11 +6423,12 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     switch (interaction.commandName) {
-      case 'bankroll':
-        return await sendStripeCheckout(interaction);
-      case 'bk':
+      case 'bankroll': {
+        const bankrollSubcommand = interaction.options.getSubcommand();
+        if (bankrollSubcommand === 'checkout') return await sendStripeCheckout(interaction);
         await interaction.deferReply({ ephemeral: true });
         return await cmdBankrollFinance(interaction);
+      }
       case 'bankroll-monzo':
         return await sendMonzoInvoice(interaction);
       case 'monzo-review':
