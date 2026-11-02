@@ -898,6 +898,44 @@ async function downloadAttachment(att, hosted) {
   }
 }
 
+// Bundle multiple invoice attachments into one ZIP to preserve the existing delivery/retry flow.
+async function downloadInvoiceAttachments(attachments, hosted) {
+  if (!attachments.length) return null;
+  if (attachments.length === 1) return downloadAttachment(attachments[0], hosted);
+  const downloaded = [];
+  try {
+    let totalBytes = 0;
+    for (const attachment of attachments) {
+      const item = await downloadAttachment(attachment, hosted);
+      downloaded.push(item);
+      totalBytes += item.size || 0;
+      if (totalBytes > 100 * 1024 * 1024) throw new Error('The combined files are over 100 MB. Please use fewer or smaller files.');
+    }
+    const zip = new AdmZip();
+    const usedNames = new Set();
+    for (let i = 0; i < downloaded.length; i++) {
+      const item = downloaded[i];
+      const original = path.basename(item.name || `file-${i + 1}`).replace(/[\\/:*?"<>|]/g, '_');
+      let entryName = original;
+      let suffix = 2;
+      while (usedNames.has(entryName.toLowerCase())) {
+        const ext = path.extname(original);
+        entryName = `${path.basename(original, ext)} (${suffix++})${ext}`;
+      }
+      usedNames.add(entryName.toLowerCase());
+      zip.addLocalFile(item.path, '', entryName);
+    }
+    const zipPath = path.join(TMP_DIR, `${crypto.randomBytes(10).toString('hex')}_invoice-files.zip`);
+    zip.writeZip(zipPath);
+    for (const item of downloaded) { try { fs.unlinkSync(item.path); } catch {} }
+    const size = fs.statSync(zipPath).size;
+    return { path: zipPath, temp: true, name: `${attachments.length}-files.zip`, size, sha256: await sha256File(zipPath), fileCount: attachments.length };
+  } catch (err) {
+    for (const item of downloaded) { try { fs.unlinkSync(item.path); } catch {} }
+    throw err;
+  }
+}
+
 // Old half-finished downloads are cleared out.
 function sweepTmp() {
   try {
@@ -1845,7 +1883,11 @@ const bankrollCmd = common(
       .addUserOption((o) => o.setName('customer').setDescription('Who is paying').setRequired(true))
       .addNumberOption((o) => o.setName('amount').setDescription('Amount to charge').setMinValue(1).setRequired(true))
       .addStringOption((o) => o.setName('description').setDescription('What the purchase is for').setRequired(true))
-      .addAttachmentOption((o) => o.setName('file').setDescription('File to send the customer once they have paid'))
+      .addAttachmentOption((o) => o.setName('file').setDescription('First file to send after payment'))
+      .addAttachmentOption((o) => o.setName('file2').setDescription('Second file (optional)'))
+      .addAttachmentOption((o) => o.setName('file3').setDescription('Third file (optional)'))
+      .addAttachmentOption((o) => o.setName('file4').setDescription('Fourth file (optional)'))
+      .addAttachmentOption((o) => o.setName('file5').setDescription('Fifth file (optional)'))
       .addStringOption((o) => o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true))
       .addStringOption((o) => o.setName('delivery').setDescription('How to deliver the file (only used with a file)')
         .addChoices({ name: 'Hosted one-time link', value: 'link' }, { name: 'Direct file upload', value: 'direct' }))
@@ -1865,7 +1907,11 @@ const addTestPurchaseOptions = (sub, isCard) => {
     .addUserOption((o) => o.setName('customer').setDescription('Who receives the test invoice').setRequired(true))
     .addNumberOption((o) => o.setName('amount').setDescription('Test invoice amount').setMinValue(1).setRequired(true))
     .addStringOption((o) => o.setName('description').setDescription('What the test purchase is for').setRequired(true))
-    .addAttachmentOption((o) => o.setName('file').setDescription('File to deliver after simulated payment'))
+    .addAttachmentOption((o) => o.setName('file').setDescription('First file to deliver after simulated payment'))
+    .addAttachmentOption((o) => o.setName('file2').setDescription('Second file (optional)'))
+    .addAttachmentOption((o) => o.setName('file3').setDescription('Third file (optional)'))
+    .addAttachmentOption((o) => o.setName('file4').setDescription('Fourth file (optional)'))
+    .addAttachmentOption((o) => o.setName('file5').setDescription('Fifth file (optional)'))
     .addStringOption((o) => o.setName('vault_file').setDescription('Or choose a saved vault file').setAutocomplete(true))
     .addStringOption((o) => o.setName('delivery').setDescription('Direct file first, or hosted download link')
       .addChoices({ name: 'Direct file upload with link fallback', value: 'direct' }, { name: 'Hosted one-time link', value: 'link' }));
@@ -1897,9 +1943,11 @@ const monzoCmd = common(
     .addStringOption((o) =>
       o.setName('description').setDescription('What the purchase is for').setRequired(true)
     )
-    .addAttachmentOption((o) =>
-      o.setName('file').setDescription('File to send the customer once they have paid')
-    )
+    .addAttachmentOption((o) => o.setName('file').setDescription('First file to send after payment'))
+    .addAttachmentOption((o) => o.setName('file2').setDescription('Second file (optional)'))
+    .addAttachmentOption((o) => o.setName('file3').setDescription('Third file (optional)'))
+    .addAttachmentOption((o) => o.setName('file4').setDescription('Fourth file (optional)'))
+    .addAttachmentOption((o) => o.setName('file5').setDescription('Fifth file (optional)'))
     .addStringOption((o) =>
       o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true)
     )
@@ -3074,7 +3122,8 @@ async function sendStripeCheckout(interaction) {
   await interaction.deferReply();
 
   try {
-    const file = interaction.options.getAttachment('file');
+    const files = ['file', 'file2', 'file3', 'file4', 'file5'].map((name) => interaction.options.getAttachment(name)).filter(Boolean);
+    const file = files[0] || null;
     const vaultKey = interaction.options.getString('vault_file');
     const linkRaw = interaction.options.getString('link');
     const expiresInput = interaction.options.getString('expires');
@@ -3087,7 +3136,7 @@ async function sendStripeCheckout(interaction) {
       }
     }
     
-    if ((file && vaultKey) || (file && linkRaw) || (vaultKey && linkRaw)) {
+    if ((files.length && vaultKey) || (files.length && linkRaw) || (vaultKey && linkRaw)) {
       throw new Error('Use only one of: attached file, vault file, or download link.');
     }
 
@@ -3103,13 +3152,13 @@ async function sendStripeCheckout(interaction) {
     }
 
     const mode = interaction.options.getString('delivery') ?? 'direct';
-    if ((file || vaultKey) && mode === 'link' && !BASE_URL) {
+    if ((files.length || vaultKey) && mode === 'link' && !BASE_URL) {
       throw new Error('Hosted links are not set up yet (PUBLIC_URL is missing). Pick Direct file upload.');
     }
 
     let fileData = null;
-    if (file) {
-      fileData = await downloadAttachment(file, mode === 'link');
+    if (files.length) {
+      fileData = await downloadInvoiceAttachments(files, mode === 'link');
     } else if (vaultKey) {
       const item = vault[vaultKey];
       if (!item || !fs.existsSync(item.path)) {
@@ -3280,11 +3329,12 @@ async function sendMonzoInvoice(interaction) {
   await interaction.deferReply();
 
   try {
-    const file = interaction.options.getAttachment('file');
+    const files = ['file', 'file2', 'file3', 'file4', 'file5'].map((name) => interaction.options.getAttachment(name)).filter(Boolean);
+    const file = files[0] || null;
     const vaultKey = interaction.options.getString('vault_file');
     const linkRaw = interaction.options.getString('link');
 
-    if ((file && vaultKey) || (file && linkRaw) || (vaultKey && linkRaw)) {
+    if ((files.length && vaultKey) || (files.length && linkRaw) || (vaultKey && linkRaw)) {
       throw new Error('Use only one of: attached file, vault file, or download link.');
     }
     if (!MONZO_LINK && !MONZO_PAYMENT_DETAILS) {
@@ -3303,13 +3353,13 @@ async function sendMonzoInvoice(interaction) {
     }
 
     const mode = interaction.options.getString('delivery') ?? 'direct';
-    if ((file || vaultKey) && mode === 'link' && !BASE_URL) {
+    if ((files.length || vaultKey) && mode === 'link' && !BASE_URL) {
       throw new Error('Hosted links are not set up yet (PUBLIC_URL is missing). Pick Direct file upload.');
     }
 
     let fileData = null;
-    if (file) {
-      fileData = await downloadAttachment(file, mode === 'link');
+    if (files.length) {
+      fileData = await downloadInvoiceAttachments(files, mode === 'link');
     } else if (vaultKey) {
       const item = vault[vaultKey];
       if (!item || !fs.existsSync(item.path)) {
@@ -4135,16 +4185,17 @@ async function cmdPaymentTest(interaction) {
     const amount = Math.round(interaction.options.getNumber('amount', true) * 100) / 100;
     const description = interaction.options.getString('description', true);
     const currency = method === 'monzo' ? 'gbp' : (interaction.options.getString('currency') || CURRENCY).toLowerCase();
-    const file = interaction.options.getAttachment('file');
+    const files = ['file', 'file2', 'file3', 'file4', 'file5'].map((name) => interaction.options.getAttachment(name)).filter(Boolean);
+    const file = files[0] || null;
     const vaultKey = interaction.options.getString('vault_file');
     const linkRaw = interaction.options.getString('link');
     const mode = interaction.options.getString('delivery') || 'direct';
     const expiresInput = method === 'bankroll' ? interaction.options.getString('expires') : null;
 
-    if ((file && vaultKey) || (file && linkRaw) || (vaultKey && linkRaw)) {
+    if ((files.length && vaultKey) || (files.length && linkRaw) || (vaultKey && linkRaw)) {
       throw new Error('Use only one of: attached file, vault file, or download link.');
     }
-    if (mode === 'link' && !BASE_URL && (file || vaultKey)) {
+    if (mode === 'link' && !BASE_URL && (files.length || vaultKey)) {
       throw new Error('Hosted links are not configured. Add PUBLIC_URL to Render or choose Direct file upload.');
     }
 
@@ -4168,8 +4219,8 @@ async function cmdPaymentTest(interaction) {
     }
 
     let fileData = null;
-    if (file) {
-      fileData = await downloadAttachment(file, mode === 'link');
+    if (files.length) {
+      fileData = await downloadInvoiceAttachments(files, mode === 'link');
     } else if (vaultKey) {
       const item = vault[vaultKey];
       if (!item || !item.path || !fs.existsSync(item.path)) throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
