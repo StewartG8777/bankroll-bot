@@ -1290,16 +1290,19 @@ let backupRetryTimer = null;
 let backupHealthWarningSent = false;
 let backupFailureAlertSent = false;
 function backupData() {
-  backupChain = backupChain.then(() => backupDataOnce()).catch((e) => {
-    console.error('Backup failed:', e.message);
-    // Alert the owner once per failure streak; never send backup diagnostics to customers.
+  // Return an explicit result to callers. The old catch swallowed errors, so
+  // /downloads backup reported success even when Discord rejected every upload.
+  backupChain = backupChain.then(async () => {
+    await backupDataOnce();
+    return { ok: true };
+  }).catch((e) => {
+    console.error('Backup failed:', e.stack || e.message || e);
     if (!backupFailureAlertSent) {
       backupFailureAlertSent = true;
       void alertOwner('Automatic backup failed', e).catch((alertError) => {
         console.error('Could not alert owner about backup failure:', alertError.message);
       });
     }
-    // A failed run must not silently wait for the next six-hour cycle.
     if (!shuttingDown && !backupRetryTimer) {
       backupRetryTimer = setTimeout(() => {
         backupRetryTimer = null;
@@ -1307,6 +1310,7 @@ function backupData() {
       }, 5 * 60 * 1000);
       backupRetryTimer.unref?.();
     }
+    return { ok: false, error: String(e?.message || e || 'Unknown backup error') };
   });
   return backupChain;
 }
@@ -1447,7 +1451,8 @@ async function backupDataOnce() {
               files: [new AttachmentBuilder(piece, { name: `bankroll-backup-part-${part}-of-${total}.bin` })],
               allowedMentions: { parse: [] },
             });
-            if (sent?.id) sentIds.push(sent.id);
+            if (!sent?.id) throw new Error(`Discord did not confirm ${rel} part ${part}/${total}.`);
+            sentIds.push(sent.id);
           }
         } finally { await handle.close().catch(() => {}); }
         // The new copy is complete: delete the parts THIS process uploaded earlier for the same file,
@@ -2798,6 +2803,9 @@ const onReady = async () => {
     }
   } catch (e) { console.error('Restart-loop check failed:', e.message); }
   await autoRestoreOnStartup();
+  // Always establish a fresh recovery point after startup restore. Previously a
+  // quiet bot could restart and never create a new snapshot until another save.
+  void backupData();
   try {
     const status = ['online', 'idle', 'dnd', 'invisible'].includes(savedPresence?.status) ? savedPresence.status : 'online';
     await client.user.setPresence({ status, activities: [] });
@@ -3773,7 +3781,16 @@ async function cmdDownloads(interaction) {
     return interaction.editReply({ embeds: [new EmbedBuilder().setColor(GREY).setTitle(`Download activity (${downloadHistory.length} stored)`).setDescription(lines.join('\n\n').slice(0,3900)).setFooter({ text: 'Audit history is retained across restarts and included in backups.' })] });
   }
   if (sub === 'cleanup') { const removed = cleanDownloads(); recordNotification('downloads.cleanup','Download cleanup completed',`${removed} expired, used or missing download record(s) removed.`,'success'); return interaction.editReply(`Cleanup complete. Removed **${removed}** expired, used or missing download record(s).`); }
-  if (sub === 'backup') { await interaction.editReply('Starting an immediate Bankroll backup…'); await backupData(); recordNotification('downloads.backup','Manual backup completed','An immediate backup run was requested from /downloads backup.','success'); return interaction.editReply('Backup run finished. Check #bankroll-backup and the bot logs for any upload errors.'); }
+  if (sub === 'backup') {
+    await interaction.editReply('Starting an immediate Bankroll backup…');
+    const result = await backupData();
+    if (!result?.ok) {
+      recordNotification('downloads.backup_failed', 'Manual backup failed', result?.error || 'Unknown backup error', 'error');
+      return interaction.editReply('❌ **Backup failed.** ' + short(result?.error || 'Unknown backup error', 900) + '\nAutomatic retry is scheduled in 5 minutes. Check the bot logs for details.');
+    }
+    recordNotification('downloads.backup', 'Manual backup completed', 'Discord confirmed the database snapshot and every stored-file backup part.', 'success');
+    return interaction.editReply('✅ **Backup confirmed.** Discord accepted the database snapshot and all stored-file parts in #bankroll-backup.');
+  }
   const key = interaction.options.getString('vault_key').trim(); const item = vault[key];
   if (!item?.path || !fs.existsSync(item.path)) return interaction.editReply(`Vault file \`${key}\` is missing.`);
   if (sub === 'verify') {
