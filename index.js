@@ -2133,6 +2133,7 @@ const botAdminCmd = common(
     .addSubcommand((sub) => sub.setName('redeploy').setDescription('Trigger a new deployment from the latest GitHub commit on Render'))
     .addSubcommand((sub) => sub.setName('restart').setDescription('Restart the running Render service'))
     .addSubcommand((sub) => sub.setName('setup-deploy-alerts').setDescription('Create a private deployment channel that pings you'))
+    .addSubcommand((sub) => sub.setName('setup-payout-webhook').setDescription('Enable Stripe payout notifications on the existing live webhook'))
     .addSubcommand((sub) => sub.setName('env-list').setDescription('List Render environment variable names (values stay hidden)'))
     .addSubcommand((sub) => sub.setName('env-add').setDescription('Add a Render environment variable securely').addStringOption((o) => o.setName('key').setDescription('Environment variable name').setRequired(true)))
     .addSubcommand((sub) => sub.setName('env-edit').setDescription('Edit a Render environment variable securely').addStringOption((o) => o.setName('key').setDescription('Environment variable name').setRequired(true)))
@@ -4697,6 +4698,29 @@ async function cmdBotAdmin(interaction) {
     }
   }
 
+  if (sub === 'setup-payout-webhook') {
+    if (!BASE_URL) return interaction.editReply('PUBLIC_URL is missing. Set it to your live Bankroll service URL in Render, then try again.');
+    if (!/^(sk|rk)_live_/.test(String(STRIPE_SECRET_KEY || ''))) return interaction.editReply('Bankroll is not using a Live-mode Stripe API key. No webhook settings were changed.');
+    const targetUrl = BASE_URL + '/webhook';
+    try {
+      const listed = await stripe.webhookEndpoints.list({ limit: 100 });
+      const endpoints = await listed.autoPagingToArray({ limit: 1000 });
+      const matches = endpoints.filter((endpoint) => endpoint.livemode === true && (endpoint.url === targetUrl || endpoint.url === targetUrl + '/'));
+      if (!matches.length) return interaction.editReply('I could not find an existing Live Stripe webhook matching ' + targetUrl + '. No changes were made. Check PUBLIC_URL in Render.');
+      const requiredEvents = ['payout.paid', 'payout.failed', 'payout.canceled'];
+      let changed = 0;
+      for (const endpoint of matches) {
+        const current = endpoint.enabled_events || [];
+        if (current.includes('*') || requiredEvents.every((event) => current.includes(event))) continue;
+        await stripe.webhookEndpoints.update(endpoint.id, { enabled_events: [...new Set([...current, ...requiredEvents])] });
+        changed += 1;
+      }
+      return interaction.editReply('Stripe payout webhook configured. ' + (changed ? 'Added the payout events to ' + changed + ' existing Live endpoint(s).' : 'All payout events were already enabled.') + ' Enabled: payout.paid, payout.failed, payout.canceled. Existing events and the signing secret were preserved.');
+    } catch (error) {
+      console.error('Stripe payout webhook setup failed:', error.stack || error);
+      return interaction.editReply('Stripe could not update the webhook: ' + String(error.message || error).slice(0, 700));
+    }
+  }
   if (sub === 'env-list') {
     if (!RENDER_API_KEY || !RENDER_SERVICE_ID) return interaction.editReply('Set RENDER_API_KEY and RENDER_SERVICE_ID in Render first.');
     const vars = await renderApiGet(`https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}/env-vars?limit=100`);
