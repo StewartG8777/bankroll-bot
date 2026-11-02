@@ -6554,6 +6554,7 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // ---------- Render deployment webhook ----------
+const app = express();
 app.post('/render-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     if (!RENDER_WEBHOOK_SECRET) {
@@ -6643,7 +6644,6 @@ app.post('/render-webhook', express.raw({ type: 'application/json' }), async (re
 });
 
 // ---------- Monzo Webhook Listener ----------
-const app = express();
 // Render puts a proxy in front of the bot; trust one hop so req.ip is the real visitor (per-visitor download limit).
 app.set('trust proxy', 1);
 
