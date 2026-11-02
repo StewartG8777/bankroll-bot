@@ -1289,6 +1289,7 @@ let backupChain = Promise.resolve();
 let backupRetryTimer = null;
 let backupHealthWarningSent = false;
 let backupFailureAlertSent = false;
+let lastBackupError = null;
 function backupData() {
   // Return an explicit result to callers. The old catch swallowed errors, so
   // /downloads backup reported success even when Discord rejected every upload.
@@ -1296,6 +1297,7 @@ function backupData() {
     await backupDataOnce();
     return { ok: true };
   }).catch((e) => {
+    lastBackupError = String(e?.message || e || 'Unknown backup error');
     console.error('Backup failed:', e.stack || e.message || e);
     if (!backupFailureAlertSent) {
       backupFailureAlertSent = true;
@@ -1342,7 +1344,7 @@ function safeBackupRel(rel) {
 }
 
 async function backupDataOnce() {
-  if (!restoreDone) return;
+  if (!restoreDone) throw new Error('Startup recovery has not finished; backup will retry in 5 minutes.');
   flushSaves(); // make sure the files on disk are current before they are read below
   lastBackupRunAt = Date.now();
   const ch = await resolveBackupChannel();
@@ -1370,6 +1372,9 @@ async function backupDataOnce() {
       } catch {}
     }
 
+    if (!files.length) {
+      throw new Error('No database files were available in the data directory; refusing to mark the backup healthy.');
+    }
     if (files.length) {
       // These three change constantly (every notification, download event and webhook). They are still
       // INCLUDED in a snapshot whenever one posts, but on their own they no longer trigger one.
@@ -1471,8 +1476,8 @@ async function backupDataOnce() {
     // A run is successful even when nothing changed and no new Discord message
     // was needed. Refresh the health timestamp only after every required upload
     // has completed; this prevents stale warnings on unchanged data.
-    if (!files.length) throw new Error('No database files were available to back up; refusing to mark the backup healthy.');
     lastBackupAt = Date.now();
+    lastBackupError = null;
     backupHealthWarningSent = false;
     backupFailureAlertSent = false;
   } catch (e) {
@@ -2868,9 +2873,10 @@ const onReady = async () => {
       fs.accessSync(DATA_DIR, fs.constants.W_OK);
       if (restoreDone && (!lastBackupAt || Date.now() - lastBackupAt > 18 * 60 * 60 * 1000) && !backupHealthWarningSent) {
         backupHealthWarningSent = true;
-        await alertOwner('Backup health warning', new Error(lastBackupAt
-          ? 'No successful backup has been recorded in over 18 hours.'
-          : 'No successful backup has been confirmed since startup.'));
+        await alertOwner('Backup health warning', new Error([
+          lastBackupAt ? 'No successful backup has been recorded in over 18 hours.' : 'No successful backup has been confirmed since startup.',
+          lastBackupError ? `Last backup failure: ${lastBackupError}` : 'No failure detail has been captured yet.'
+        ].join(' ')));
         // Attempt a recovery backup immediately; backupData also schedules a retry if it fails.
         void backupData();
       }
