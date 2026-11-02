@@ -6689,6 +6689,15 @@ async function monitorRenderDeployments() {
 
 // ---------- Render deployment webhook ----------
 const app = express();
+// Bind the HTTP port immediately so Render detects the service even while the
+// remaining routes and Discord startup logic are being initialized.
+const httpServer = app.listen(Number(PORT) || 3000, '0.0.0.0', () => {
+  console.log(`Webhook server listening on 0.0.0.0:${Number(PORT) || 3000}`);
+});
+httpServer.on('error', (error) => {
+  console.error('HTTP server failed to bind:', error.stack || error);
+  process.exitCode = 1;
+});
 app.post('/render-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     if (!RENDER_WEBHOOK_SECRET) {
@@ -7100,7 +7109,7 @@ app.get('/:name/:token', (req, res) => {
 });
 
 app.get('/', (_, res) => res.send('Bankroll bot running'));
-app.listen(PORT, () => console.log(`Webhook server listening on :${PORT}`));
+// HTTP server is bound immediately after Express is created above.
 
 // Monitor process memory and event-loop stalls. Configure MEMORY_WARN_MB in Render if needed.
 // Resolution is milliseconds; 20,000 would make the monitor itself report a ~20-second baseline.
