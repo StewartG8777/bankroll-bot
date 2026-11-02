@@ -6795,6 +6795,28 @@ async function monitorRenderDeployments() {
     if (!renderMonitorInitialized) {
       for (const deploy of observed) renderObservedDeployments.set(String(deploy.id), String(deploy.status || 'unknown'));
       renderMonitorInitialized = true;
+      // A successful deploy can replace this process before the next polling tick.
+      // On fresh startup, report the just-finished deploy when it matches this instance's commit.
+      const latest = observed[0];
+      const latestStatus = String(latest?.status || '');
+      const latestCommit = String(latest?.commit?.id || '');
+      const runningCommit = String(process.env.RENDER_GIT_COMMIT || '');
+      const createdAt = Date.parse(latest?.createdAt || latest?.startedAt || '');
+      const isRecent = Number.isFinite(createdAt) && Date.now() - createdAt < 5 * 60 * 1000;
+      if (latest && successStatuses.has(latestStatus) && isRecent && (!runningCommit || !latestCommit || latestCommit.startsWith(runningCommit.slice(0, 12)))) {
+        const embed = new EmbedBuilder()
+          .setColor(GREEN)
+          .setTitle('✅ RENDER | DEPLOYMENT SUCCEEDED')
+          .setDescription([
+            '**Bankroll has started on the newly deployed version.**',
+            '**Final status:** ' + latestStatus.toUpperCase(),
+            '**Deploy ID:** ' + String(latest.id),
+            '**Commit:** ' + (latestCommit ? latestCommit.slice(0, 12) : 'Not supplied'),
+            latest.finishedAt ? '**Finished:** <t:' + Math.floor(Date.parse(latest.finishedAt) / 1000) + ':F>' : null
+          ].filter(Boolean).join('\\n'))
+          .setTimestamp();
+        await notifyOwner({ embeds: [embed] }, { log: true, notificationType: 'render.deploy_succeeded_api', notificationStatus: 'success' });
+      }
     } else {
       for (const deploy of observed) {
         const deployId = String(deploy.id);
