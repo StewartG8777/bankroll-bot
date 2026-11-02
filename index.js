@@ -55,6 +55,7 @@ const {
   DISCORD_GUILD_ID = '',
   RENDER_API_KEY = '',
   RENDER_SERVICE_ID = '',
+  RENDER_OWNER_ID = '',
   RENDER_WEBHOOK_SECRET = '',
 } = process.env;
 
@@ -6553,6 +6554,133 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
+// ---------- Render deployment diagnostics ----------
+const RENDER_ALERTS_FILE = path.join(DATA_DIR, 'render_deploy_alerts.json');
+let renderLongDeployAlerts = {};
+try {
+  const saved = JSON.parse(fs.readFileSync(RENDER_ALERTS_FILE, 'utf8'));
+  if (saved && typeof saved === 'object' && !Array.isArray(saved)) renderLongDeployAlerts = saved;
+} catch {}
+let lastRenderMonitorErrorAt = 0;
+let renderMonitorBusy = false;
+
+function saveRenderLongDeployAlerts() {
+  try {
+    renderLongDeployAlerts = Object.fromEntries(
+      Object.entries(renderLongDeployAlerts).sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0)).slice(0, 100)
+    );
+    atomicWrite(RENDER_ALERTS_FILE, JSON.stringify(renderLongDeployAlerts, null, 2));
+  } catch (error) {
+    console.error('Could not save Render deployment alert history:', error.message);
+  }
+}
+
+async function renderApiGet(url) {
+  if (!RENDER_API_KEY) throw new Error('RENDER_API_KEY is not configured.');
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${RENDER_API_KEY}`, Accept: 'application/json' },
+    signal: AbortSignal.timeout(12000),
+  });
+  const body = await response.text();
+  if (!response.ok) throw new Error(`Render API HTTP ${response.status}: ${body.slice(0, 500)}`);
+  try { return body ? JSON.parse(body) : {}; } catch { throw new Error('Render API returned invalid JSON.'); }
+}
+
+async function fetchRenderFailureLogs(deployId, startedAt) {
+  const result = { status: '', commit: '', logs: '', note: '' };
+  if (!RENDER_API_KEY || !RENDER_SERVICE_ID) {
+    result.note = 'Set RENDER_API_KEY and RENDER_SERVICE_ID to retrieve deployment diagnostics.';
+    return result;
+  }
+  try {
+    const deploy = await renderApiGet(`https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}/deploys/${encodeURIComponent(deployId)}`);
+    result.status = String(deploy.status || '');
+    result.commit = String(deploy.commit?.id || '');
+    const from = new Date(startedAt || deploy.startedAt || deploy.createdAt || Date.now() - 15 * 60 * 1000);
+    const to = new Date(deploy.finishedAt || Date.now());
+    if (!RENDER_OWNER_ID) {
+      result.note = 'Add RENDER_OWNER_ID in Render Environment to include build error log lines.';
+      return result;
+    }
+    const params = new URLSearchParams({
+      ownerId: RENDER_OWNER_ID,
+      startTime: from.toISOString(),
+      endTime: to.toISOString(),
+      direction: 'backward',
+      limit: '50',
+      type: 'build',
+      resource: RENDER_SERVICE_ID,
+    });
+    let payload = await renderApiGet(`https://api.render.com/v1/logs?${params.toString()}`);
+    let entries = Array.isArray(payload.logs) ? payload.logs : [];
+    const errors = entries.filter((entry) => (entry.labels || []).some((label) =>
+      label.name === 'level' && /error|critical|alert|emergency/i.test(label.value)
+    ));
+    if (errors.length) entries = errors;
+    else if (!entries.length) {
+      result.note = 'Render returned no build log lines for this deployment.';
+    }
+    result.logs = entries.slice(0, 12).reverse().map((entry) => {
+      const stamp = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString('en-GB', { timeZone: 'Europe/London' }) : '';
+      return `[${stamp}] ${String(entry.message || '').trim()}`;
+    }).filter((line) => line.trim()).join('\n').slice(-3500);
+    if (entries.length && !errors.length) result.note = 'No error-level build lines were tagged; showing recent build output instead.';
+  } catch (error) {
+    result.note = `Could not retrieve Render logs: ${String(error.message || error).slice(0, 350)}`;
+    console.error('Render deployment log retrieval failed:', error.stack || error);
+  }
+  return result;
+}
+
+async function monitorRenderDeployments() {
+  if (renderMonitorBusy || !RENDER_API_KEY || !RENDER_SERVICE_ID) return;
+  renderMonitorBusy = true;
+  try {
+    const params = new URLSearchParams({ limit: '10' });
+    const response = await renderApiGet(`https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}/deploys?${params.toString()}`);
+    const rows = Array.isArray(response) ? response : [];
+    const activeStatuses = new Set(['created', 'queued', 'build_in_progress', 'update_in_progress', 'pre_deploy_in_progress']);
+    for (const row of rows) {
+      const deploy = row?.deploy || row;
+      const deployId = String(deploy?.id || '');
+      if (!deployId || !activeStatuses.has(String(deploy.status || ''))) continue;
+      if (renderLongDeployAlerts[deployId]) continue;
+      const started = Date.parse(deploy.startedAt || deploy.createdAt || deploy.updatedAt || '');
+      if (!Number.isFinite(started) || Date.now() - started < 60 * 1000) continue;
+      renderLongDeployAlerts[deployId] = Date.now();
+      saveRenderLongDeployAlerts();
+      const elapsedSeconds = Math.floor((Date.now() - started) / 1000);
+      const commit = deploy.commit?.id ? String(deploy.commit.id).slice(0, 12) : 'Not supplied';
+      const embed = new EmbedBuilder()
+        .setColor(0xf39c12)
+        .setTitle('⚠️ RENDER | DEPLOYMENT TAKING TOO LONG')
+        .setDescription([
+          '**A deployment has been running for over 1 minute.**',
+          'This can indicate a slow build, a stuck deploy, or a deployment loop. It is an alert only; Bankroll will not automatically cancel or restart it.',
+          '',
+          `**Status:** ${String(deploy.status).toUpperCase()}`,
+          `**Duration:** ${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`,
+          `**Deploy ID:** ${deployId}`,
+          `**Commit:** ${commit}`,
+          `**Started:** <t:${Math.floor(started / 1000)}:F>`
+        ].join('\n'))
+        .setTimestamp();
+      await notifyOwner({ embeds: [embed] }, {
+        log: true,
+        notificationType: 'render.deploy_slow',
+        notificationStatus: 'warning'
+      });
+    }
+  } catch (error) {
+    if (Date.now() - lastRenderMonitorErrorAt > 10 * 60 * 1000) {
+      lastRenderMonitorErrorAt = Date.now();
+      console.error('Render deployment monitor could not check deploy status:', error.stack || error);
+    }
+  } finally {
+    renderMonitorBusy = false;
+  }
+}
+
 // ---------- Render deployment webhook ----------
 const app = express();
 app.post('/render-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -6597,6 +6725,8 @@ app.post('/render-webhook', express.raw({ type: 'application/json' }), async (re
     }
     const type = String(event?.type || 'unknown');
     const status = String(event?.data?.status || '');
+    const deployId = String(event?.data?.deployId || event?.data?.id || '');
+    const deployStartedAt = event?.data?.startedAt || event?.timestamp || new Date().toISOString();
     const serviceName = String(event?.data?.serviceName || 'Bankroll');
     const isFailure = status === 'failed' || status === 'canceled' ||
       ['server_failed', 'image_pull_failed', 'pipeline_minutes_exhausted'].includes(type);
@@ -6624,11 +6754,19 @@ app.post('/render-webhook', express.raw({ type: 'application/json' }), async (re
       event?.timestamp ? '**Time:** ' + new Date(event.timestamp).toLocaleString('en-GB', { timeZone: 'Europe/London' }) : null,
       '**Event ID:** ' + eventId
     ].filter(Boolean).join('\n');
+    let failureDiagnostics = null;
+    if (isFailure && deployId) {
+      failureDiagnostics = await fetchRenderFailureLogs(deployId, deployStartedAt);
+    }
     const embed = new EmbedBuilder()
       .setColor(isFailure ? RED : (type === 'deploy_ended' && status === 'succeeded' ? GREEN : 0x3498db))
       .setTitle('RENDER | ' + title.toUpperCase())
       .setDescription(details)
       .setTimestamp();
+    if (failureDiagnostics?.status) embed.addFields({ name: 'Render deploy status', value: failureDiagnostics.status, inline: true });
+    if (failureDiagnostics?.commit) embed.addFields({ name: 'Commit', value: failureDiagnostics.commit.slice(0, 100), inline: true });
+    if (failureDiagnostics?.logs) embed.addFields({ name: 'Build error logs / recent output', value: '\\`\\`\\`\\n' + failureDiagnostics.logs.slice(0, 1000) + '\\n\\`\\`\\`' });
+    if (failureDiagnostics?.note) embed.addFields({ name: 'Diagnostics note', value: failureDiagnostics.note.slice(0, 1000) });
     await notifyOwner({ embeds: [embed] }, {
       log: true,
       notificationType: 'render.' + type,
@@ -6642,6 +6780,14 @@ app.post('/render-webhook', express.raw({ type: 'application/json' }), async (re
     return res.status(500).send('Render webhook processing failed.');
   }
 });
+
+if (RENDER_API_KEY && RENDER_SERVICE_ID) {
+  console.log('[RENDER MONITOR] Deployment duration monitoring enabled (60-second alert threshold).');
+  void monitorRenderDeployments();
+  setInterval(() => { void monitorRenderDeployments(); }, 20 * 1000).unref?.();
+} else {
+  console.warn('[RENDER MONITOR] Long-deployment alerts disabled: set RENDER_API_KEY and RENDER_SERVICE_ID.');
+}
 
 // ---------- Monzo Webhook Listener ----------
 // Render puts a proxy in front of the bot; trust one hop so req.ip is the real visitor (per-visitor download limit).
