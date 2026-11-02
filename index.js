@@ -1824,7 +1824,7 @@ const bankrollCmd = common(
         .setDescription('Currency for this invoice (default: your usual one)')
         .addChoices(
           { name: 'GBP £', value: 'gbp' },
-          { name: 'USD $', value: 'usd' },
+          { name: 'USD dollars', value: 'usd' },
           { name: 'EUR €', value: 'eur' }
         )
     )
