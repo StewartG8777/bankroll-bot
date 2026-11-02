@@ -2725,13 +2725,28 @@ const onReady = async () => {
     const total = n + monzoRebuilt;
     console.log(`Startup recovery complete. Reminders rebuilt: ${total}.${recoveryNote}`);
     const deployedCommit = process.env.RENDER_GIT_COMMIT || process.env.GITHUB_SHA || process.env.SOURCE_VERSION || 'Not supplied by hosting platform';
+    let deployedCommitName = 'Commit name unavailable';
+    if (deployedCommit !== 'Not supplied by hosting platform') {
+      try {
+        const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'Bankroll-Discord-Bot' };
+        if (process.env.GITHUB_TOKEN) headers.Authorization = 'Bearer ' + process.env.GITHUB_TOKEN;
+        const commitResponse = await fetch('https://api.github.com/repos/StewartG8777/bankroll-bot/commits/' + encodeURIComponent(deployedCommit), { headers, signal: AbortSignal.timeout(8000) });
+        if (commitResponse.ok) {
+          const commitData = await commitResponse.json();
+          deployedCommitName = String(commitData.commit?.message || '').split('\\n')[0].trim() || deployedCommitName;
+        }
+      } catch (error) {
+        console.warn('Could not retrieve deployed GitHub commit name:', error.message);
+      }
+    }
     const hasRecoveryIssue = !!recoveryInfo?.lost?.length || /Backup restore failed/i.test(recoveryNote);
     const startupEmbed = new EmbedBuilder()
       .setColor(hasRecoveryIssue ? RED : GREEN)
       .setTitle(hasRecoveryIssue ? 'Bankroll online — recovery needs attention' : 'Bankroll is back online')
       .setDescription('The bot has connected to Discord and completed its startup recovery.')
       .addFields(
-        { name: 'Deployed commit', value: String(deployedCommit).slice(0, 100), inline: false },
+        { name: 'Commit name', value: short(deployedCommitName, 180), inline: false },
+        { name: 'Commit ID', value: String(deployedCommit).slice(0, 100), inline: false },
         { name: 'Reminders rebuilt', value: String(total), inline: true },
         { name: 'Backup recovery', value: short(recoveryNote.trim() || 'No recovery details reported.', 900), inline: false }
       )
