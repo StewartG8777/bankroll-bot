@@ -55,6 +55,7 @@ const {
   DISCORD_GUILD_ID = '',
   RENDER_API_KEY = '',
   RENDER_SERVICE_ID = '',
+  RENDER_WEBHOOK_SECRET = '',
 } = process.env;
 
 const MONZO_LINK = (MONZO_ME_URL || (MONZO_USERNAME ? `https://monzo.me/${MONZO_USERNAME.replace(/^\/+|\/+$/g, '')}` : '')).replace(/\/+$/, '');
@@ -4789,6 +4790,9 @@ async function cmdBotAdmin(interaction) {
       ...(sub === 'redeploy' ? { body: JSON.stringify({ clearCache: 'do_not_clear' }) } : {}),
     });
     const body = await response.text();
+    if (response.status === 401) {
+      return interaction.editReply('Render rejected the API key (HTTP 401 Unauthorized). In Render, open Account Settings → API Keys, create a new API key, then update the RENDER_API_KEY environment variable on the Bankroll service. Use the API key itself (not a deploy hook URL), with no quotes or extra spaces, then redeploy Bankroll. Do not send the key in Discord.');
+    }
     if (!response.ok) throw new Error(`Render ${sub} request failed (HTTP ${response.status}): ${short(body, 350)}`);
     return interaction.editReply(sub === 'redeploy'
       ? 'Render accepted the deployment request. It will build and deploy the latest commit from the connected branch.'
@@ -6546,6 +6550,95 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({ content: `Something went wrong: ${err.message}`, flags: 64 });
       }
     } catch {}
+  }
+});
+
+// ---------- Render deployment webhook ----------
+app.post('/render-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    if (!RENDER_WEBHOOK_SECRET) {
+      console.error('Render webhook rejected: RENDER_WEBHOOK_SECRET is not configured.');
+      return res.status(503).send('Render webhook is not configured.');
+    }
+    const webhookId = String(req.headers['webhook-id'] || '');
+    const webhookTimestamp = String(req.headers['webhook-timestamp'] || '');
+    const signatureHeader = String(req.headers['webhook-signature'] || '');
+    const timestampSeconds = Number(webhookTimestamp);
+    if (!webhookId || !webhookTimestamp || !signatureHeader || !Number.isFinite(timestampSeconds)) {
+      return res.status(400).send('Missing Render webhook signature headers.');
+    }
+    if (Math.abs(Date.now() / 1000 - timestampSeconds) > 5 * 60) {
+      return res.status(401).send('Render webhook timestamp expired.');
+    }
+    const signingKey = Buffer.from(String(RENDER_WEBHOOK_SECRET).replace(/^whsec_/, ''), 'base64');
+    const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
+    const signedContent = webhookId + '.' + webhookTimestamp + '.' + rawBody;
+    const expected = crypto.createHmac('sha256', signingKey).update(signedContent).digest('base64');
+    const expectedBuffer = Buffer.from(expected, 'base64');
+    const validSignature = signatureHeader.split(/\s+/).some((part) => {
+      const pieces = part.split(',');
+      if (pieces.length !== 2 || pieces[0] !== 'v1') return false;
+      const supplied = Buffer.from(pieces[1], 'base64');
+      return supplied.length === expectedBuffer.length && crypto.timingSafeEqual(supplied, expectedBuffer);
+    });
+    if (!validSignature) {
+      console.error('Render webhook rejected: signature verification failed.');
+      return res.status(401).send('Invalid Render webhook signature.');
+    }
+    let event;
+    try { event = JSON.parse(rawBody); } catch { return res.status(400).send('Invalid JSON payload.'); }
+    const eventId = String(event?.data?.id || webhookId);
+    if (hasProcessedWebhook('render:' + eventId)) return res.status(200).json({ received: true, duplicate: true });
+    const serviceId = String(event?.data?.serviceId || '');
+    if (RENDER_SERVICE_ID && serviceId && serviceId !== RENDER_SERVICE_ID) {
+      markWebhookProcessed('render:' + eventId, String(event?.type || 'render.ignored'));
+      return res.status(200).json({ received: true, ignored: true });
+    }
+    const type = String(event?.type || 'unknown');
+    const status = String(event?.data?.status || '');
+    const serviceName = String(event?.data?.serviceName || 'Bankroll');
+    const isFailure = status === 'failed' || status === 'canceled' ||
+      ['server_failed', 'image_pull_failed', 'pipeline_minutes_exhausted'].includes(type);
+    const labels = {
+      deploy_started: 'Deployment started',
+      deploy_ended: 'Deployment finished',
+      build_started: 'Build started',
+      build_ended: 'Build finished',
+      server_failed: 'Service failed',
+      server_available: 'Service available',
+      server_restarted: 'Service restarted',
+      image_pull_failed: 'Image pull failed',
+      pipeline_minutes_exhausted: 'Deploy blocked: pipeline minutes exhausted'
+    };
+    if (!Object.prototype.hasOwnProperty.call(labels, type)) {
+      markWebhookProcessed('render:' + eventId, type);
+      return res.status(200).json({ received: true, ignored: true });
+    }
+    const title = labels[type];
+    const statusLabel = status ? status.toUpperCase() : (isFailure ? 'FAILED' : 'UPDATE');
+    const details = [
+      '**Service:** ' + serviceName,
+      '**Event:** ' + title,
+      status ? '**Result:** ' + statusLabel : null,
+      event?.timestamp ? '**Time:** ' + new Date(event.timestamp).toLocaleString('en-GB', { timeZone: 'Europe/London' }) : null,
+      '**Event ID:** ' + eventId
+    ].filter(Boolean).join('\n');
+    const embed = new EmbedBuilder()
+      .setColor(isFailure ? RED : (type === 'deploy_ended' && status === 'succeeded' ? GREEN : 0x3498db))
+      .setTitle('RENDER | ' + title.toUpperCase())
+      .setDescription(details)
+      .setTimestamp();
+    await notifyOwner({ embeds: [embed] }, {
+      log: true,
+      notificationType: 'render.' + type,
+      notificationStatus: isFailure ? 'error' : (status === 'succeeded' ? 'success' : 'info')
+    });
+    markWebhookProcessed('render:' + eventId, type);
+    console.log('Render webhook received:', type, status || 'no status', serviceName, eventId);
+    return res.status(200).json({ received: true });
+  } catch (error) {
+    console.error('Render webhook processing failed:', error.message);
+    return res.status(500).send('Render webhook processing failed.');
   }
 });
 
