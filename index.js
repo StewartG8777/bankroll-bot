@@ -1714,6 +1714,56 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     }, { notificationType: 'payment.confirmed', notificationStatus: 'success' });
   }
 
+  // Multiple Vault files are delivered as one clearly named download embed per file.
+  if (Array.isArray(d.files) && d.files.length > 1) {
+    const embeds = [];
+    const rows = [];
+    for (const file of d.files) {
+      if (!file?.path || !fs.existsSync(file.path)) throw new Error(`A paid Vault file is missing: ${file?.name || 'unknown file'}.`);
+      if (file.sha256 && await sha256File(file.path) !== file.sha256) {
+        recordDownloadEvent('verification_failed', { file: file.name, customerId: d.customerId, agentId: d.agentId, detail: 'SHA-256 checksum does not match the saved file record.' });
+        throw new Error(`SHA-256 verification failed for ${file.name}.`);
+      }
+      const link = await makeDownloadLink({ ...d, path: file.path, name: file.name, vaultKey: file.vaultKey }, paymentIntentId);
+      const size = file.size || fs.statSync(file.path).size;
+      embeds.push(buildDownloadEmbed(file.name, null, size, `${d.testMode ? '[TEST] ' : ''}Your download is ready`, true));
+      rows.push(downloadLinkRow(link, 'Download ' + (path.extname(file.name).toLowerCase() === '.zip' ? 'ZIP' : 'File')));
+    }
+    const payload = {
+      content: `<@${d.customerId}> payment received. Each file has its own download below.`,
+      embeds,
+      components: rows,
+      allowedMentions: { parse: [] },
+    };
+    let sent;
+    const live = liveInteractions.get(key);
+    if (live?.interaction && Date.now() - live.at < 14 * 60 * 1000) {
+      sent = await live.interaction.followUp(payload);
+    } else {
+      const invoice = await getInvoiceMessage(d, key);
+      if (!invoice) throw new Error('The original invoice message could not be found for the multi-file delivery.');
+      sent = await invoice.reply({ ...payload, failIfNotExists: true });
+    }
+    d.deliveryComplete = true;
+    d.deliveredAt = Date.now();
+    d.deliveryMessageUrl = sent?.url || null;
+    d.deliveryMethod = 'individual hosted download embeds';
+    delete d.deliveryError;
+    saveDeliveries();
+    clearDeliveryWatch(key);
+    const retryTimer = deliveryRetryTimers.get(key);
+    if (retryTimer) clearTimeout(retryTimer);
+    deliveryRetryTimers.delete(key);
+    recordDownloadEvent('delivery_sent', { file: d.files.map((f) => f.name).join(', '), customerId: d.customerId, agentId: d.agentId, detail: `Delivered ${d.files.length} individual download embeds as a reply to the original invoice.` });
+    await notifyOwner({
+      embeds: [new EmbedBuilder().setColor(GREEN).setTitle(d.testMode ? '[TEST] Files sent' : 'Files sent')
+        .setDescription(d.files.map((f) => `• ${short(String(f.name || 'file'), 120)}`).join('\n'))
+        .addFields({ name: 'Customer', value: `<@${d.customerId}>` }, { name: 'Delivery Method', value: 'Individual download embeds' })
+        .setTimestamp()]
+    }, { notificationType: 'delivery.sent', notificationStatus: 'success' });
+    return true;
+  }
+
   const noFile = !d.link && !d.path;
   const isZip = /\.zip$/i.test(String(d.name || ''));
   if (d.path && fs.existsSync(d.path) && d.sha256 && await sha256File(d.path) !== d.sha256) {
