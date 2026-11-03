@@ -5095,14 +5095,21 @@ async function cmdBotAdmin(interaction) {
     });
     const verifiedCount = verifiedCollection?.size ?? null;
     let guildNote = '';
-    if (DISCORD_GUILD_ID) {
-      const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
+    try {
+      const guild = DISCORD_GUILD_ID
+        ? await client.guilds.fetch(DISCORD_GUILD_ID)
+        : client.guilds.cache.first();
       if (guild) {
-        const oldGuild = await guild.commands.fetch().catch(() => null);
-        const oldGuildCount = oldGuild?.size || 0;
-        await guild.commands.set([]);
-        guildNote = '\nRemoved ' + oldGuildCount + ' old server-only command copy/copies.';
+        const guildCommandJson = commands.map((command) => {
+          const { integration_types, contexts, ...guildCommand } = command.toJSON();
+          return guildCommand;
+        });
+        const guildPublished = await guild.commands.set(guildCommandJson);
+        guildNote = '\nVerified ' + guildPublished.size + ' server commands, including /bankroll.';
       }
+    } catch (guildError) {
+      console.error('Could not refresh server command copy:', guildError);
+      guildNote = '\nServer command copy failed: ' + String(guildError.message || guildError).slice(0, 250);
     }
     const changeLines = [];
     if (added.length) changeLines.push('**Added:** ' + added.map((n) => '/' + n).join(', '));
