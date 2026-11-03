@@ -60,6 +60,7 @@ const {
   RENDER_WEBHOOK_SECRET = '',
   RENDER_ALERT_CHANNEL_ID = '',
   SHAREX_UPLOAD_TOKEN = '',
+  SHAREX_CHANNEL_NAME = 'screenshots',
 } = process.env;
 
 const MONZO_LINK = (MONZO_ME_URL || (MONZO_USERNAME ? `https://monzo.me/${MONZO_USERNAME.replace(/^\/+|\/+$/g, '')}` : '')).replace(/\/+$/, '');
@@ -2908,16 +2909,16 @@ const onReady = async () => {
   if (DISCORD_GUILD_ID) {
     try {
       const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
-      let screenshots = guild.channels.cache.find(c => c.name === 'screenshots' && c.type === ChannelType.GuildText);
+      let screenshots = guild.channels.cache.find(c => c.name === SHAREX_CHANNEL_NAME && c.type === ChannelType.GuildText);
       if (!screenshots) screenshots = await guild.channels.create({
-        name: 'screenshots',
+        name: SHAREX_CHANNEL_NAME,
         type: ChannelType.GuildText,
         topic: 'Automatic screenshots uploaded through ShareX.',
         reason: 'Bankroll ShareX screenshot destination'
       });
       console.log(`ShareX destination ready: #${screenshots.name} (${screenshots.id})`);
     } catch (error) {
-      console.error('Could not create/find #screenshots. Check DISCORD_GUILD_ID and Manage Channels permission:', error.message);
+      console.error(`Could not create/find #${SHAREX_CHANNEL_NAME}. Check DISCORD_GUILD_ID and Manage Channels permission:`, error.message);
     }
   }
 
