@@ -10,6 +10,7 @@
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
+    "googleapis": "^144.0.0",
     "stripe": "^17.0.0",
     "yauzl": "^3.2.0",
     "yazl": "^3.3.1"
