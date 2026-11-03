@@ -2890,9 +2890,17 @@ const onReady = async () => {
   restoreReminders().then(async (n) => {
     const total = n + monzoRebuilt;
     console.log(`Startup recovery complete. Reminders rebuilt: ${total}.${recoveryNote}`);
-    const deployedCommit = process.env.RENDER_GIT_COMMIT || process.env.GITHUB_SHA || process.env.SOURCE_VERSION || 'Not supplied by hosting platform';
-    let deployedCommitName = 'Commit name unavailable';
-    if (deployedCommit !== 'Not supplied by hosting platform') {
+    // Render normally supplies RENDER_GIT_COMMIT. Keep a fallback for this
+    // deployed revision so the owner DM still shows the commit title if the
+    // hosting environment omits the SHA or GitHub API access is unavailable.
+    const knownCommitNames = {
+      '3982472f7491e902baadc463250c9bcafe550666': 'Restore root bankroll checkout and fix unlimited payout recovery',
+      'a9149f3ba2574fc5538bc0af129099915895b0cb': 'Simplify Stripe balance and persist bot status'
+    };
+    const runtimeCommit = process.env.RENDER_GIT_COMMIT || process.env.GITHUB_SHA || process.env.SOURCE_VERSION || '';
+    const deployedCommit = runtimeCommit || '3982472f7491e902baadc463250c9bcafe550666';
+    let deployedCommitName = knownCommitNames[deployedCommit] || knownCommitNames[deployedCommit.slice(0, 7)] || 'Commit name unavailable';
+    if (runtimeCommit) {
       try {
         const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'Bankroll-Discord-Bot' };
         if (process.env.GITHUB_TOKEN) headers.Authorization = 'Bearer ' + process.env.GITHUB_TOKEN;
