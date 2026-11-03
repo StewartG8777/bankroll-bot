@@ -3340,7 +3340,8 @@ async function sendStripeCheckout(interaction) {
     }
 
     const mode = interaction.options.getString('delivery') ?? 'direct';
-    if ((files.length || vaultKey) && mode === 'link' && !BASE_URL) {
+    if (vaultFiles.length > 1 && !BASE_URL) throw new Error('Multiple Vault files need PUBLIC_URL configured so each file can have its own download button.');
+    if ((files.length || vaultFiles.length) && mode === 'link' && !BASE_URL) {
       throw new Error('Hosted links are not set up yet (PUBLIC_URL is missing). Pick Direct file upload.');
     }
 
@@ -3430,8 +3431,8 @@ async function sendStripeCheckout(interaction) {
     if (expiresAt) {
       embed.addFields({ name: 'Pay by', value: `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
     }
-    if (fileData) {
-      embed.addFields({ name: 'File', value: `${fileData.name} (posted as a reply to this invoice after payment)` });
+    if (fileData || vaultFiles.length) {
+      embed.addFields({ name: 'Files', value: (vaultFiles.length ? vaultFiles.map((f) => f.name).join('\n') : fileData.name) + ' (individual download embeds will be posted as a reply after payment)' });
     }
     if (linkUrl) {
       embed.addFields({ name: 'Download', value: 'Download link posted as a reply to this invoice after payment' });
@@ -3531,7 +3532,8 @@ async function sendMonzoInvoice(interaction) {
     }
 
     const mode = interaction.options.getString('delivery') ?? 'direct';
-    if ((files.length || vaultKey) && mode === 'link' && !BASE_URL) {
+    if (vaultFiles.length > 1 && !BASE_URL) throw new Error('Multiple Vault files need PUBLIC_URL configured so each file can have its own download button.');
+    if ((files.length || vaultFiles.length) && mode === 'link' && !BASE_URL) {
       throw new Error('Hosted links are not set up yet (PUBLIC_URL is missing). Pick Direct file upload.');
     }
 
@@ -4459,6 +4461,7 @@ async function cmdPaymentTest(interaction) {
     const vaultKey = vaultFiles[0]?.vaultKey || null;
     const linkRaw = interaction.options.getString('link');
     const mode = interaction.options.getString('delivery') || 'direct';
+    if (vaultFiles.length > 1 && !BASE_URL) throw new Error('Multiple Vault files need PUBLIC_URL configured so each file can have its own download button.');
     const expiresInput = method === 'bankroll' ? interaction.options.getString('expires') : null;
 
     if ((files.length && vaultFiles.length) || (files.length && linkRaw) || (vaultFiles.length && linkRaw)) {
@@ -4541,7 +4544,7 @@ async function cmdPaymentTest(interaction) {
     saveDeliveries();
 
     const where = whereFrom(interaction, customer);
-    const fileLabel = fileData?.name || (externalLink ? 'External download link' : 'No file attached');
+    const fileLabel = vaultFiles.length ? vaultFiles.map((f) => f.name).join(', ') : (fileData?.name || (externalLink ? 'External download link' : 'No file attached'));
     const embed = new EmbedBuilder()
       .setColor(GREEN)
       .setTitle(method === 'monzo' ? 'Bankroll Monzo Test Invoice' : 'Bankroll Card Test Invoice')
