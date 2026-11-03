@@ -2158,6 +2158,14 @@ const vaultCmd = common(
     )
 );
 
+
+const driveCredentialsCmd = common(
+  new SlashCommandBuilder()
+    .setName('drive-credentials')
+    .setDescription('Securely upload Google Drive OAuth credentials (owner only)')
+    .addAttachmentOption((o) => o.setName('file').setDescription('The downloaded Google OAuth client JSON').setRequired(true))
+);
+
 const sendfileCmd = new SlashCommandBuilder()
   .setName('sendfile')
   .setDescription('Schedule any vault file for delivery in this DM or group DM')
@@ -2405,7 +2413,7 @@ function previousCommandSchemaMismatch(published, desired) {
   });
 }
 
-const commands = [sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
 // are never cached.
@@ -6973,6 +6981,35 @@ async function handleBankrollPayoutButton(interaction) {
   }
 }
 
+async function cmdDriveCredentials(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: 'Only the bot owner can upload Google Drive credentials.', ephemeral: true });
+  }
+  const attachment = interaction.options.getAttachment('file');
+  if (!attachment) return interaction.reply({ content: 'Attach the Google OAuth JSON file.', ephemeral: true });
+  if (attachment.size > 1024 * 1024) return interaction.reply({ content: 'The OAuth JSON must be smaller than 1 MB.', ephemeral: true });
+  if (!String(attachment.name || '').toLowerCase().endsWith('.json')) return interaction.reply({ content: 'Please attach the downloaded .json credentials file.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const response = await fetch(attachment.url, { signal: AbortSignal.timeout(20000) });
+  if (!response.ok) throw new Error(`Discord attachment download failed (HTTP ${response.status}).`);
+  const raw = await response.text();
+  if (Buffer.byteLength(raw, 'utf8') > 1024 * 1024) throw new Error('The downloaded credentials file is larger than 1 MB.');
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { throw new Error('The attachment is not valid JSON.'); }
+  const clientConfig = parsed.installed || parsed.web;
+  if (!clientConfig || typeof clientConfig.client_id !== 'string' || typeof clientConfig.client_secret !== 'string' || !Array.isArray(clientConfig.redirect_uris) || !clientConfig.redirect_uris.length) {
+    throw new Error('This JSON does not look like a Google OAuth Desktop/Web client file. Download the OAuth client JSON from Google Cloud and try again.');
+  }
+  // Never trust the uploaded filename: Bankroll always stores it under the fixed standard name.
+  const destination = path.join(DATA_DIR, 'google-oauth.json');
+  atomicWrite(destination, JSON.stringify(parsed, null, 2));
+  try { fs.chmodSync(destination, 0o600); } catch {}
+  console.log('Google OAuth client JSON received and saved under the standard filename (contents withheld).');
+  const persistence = DATA_DIR_STATUS.includes('fallback storage')
+    ? '\n\n⚠️ Bankroll is currently using temporary storage. The file may be lost on a restart/redeploy until a persistent Render disk is configured.'
+    : '\n\nStorage status: ' + DATA_DIR_STATUS;
+  return interaction.editReply({ content: '✅ Google OAuth credentials received, validated and renamed to google-oauth.json in Bankroll’s private data folder. The secret was not posted back to Discord.' + persistence });
+}
 // ---------- Interaction router ----------
 client.on('interactionCreate', async (interaction) => {
   try {
@@ -7012,6 +7049,8 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     switch (interaction.commandName) {
+      case 'drive-credentials':
+        return await cmdDriveCredentials(interaction);
       case 'bankroll':
         return await sendStripeCheckout(interaction);
       case 'bankroll-balance':
