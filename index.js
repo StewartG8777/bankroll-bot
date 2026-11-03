@@ -825,10 +825,8 @@ function purgeOldDeliveries() {
   for (const [k, d] of Object.entries(deliveries)) {
     if (!d || !(Date.now() - d.savedAt > 7 * 24 * 60 * 60 * 1000)) continue;
     if ((d.paymentConfirmed || d.paid) && !d.deliveryComplete) continue;
-    if (d.path) {
-      try {
-        fs.unlinkSync(d.path);
-      } catch {}
+    for (const fp of new Set([d.path, ...(Array.isArray(d.files) ? d.files.map((f) => f.path) : [])].filter(Boolean))) {
+      try { fs.unlinkSync(fp); } catch {}
     }
     if (d.type === 'monzo' && monzoLedger[k]?.status === 'open') {
       monzoLedger[k].status = 'expired';
@@ -1564,10 +1562,8 @@ async function backupMonzoReviewToDiscord() {
 function discardPending(key) {
   const d = deliveries[key];
   if (!d) return false;
-  if (d.path) {
-    try {
-      fs.unlinkSync(d.path);
-    } catch {}
+  for (const fp of new Set([d.path, ...(Array.isArray(d.files) ? d.files.map((f) => f.path) : [])].filter(Boolean))) {
+    try { fs.unlinkSync(fp); } catch {}
   }
   delete deliveries[key];
   saveDeliveries();
