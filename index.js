@@ -988,6 +988,32 @@ function saveDelivery(key, fileData, interaction, customer) {
   saveDeliveries();
 }
 
+
+function getSelectedVaultFiles(interaction) {
+  const keys = ['vault_file', 'vault_file2', 'vault_file3', 'vault_file4', 'vault_file5'].map((n) => interaction.options.getString(n)).filter(Boolean);
+  if (new Set(keys).size !== keys.length) throw new Error('Choose each Vault file only once.');
+  return keys.map((key) => {
+    const item = vault[key];
+    if (!item?.path || !fs.existsSync(item.path)) throw new Error(`Vault item "${key}" was not found on disk.`);
+    return { vaultKey: key, path: item.path, temp: false, name: item.originalName || key, size: item.size || fs.statSync(item.path).size, sha256: item.sha256 };
+  });
+}
+function saveMultipleVaultDeliveries(key, items, interaction, customer) {
+  if (!items.length) return;
+  saveDelivery(key, items[0], interaction, customer);
+  const saved = [{ vaultKey: items[0].vaultKey, path: deliveries[key].path, name: items[0].name, size: items[0].size, sha256: items[0].sha256 }];
+  for (let i = 1; i < items.length; i++) {
+    const f = items[i], safe = String(f.name || `file-${i+1}`).replace(/[^\w.\-]/g, '_');
+    const dest = path.join(FILES_DIR, `${key.replace(/[^\w\-]/g, '_')}_${i+1}_${safe}`);
+    try { fs.linkSync(f.path, dest); } catch { fs.copyFileSync(f.path, dest); }
+    saved.push({ vaultKey: f.vaultKey, path: dest, name: f.name, size: f.size, sha256: f.sha256 });
+  }
+  deliveries[key].files = saved;
+  deliveries[key].vaultKeys = saved.map((f) => f.vaultKey);
+  deliveries[key].name = saved.map((f) => f.name).join(', ');
+  saveDeliveries();
+}
+
 function saveLinkDelivery(key, url, interaction, customer) {
   deliveries[key] = {
     link: url,
@@ -1921,7 +1947,11 @@ const bankrollCmd = common(
     .addAttachmentOption((o) => o.setName('file3').setDescription('Third file (optional)'))
     .addAttachmentOption((o) => o.setName('file4').setDescription('Fourth file (optional)'))
     .addAttachmentOption((o) => o.setName('file5').setDescription('Fifth file (optional)'))
-    .addStringOption((o) => o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file').setDescription('First saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file2').setDescription('Second saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file3').setDescription('Third saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file4').setDescription('Fourth saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file5').setDescription('Fifth saved Vault file').setAutocomplete(true))
     .addStringOption((o) => o.setName('delivery').setDescription('How to deliver the file (only used with a file)')
       .addChoices({ name: 'Hosted one-time link', value: 'link' }, { name: 'Direct file upload', value: 'direct' }))
     .addStringOption((o) => o.setName('currency').setDescription('Currency for this invoice (default: your usual one)')
@@ -1946,7 +1976,11 @@ const addTestPurchaseOptions = (sub, isCard) => {
     .addAttachmentOption((o) => o.setName('file3').setDescription('Third file (optional)'))
     .addAttachmentOption((o) => o.setName('file4').setDescription('Fourth file (optional)'))
     .addAttachmentOption((o) => o.setName('file5').setDescription('Fifth file (optional)'))
-    .addStringOption((o) => o.setName('vault_file').setDescription('Or choose a saved vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file').setDescription('First saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file2').setDescription('Second saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file3').setDescription('Third saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file4').setDescription('Fourth saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file5').setDescription('Fifth saved Vault file').setAutocomplete(true))
     .addStringOption((o) => o.setName('delivery').setDescription('Direct file first, or hosted download link')
       .addChoices({ name: 'Direct file upload with link fallback', value: 'direct' }, { name: 'Hosted one-time link', value: 'link' }));
   if (isCard) {
@@ -1982,9 +2016,11 @@ const monzoCmd = common(
     .addAttachmentOption((o) => o.setName('file3').setDescription('Third file (optional)'))
     .addAttachmentOption((o) => o.setName('file4').setDescription('Fourth file (optional)'))
     .addAttachmentOption((o) => o.setName('file5').setDescription('Fifth file (optional)'))
-    .addStringOption((o) =>
-      o.setName('vault_file').setDescription('Or pick a pre-saved file from your vault').setAutocomplete(true)
-    )
+    .addStringOption((o) => o.setName('vault_file').setDescription('First saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file2').setDescription('Second saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file3').setDescription('Third saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file4').setDescription('Fourth saved Vault file').setAutocomplete(true))
+    .addStringOption((o) => o.setName('vault_file5').setDescription('Fifth saved Vault file').setAutocomplete(true))
     .addStringOption((o) =>
       o
         .setName('delivery')
@@ -3225,7 +3261,8 @@ async function sendStripeCheckout(interaction) {
   try {
     const files = ['file', 'file2', 'file3', 'file4', 'file5'].map((name) => interaction.options.getAttachment(name)).filter(Boolean);
     const file = files[0] || null;
-    const vaultKey = interaction.options.getString('vault_file');
+    const vaultFiles = getSelectedVaultFiles(interaction);
+    const vaultKey = vaultFiles[0]?.vaultKey || null;
     const linkRaw = interaction.options.getString('link');
     const expiresInput = interaction.options.getString('expires');
 
@@ -3237,7 +3274,7 @@ async function sendStripeCheckout(interaction) {
       }
     }
     
-    if ((files.length && vaultKey) || (files.length && linkRaw) || (vaultKey && linkRaw)) {
+    if ((files.length && vaultFiles.length) || (files.length && linkRaw) || (vaultFiles.length && linkRaw)) {
       throw new Error('Use only one of: attached file, vault file, or download link.');
     }
 
@@ -3260,13 +3297,7 @@ async function sendStripeCheckout(interaction) {
     let fileData = null;
     if (files.length) {
       fileData = await downloadInvoiceAttachments(files, mode === 'link');
-    } else if (vaultKey) {
-      const item = vault[vaultKey];
-      if (!item || !fs.existsSync(item.path)) {
-        throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
-      }
-      fileData = { path: item.path, temp: false, name: item.originalName, size: item.size, sha256: item.sha256 };
-    }
+    } else if (vaultFiles.length === 1) fileData = vaultFiles[0];
     const fileSha = fileData ? fileData.sha256 ?? (await sha256File(fileData.path)) : null;
     if (fileData && fileSha) fileData.sha256 = fileSha;
     if (vaultKey && fileSha && vault[vaultKey] && !vault[vaultKey].sha256) vault[vaultKey].sha256 = fileSha;
@@ -3327,13 +3358,8 @@ async function sendStripeCheckout(interaction) {
     }
 
     const session = await stripe.checkout.sessions.create(params);
-    if (fileData) {
-      saveDelivery(session.id, fileData, interaction, customer);
-      if (vaultKey) {
-        deliveries[session.id].vaultKey = vaultKey;
-        saveDeliveries();
-      }
-    }
+    if (files.length) saveDelivery(session.id, fileData, interaction, customer);
+    else if (vaultFiles.length) saveMultipleVaultDeliveries(session.id, vaultFiles, interaction, customer);
     if (linkUrl) saveLinkDelivery(session.id, linkUrl, interaction, customer);
     if (deliveries[session.id]) {
       Object.assign(deliveries[session.id], { type: 'stripe', amount, currency: cur, description });
@@ -3370,7 +3396,7 @@ async function sendStripeCheckout(interaction) {
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setLabel('Pay invoice').setStyle(ButtonStyle.Link).setURL(session.url)
     );
-    if (fileData || linkUrl) {
+    if (fileData || vaultFiles.length || linkUrl) {
       // Backup for when the bot can no longer post in the DM (paid after 15 minutes, or a very big file):
       // the customer's click lets the bot reply under the invoice with the file or the download embed.
       row.addComponents(
@@ -3397,7 +3423,7 @@ async function sendStripeCheckout(interaction) {
       console.error('Logging failed:', e.message)
     );
 
-    if (fileData || linkUrl) {
+    if (fileData || vaultFiles.length || linkUrl) {
       liveInteractions.set(session.id, { interaction, at: Date.now() });
       setTimeout(() => liveInteractions.delete(session.id), 14 * 60 * 1000);
     }
@@ -3432,10 +3458,11 @@ async function sendMonzoInvoice(interaction) {
   try {
     const files = ['file', 'file2', 'file3', 'file4', 'file5'].map((name) => interaction.options.getAttachment(name)).filter(Boolean);
     const file = files[0] || null;
-    const vaultKey = interaction.options.getString('vault_file');
+    const vaultFiles = getSelectedVaultFiles(interaction);
+    const vaultKey = vaultFiles[0]?.vaultKey || null;
     const linkRaw = interaction.options.getString('link');
 
-    if ((files.length && vaultKey) || (files.length && linkRaw) || (vaultKey && linkRaw)) {
+    if ((files.length && vaultFiles.length) || (files.length && linkRaw) || (vaultFiles.length && linkRaw)) {
       throw new Error('Use only one of: attached file, vault file, or download link.');
     }
     if (!MONZO_LINK && !MONZO_PAYMENT_DETAILS) {
@@ -3461,13 +3488,7 @@ async function sendMonzoInvoice(interaction) {
     let fileData = null;
     if (files.length) {
       fileData = await downloadInvoiceAttachments(files, mode === 'link');
-    } else if (vaultKey) {
-      const item = vault[vaultKey];
-      if (!item || !fs.existsSync(item.path)) {
-        throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
-      }
-      fileData = { path: item.path, temp: false, name: item.originalName, size: item.size, sha256: item.sha256 };
-    }
+    } else if (vaultFiles.length === 1) fileData = vaultFiles[0];
 
     if (fileData) {
       fileData.sha256 = fileData.sha256 || await sha256File(fileData.path);
@@ -3479,13 +3500,9 @@ async function sendMonzoInvoice(interaction) {
     const paymentUrl = paymentBase ? paymentBase + '/' + amount.toFixed(2) + '?d=' + encodeURIComponent(reference) : null;
     const key = `monzo_${crypto.randomBytes(8).toString('hex')}`;
 
-    if (fileData) {
-      saveDelivery(key, fileData, interaction, customer);
-      if (vaultKey) {
-        deliveries[key].vaultKey = vaultKey;
-        saveDeliveries();
-      }
-    } else if (linkUrl) saveLinkDelivery(key, linkUrl, interaction, customer);
+    if (files.length) saveDelivery(key, fileData, interaction, customer);
+    else if (vaultFiles.length) saveMultipleVaultDeliveries(key, vaultFiles, interaction, customer);
+    else if (linkUrl) saveLinkDelivery(key, linkUrl, interaction, customer);
     else {
       deliveries[key] = {
         name: 'no file',
@@ -3536,7 +3553,7 @@ async function sendMonzoInvoice(interaction) {
       );
     embed.addFields({ name: 'Pay by', value: `<t:${tsec(monzoLedger[key].expiresAt)}:R>` });
     if (MONZO_PAYMENT_DETAILS) embed.addFields({ name: 'Pay to', value: MONZO_PAYMENT_DETAILS.replace(/\\n/g, '\n') });
-    if (fileData) embed.addFields({ name: 'File', value: `${fileData.name} (posted as a reply to this invoice as soon as payment lands)` });
+    if (fileData || vaultFiles.length) embed.addFields({ name: 'Files', value: (vaultFiles.length ? vaultFiles.map((f) => f.name).join('\n') : fileData.name) + ' (individual download embeds will be posted as a reply after payment)' });
     if (linkUrl) embed.addFields({ name: 'Download', value: 'Download link posted as a reply to this invoice as soon as payment lands' });
     embed
       .addFields(
@@ -3549,7 +3566,7 @@ async function sendMonzoInvoice(interaction) {
     if (MONZO_LINK) {
       row.addComponents(new ButtonBuilder().setLabel('Pay with Monzo').setStyle(ButtonStyle.Link).setURL(paymentUrl));
     }
-    if (fileData || linkUrl) {
+    if (fileData || vaultFiles.length || linkUrl) {
       row.addComponents(
         new ButtonBuilder().setCustomId(`getfile:${key}`).setLabel('Get file').setStyle(ButtonStyle.Secondary)
       );
@@ -4388,12 +4405,13 @@ async function cmdPaymentTest(interaction) {
     const currency = method === 'monzo' ? 'gbp' : (interaction.options.getString('currency') || CURRENCY).toLowerCase();
     const files = ['file', 'file2', 'file3', 'file4', 'file5'].map((name) => interaction.options.getAttachment(name)).filter(Boolean);
     const file = files[0] || null;
-    const vaultKey = interaction.options.getString('vault_file');
+    const vaultFiles = getSelectedVaultFiles(interaction);
+    const vaultKey = vaultFiles[0]?.vaultKey || null;
     const linkRaw = interaction.options.getString('link');
     const mode = interaction.options.getString('delivery') || 'direct';
     const expiresInput = method === 'bankroll' ? interaction.options.getString('expires') : null;
 
-    if ((files.length && vaultKey) || (files.length && linkRaw) || (vaultKey && linkRaw)) {
+    if ((files.length && vaultFiles.length) || (files.length && linkRaw) || (vaultFiles.length && linkRaw)) {
       throw new Error('Use only one of: attached file, vault file, or download link.');
     }
     if (mode === 'link' && !BASE_URL && (files.length || vaultKey)) {
@@ -4422,11 +4440,7 @@ async function cmdPaymentTest(interaction) {
     let fileData = null;
     if (files.length) {
       fileData = await downloadInvoiceAttachments(files, mode === 'link');
-    } else if (vaultKey) {
-      const item = vault[vaultKey];
-      if (!item || !item.path || !fs.existsSync(item.path)) throw new Error(`Vault item "${vaultKey}" was not found on disk.`);
-      fileData = { path: item.path, temp: false, name: item.originalName, size: item.size, sha256: item.sha256 };
-    }
+    } else if (vaultFiles.length === 1) fileData = vaultFiles[0];
 
     if (fileData && !BASE_URL && mode !== 'link' && fs.statSync(fileData.path).size > MAX_FILE_BYTES) {
       throw new Error('This file is too large for a direct Discord attachment, and PUBLIC_URL is not configured for the download-link fallback.');
@@ -4444,10 +4458,12 @@ async function cmdPaymentTest(interaction) {
       expiresAt = Math.floor(Date.now() / 1000) + secs;
     }
 
-    if (fileData) {
+    if (files.length) {
       saveDelivery(testKey, fileData, interaction, customer);
       createdPath = deliveries[testKey]?.path || null;
-      if (vaultKey) deliveries[testKey].vaultKey = vaultKey;
+    } else if (vaultFiles.length) {
+      saveMultipleVaultDeliveries(testKey, vaultFiles, interaction, customer);
+      createdPath = deliveries[testKey]?.path || null;
     } else if (externalLink) {
       saveLinkDelivery(testKey, externalLink, interaction, customer);
     } else {
@@ -4488,7 +4504,7 @@ async function cmdPaymentTest(interaction) {
       );
     if (method === 'monzo') embed.addFields({ name: 'Payment reference', value: `\`${reference}\``, inline: true });
     if (expiresAt) embed.addFields({ name: 'Pay by', value: method === 'monzo' ? `<t:${tsec(expiresAt)}:R>` : `<t:${expiresAt}:R> (<t:${expiresAt}:f>)` });
-    if (fileData || externalLink) embed.addFields({ name: 'File', value: `${fileLabel}\n${mode === 'link' ? 'Download Button' : 'Direct attachment / Download Button'}` });
+    if (fileData || vaultFiles.length || externalLink) embed.addFields({ name: 'Files', value: (vaultFiles.length ? vaultFiles.map((f) => f.name).join('\n') : fileLabel) + `\n${mode === 'link' ? 'Download Button' : 'Direct attachment / Download Button'}` });
     embed.addFields(
       { name: 'Generated In Guild', value: where.guild },
       { name: 'Generated In Channel', value: where.channel }
