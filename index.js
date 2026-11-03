@@ -6995,10 +6995,24 @@ async function cmdDriveCredentials(interaction) {
   const raw = await response.text();
   if (Buffer.byteLength(raw, 'utf8') > 1024 * 1024) throw new Error('The downloaded credentials file is larger than 1 MB.');
   let parsed;
-  try { parsed = JSON.parse(raw); } catch { throw new Error('The attachment is not valid JSON.'); }
-  const clientConfig = parsed.installed || parsed.web;
-  if (!clientConfig || typeof clientConfig.client_id !== 'string' || typeof clientConfig.client_secret !== 'string' || !Array.isArray(clientConfig.redirect_uris) || !clientConfig.redirect_uris.length) {
-    throw new Error('This JSON does not look like a Google OAuth Desktop/Web client file. Download the OAuth client JSON from Google Cloud and try again.');
+  try { parsed = JSON.parse(raw.replace(/^\\uFEFF/, '').trim()); } catch { throw new Error('The attachment is not valid JSON.'); }
+  // Google has shipped OAuth client files in wrapped (installed/web) and flat formats.
+  // Accept both, plus common wrapper keys, but never accept service-account private keys as OAuth clients.
+  const candidates = [parsed?.installed, parsed?.web, parsed?.credentials, parsed?.oauth2, parsed].filter((v) => v && typeof v === 'object' && !Array.isArray(v));
+  const clientConfig = candidates.find((v) => typeof v.client_id === 'string' && v.client_id.trim() && typeof v.client_secret === 'string' && v.client_secret.trim());
+  if (!clientConfig) {
+    const keys = Object.keys(parsed && typeof parsed === 'object' ? parsed : {}).slice(0, 15).join(', ') || '(no top-level keys)';
+    throw new Error('Valid JSON received, but it does not contain an OAuth client_id and client_secret. Detected top-level keys: ' + keys + '. Do not upload a service-account JSON here; use the OAuth 2.0 Client ID JSON.');
+  }
+  if (parsed.installed || parsed.web) {
+    // Keep the original Google file structure intact.
+  } else {
+    // Normalize a flat/wrapped OAuth JSON into Google's standard installed-client structure.
+    parsed = { installed: {
+      client_id: clientConfig.client_id,
+      client_secret: clientConfig.client_secret,
+      redirect_uris: Array.isArray(clientConfig.redirect_uris) && clientConfig.redirect_uris.length ? clientConfig.redirect_uris : ['http://localhost']
+    } };
   }
   // Never trust the uploaded filename: Bankroll always stores it under the fixed standard name.
   const destination = path.join(DATA_DIR, 'google-oauth.json');
