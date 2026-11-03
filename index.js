@@ -7601,6 +7601,8 @@ app.post('/sharex/upload', express.raw({ type: ['image/png', 'image/jpeg', 'imag
     // Give ShareX a Bankroll-owned URL instead of exposing the Discord CDN URL.
     const publicBase = String(PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\\/+$/, '');
     const imageUrl = `${publicBase}/s/${message.id}`;
+    // Put the shareable Bankroll link directly under the screenshot in #screenshots.
+    await message.edit({ content: `🔗 ${imageUrl}` });
     return res.json({ url: imageUrl, id: attachment.id, discordUrl: attachment.url });
   } catch (error) {
     console.error('ShareX upload failed:', error.stack || error);
