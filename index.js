@@ -1935,6 +1935,7 @@ const bankrollCmd = common(
       .addStringOption((o) => o.setName('currency').setDescription('Currency to withdraw (default: GBP)')
         .addChoices({ name: 'GBP £', value: 'gbp' }, { name: 'USD dollars', value: 'usd' }, { name: 'EUR €', value: 'eur' })))
     .addSubcommand((sub) => sub.setName('cashlogs').setDescription('Show your recent Stripe payout history'))
+     .addSubcommand((sub) => sub.setName('recover').setDescription('Recover all available Stripe balance transactions and payouts'))
 );
 
 const addTestPurchaseOptions = (sub, isCard) => {
@@ -2829,7 +2830,7 @@ const onReady = async () => {
     console.error('Automatic global slash-command refresh failed:', error);
   }
   // Publish a guild-scoped copy for immediate visibility in the configured server.
-  if (DISCORD_GUILD_ID) {
+  {
     try {
       const guild = DISCORD_GUILD_ID
         ? await client.guilds.fetch(DISCORD_GUILD_ID)
@@ -6751,6 +6752,44 @@ async function cmdBankrollFinance(interaction) {
       ).setTimestamp();
     await interaction.editReply({ embeds: [embed] });
     await logToServer({ embeds: [embed] });
+    return;
+  }
+
+  if (sub === 'recover') {
+    await interaction.editReply('Recovering every available Stripe balance transaction and payout. This may take a few minutes.');
+    const transactions = [];
+    let cursor;
+    let pages = 0;
+    do {
+      const params = { limit: 100 };
+      if (cursor) params.starting_after = cursor;
+      const page = await stripe.balanceTransactions.list(params);
+      transactions.push(...(page.data || []));
+      pages++;
+      cursor = page.has_more && page.data?.length ? page.data[page.data.length - 1].id : null;
+    } while (cursor);
+    const payouts = await stripe.payouts.list({ limit: 100 }).autoPagingToArray({ limit: 100000 });
+    const audit = {
+      recoveredAt: new Date().toISOString(),
+      note: 'Reconstructed transaction movements and payouts, not historical point-in-time balance snapshots.',
+      balanceTransactions: transactions,
+      payouts
+    };
+    atomicWrite(path.join(DATA_DIR, 'stripe_balance_history.json'), JSON.stringify(audit));
+    scheduleBackup(true);
+    const dates = transactions.map(t => Number(t.created || 0)).filter(Boolean);
+    const embed = new EmbedBuilder().setColor(GREEN).setTitle('BANKROLL | STRIPE HISTORY RECOVERED')
+      .setDescription('Recovered from Stripe API. This does not recreate historical balance snapshots that were never saved.')
+      .addFields(
+        { name: 'Balance transactions', value: String(transactions.length), inline: true },
+        { name: 'Payouts', value: String(payouts.length), inline: true },
+        { name: 'Pages read', value: String(pages), inline: true },
+        { name: 'Oldest transaction', value: dates.length ? '<t:' + Math.min(...dates) + ':d>' : 'Unavailable', inline: true },
+        { name: 'Newest transaction', value: dates.length ? '<t:' + Math.max(...dates) + ':d>' : 'Unavailable', inline: true },
+        { name: 'Saved file', value: 'stripe_balance_history.json', inline: true }
+      ).setTimestamp();
+    await interaction.editReply({ embeds: [embed] });
+    await logToServer({ embeds: [embed], files: [{ name: 'stripe_balance_history.json', buffer: Buffer.from(JSON.stringify(audit, null, 2)) }] });
     return;
   }
 
