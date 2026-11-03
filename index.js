@@ -7110,7 +7110,7 @@ const GOOGLE_OAUTH_FILE = path.join(DATA_DIR, 'google-oauth.json');
 const GOOGLE_TOKEN_FILE = path.join(DATA_DIR, 'google-drive-token.json');
 const GOOGLE_DRIVE_FOLDER_NAMES = ['BACKUPS', 'DATABASE', 'LOGS', 'SYSTEM', 'VAULT'];
 const GOOGLE_OAUTH_STATES = new Map();
-function googleRedirectUri() { const base = String(PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\\/+$/, ''); return base ? base + '/google/oauth/callback' : ''; }
+function googleRedirectUri() { const base = String(PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, ''); return base ? base + '/google/oauth/callback' : ''; }
 function readGoogleClientConfig() {
   if (!fs.existsSync(GOOGLE_OAUTH_FILE)) throw new Error('Upload your Google OAuth client JSON first with /drive-credentials.');
   const parsed = JSON.parse(fs.readFileSync(GOOGLE_OAUTH_FILE, 'utf8'));
@@ -7193,7 +7193,7 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
     if (st.size > 150 * 1024 * 1024) throw new Error('Google Drive backup file exceeds 150 MiB: ' + rel);
     const sig = await sha256FileCached(fp, st);
     const key = crypto.createHash('sha256').update(rel).digest('hex').slice(0, 16);
-    const name = key + '_' + path.basename(rel).replace(/[^\\w.\\-]/g, '_');
+    const name = key + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
     await uploadOne('VAULT', name, st.size + ':' + sig, fs.createReadStream(fp));
     vaultFileCount++;
   }
