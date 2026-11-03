@@ -981,6 +981,7 @@ function saveDelivery(key, fileData, interaction, customer) {
     channelId: interaction.channelId,
     customerId: customer.id,
     agentId: interaction.user.id,
+    vaultKey: fileData.vaultKey ?? null,
     savedAt: Date.now(),
     ...(fileData.sha256 ? { sha256: fileData.sha256 } : {}),
     ...(fileData.size ? { size: fileData.size } : {}),
@@ -4074,7 +4075,7 @@ async function cmdVault(interaction) {
     let info;
     try {
       info = await streamToFile(att.url, tempPath, 100 * 1024 * 1024);
-      if (/\\.zip$/i.test(newName)) await verifyZipIntegrity(tempPath);
+      if (/\.zip$/i.test(newName)) await verifyZipIntegrity(tempPath);
       fs.renameSync(tempPath, replacementPath);
     } catch (error) {
       try { fs.unlinkSync(tempPath); } catch {}
