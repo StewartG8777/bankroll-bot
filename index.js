@@ -1498,6 +1498,12 @@ async function backupDataOnce() {
       }
     }
 
+    // Mirror the database snapshot and stored vault/order files to Google Drive as an independent copy.
+    if (googleDriveIsConnected()) {
+      const driveResult = await backupToGoogleDrive(files, dataFilePaths());
+      console.log('Google Drive mirror checked; ' + driveResult.uploaded + ' changed file(s) uploaded.');
+    }
+
     // A run is successful even when nothing changed and no new Discord message
     // was needed. Refresh the health timestamp only after every required upload
     // has completed; this prevents stale warnings on unchanged data.
@@ -2159,6 +2165,11 @@ const vaultCmd = common(
 );
 
 
+const driveCmd = common(new SlashCommandBuilder().setName('drive').setDescription('Connect and manage Google Drive backups (owner only)')
+  .addSubcommand((sub) => sub.setName('connect').setDescription('Connect the Google account used for backups'))
+  .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive connection and backup status'))
+  .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate Discord and Google Drive backup')));
+
 const driveCredentialsCmd = common(
   new SlashCommandBuilder()
     .setName('drive-credentials')
@@ -2413,7 +2424,7 @@ function previousCommandSchemaMismatch(published, desired) {
   });
 }
 
-const commands = [driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
 // are never cached.
@@ -6981,6 +6992,84 @@ async function handleBankrollPayoutButton(interaction) {
   }
 }
 
+// ---------- Google Drive OAuth + durable backup mirror ----------
+const GOOGLE_OAUTH_FILE = path.join(DATA_DIR, 'google-oauth.json');
+const GOOGLE_TOKEN_FILE = path.join(DATA_DIR, 'google-drive-token.json');
+const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || '1wGvKWhf7-Ngnk0x4hX1jpB89hIFKzUVb';
+const GOOGLE_OAUTH_STATES = new Map();
+function googleRedirectUri() { const base = String(PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, ''); return base ? base + '/google/oauth/callback' : ''; }
+function readGoogleClientConfig() {
+  if (!fs.existsSync(GOOGLE_OAUTH_FILE)) throw new Error('Upload your Google OAuth client JSON first with /drive-credentials.');
+  const parsed = JSON.parse(fs.readFileSync(GOOGLE_OAUTH_FILE, 'utf8'));
+  const config = parsed.web || parsed.installed || parsed;
+  if (!config.client_id || !config.client_secret) throw new Error('The saved OAuth file is missing client_id/client_secret.');
+  if (parsed.installed && !parsed.web) throw new Error('This is a Google Desktop (installed) OAuth client. Render needs a Google Web application OAuth client. Create a Web application client, add the redirect URI shown by /drive connect, then upload that JSON with /drive-credentials.');
+  const redirectUri = googleRedirectUri();
+  if (!redirectUri) throw new Error('Set PUBLIC_URL in Render to your public HTTPS service URL before connecting Google Drive.');
+  return { clientId: config.client_id, clientSecret: config.client_secret, redirectUri };
+}
+function makeGoogleOAuthClient() {
+  const { google } = require('googleapis');
+  const config = readGoogleClientConfig();
+  const oauth = new google.auth.OAuth2(config.clientId, config.clientSecret, config.redirectUri);
+  if (fs.existsSync(GOOGLE_TOKEN_FILE)) { try { oauth.setCredentials(JSON.parse(fs.readFileSync(GOOGLE_TOKEN_FILE, 'utf8'))); } catch (e) { console.error('Google Drive token file could not be read:', e.message); } }
+  oauth.on('tokens', (fresh) => { try { let current = {}; try { current = JSON.parse(fs.readFileSync(GOOGLE_TOKEN_FILE, 'utf8')); } catch {} atomicWrite(GOOGLE_TOKEN_FILE, JSON.stringify({ ...current, ...fresh }, null, 2)); try { fs.chmodSync(GOOGLE_TOKEN_FILE, 0o600); } catch {} } catch (e) { console.error('Could not persist refreshed Google Drive token:', e.message); } });
+  return oauth;
+}
+function googleDriveIsConnected() { try { const t = JSON.parse(fs.readFileSync(GOOGLE_TOKEN_FILE, 'utf8')); return !!(t.refresh_token || t.access_token); } catch { return false; } }
+async function backupToGoogleDrive(databaseFiles, storedPaths) {
+  if (!googleDriveIsConnected()) return { connected: false, uploaded: 0, skipped: true };
+  const { google } = require('googleapis');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const existing = new Map(); let pageToken;
+  do {
+    const page = await drive.files.list({ q: "'" + GOOGLE_DRIVE_FOLDER_ID + "' in parents and trashed = false", pageSize: 1000, pageToken, fields: 'nextPageToken,files(id,name,appProperties)', supportsAllDrives: true, includeItemsFromAllDrives: true });
+    for (const f of (page.data.files || [])) existing.set(f.name, f);
+    pageToken = page.data.nextPageToken;
+  } while (pageToken);
+  let uploaded = 0;
+  const uploadOne = async (name, signature, body, mimeType) => {
+    const old = existing.get(name); if (old && old.appProperties && old.appProperties.bankrollSignature === signature) return;
+    const requestBody = { name, appProperties: { bankrollSignature: signature, bankrollBackup: 'true' } };
+    const media = { mimeType: mimeType || 'application/octet-stream', body };
+    if (old && old.id) await drive.files.update({ fileId: old.id, requestBody, media, fields: 'id,name' });
+    else { const created = await drive.files.create({ requestBody: { ...requestBody, parents: [GOOGLE_DRIVE_FOLDER_ID] }, media, fields: 'id,name' }); existing.set(name, created.data); }
+    uploaded++; console.log('Google Drive backup uploaded:', name);
+  };
+  for (const file of databaseFiles || []) { const sig = crypto.createHash('sha256').update(file.buffer).digest('hex'); await uploadOne('db_' + file.name, sig, Readable.from([file.buffer]), 'application/json'); }
+  for (const fp of storedPaths || []) {
+    if (!fp || !fs.existsSync(fp)) continue; const rel = relData(fp); if (!rel) continue;
+    const st = fs.statSync(fp); if (!st.isFile() || !st.size) continue;
+    if (st.size > 150 * 1024 * 1024) throw new Error('Google Drive backup file exceeds 150 MiB: ' + rel);
+    const sig = await sha256FileCached(fp, st); const key = crypto.createHash('sha256').update(rel).digest('hex').slice(0, 16);
+    const name = 'file_' + key + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
+    await uploadOne(name, st.size + ':' + sig, fs.createReadStream(fp));
+  }
+  console.log('Google Drive backup complete: ' + uploaded + ' file(s) uploaded.'); return { connected: true, uploaded };
+}
+async function cmdDrive(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage Google Drive backups.');
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'connect') {
+    const redirectUri = googleRedirectUri(); const oauth = makeGoogleOAuthClient();
+    const state = crypto.randomBytes(24).toString('hex'); GOOGLE_OAUTH_STATES.set(state, { userId: interaction.user.id, expiresAt: Date.now() + 10 * 60 * 1000 });
+    for (const [key, value] of GOOGLE_OAUTH_STATES) if (Date.now() > value.expiresAt) GOOGLE_OAUTH_STATES.delete(key);
+    const url = oauth.generateAuthUrl({ access_type: 'offline', prompt: 'consent', state, scope: ['https://www.googleapis.com/auth/drive'] });
+    return interaction.editReply('**Connect Google Drive**\n1. Open the authorisation link below.\n2. Sign into the Google account that owns the backup folder and approve access.\n3. Google will return to Bankroll automatically.\n\n**Required authorised redirect URI in Google Cloud:**\n`' + redirectUri + '`\n\n' + url + '\n\nThis link expires in 10 minutes.');
+  }
+  if (sub === 'status') {
+    if (!googleDriveIsConnected()) return interaction.editReply('❌ Google Drive is not connected yet. Run `/drive connect`.');
+    try { const { google } = require('googleapis'); const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() }); const folder = await drive.files.get({ fileId: GOOGLE_DRIVE_FOLDER_ID, fields: 'id,name,mimeType,trashed' }); return interaction.editReply('✅ Google Drive is connected.\n**Folder:** ' + folder.data.name + '\n**Automatic backup:** enabled alongside the existing Discord backup.\n**Storage:** ' + DATA_DIR_STATUS); }
+    catch (e) { return interaction.editReply('⚠️ A Google token is saved, but Drive access failed: ' + short(e.message, 700)); }
+  }
+  if (sub === 'backup') {
+    await interaction.editReply('Starting an immediate Bankroll backup to Discord and Google Drive…'); const result = await backupData();
+    if (!result || !result.ok) return interaction.editReply('❌ Backup failed: ' + short(result && result.error || 'Unknown backup error', 800));
+    if (!googleDriveIsConnected()) return interaction.editReply('⚠️ The existing Discord backup completed, but Google Drive is not connected. Run `/drive connect` first.');
+    return interaction.editReply('✅ Backup completed. Bankroll checked and uploaded changed database and stored files to the configured Google Drive folder.');
+  }
+}
+
 async function cmdDriveCredentials(interaction) {
   if (interaction.user.id !== OWNER_ID) {
     return interaction.reply({ content: 'Only the bot owner can upload Google Drive credentials.', ephemeral: true });
@@ -7065,6 +7154,9 @@ client.on('interactionCreate', async (interaction) => {
     switch (interaction.commandName) {
       case 'drive-credentials':
         return await cmdDriveCredentials(interaction);
+      case 'drive':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdDrive(interaction);
       case 'bankroll':
         return await sendStripeCheckout(interaction);
       case 'bankroll-balance':
@@ -7464,6 +7556,21 @@ const httpServer = app.listen(Number(PORT) || 3000, '0.0.0.0', () => {
 httpServer.on('error', (error) => {
   console.error('HTTP server failed to bind:', error.stack || error);
   process.exitCode = 1;
+});
+app.get('/google/oauth/callback', async (req, res) => {
+  const state = String(req.query.state || ''); const pending = GOOGLE_OAUTH_STATES.get(state); GOOGLE_OAUTH_STATES.delete(state);
+  if (!pending || Date.now() > pending.expiresAt || pending.userId !== OWNER_ID) return res.status(400).send('This Google authorisation link has expired. Return to Discord and run /drive connect again.');
+  if (req.query.error) return res.status(400).send('Google access was not granted. Return to Discord and run /drive connect again.');
+  if (!req.query.code) return res.status(400).send('Google did not return an authorisation code.');
+  try {
+    const oauth = makeGoogleOAuthClient(); const result = await oauth.getToken(String(req.query.code)); const previous = (() => { try { return JSON.parse(fs.readFileSync(GOOGLE_TOKEN_FILE, 'utf8')); } catch { return {}; } })();
+    const saved = { ...previous, ...result.tokens }; if (!saved.refresh_token && previous.refresh_token) saved.refresh_token = previous.refresh_token;
+    if (!saved.refresh_token) throw new Error('Google did not issue a refresh token. Revoke Bankroll access in your Google Account and run /drive connect again.');
+    atomicWrite(GOOGLE_TOKEN_FILE, JSON.stringify(saved, null, 2)); try { fs.chmodSync(GOOGLE_TOKEN_FILE, 0o600); } catch {}
+    res.status(200).send('<h2>Google Drive connected to Bankroll</h2><p>You can close this page and return to Discord. Run /drive status to verify the connection.</p>');
+    console.log('Google Drive OAuth completed successfully; token contents withheld.');
+    void client.users.fetch(OWNER_ID).then(user => user.send('✅ Google Drive has been connected to Bankroll. Run `/drive status` to verify, then `/drive backup` for the first full backup.')).catch(() => {});
+  } catch (e) { console.error('Google OAuth callback failed:', e.message); res.status(500).send('Google authorisation could not be completed: ' + String(e.message || e).slice(0, 400)); }
 });
 app.post('/render-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
