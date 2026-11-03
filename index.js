@@ -7108,9 +7108,9 @@ async function handleBankrollPayoutButton(interaction) {
 // ---------- Google Drive OAuth + durable backup mirror ----------
 const GOOGLE_OAUTH_FILE = path.join(DATA_DIR, 'google-oauth.json');
 const GOOGLE_TOKEN_FILE = path.join(DATA_DIR, 'google-drive-token.json');
-const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || '1wGvKWhf7-Ngnk0x4hX1jpB89hIFKzUVb';
+const GOOGLE_DRIVE_FOLDER_NAMES = ['BACKUPS', 'DATABASE', 'LOGS', 'SYSTEM', 'VAULT'];
 const GOOGLE_OAUTH_STATES = new Map();
-function googleRedirectUri() { const base = String(PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, ''); return base ? base + '/google/oauth/callback' : ''; }
+function googleRedirectUri() { const base = String(PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\\/+$/, ''); return base ? base + '/google/oauth/callback' : ''; }
 function readGoogleClientConfig() {
   if (!fs.existsSync(GOOGLE_OAUTH_FILE)) throw new Error('Upload your Google OAuth client JSON first with /drive-credentials.');
   const parsed = JSON.parse(fs.readFileSync(GOOGLE_OAUTH_FILE, 'utf8'));
@@ -7130,35 +7130,79 @@ function makeGoogleOAuthClient() {
   return oauth;
 }
 function googleDriveIsConnected() { try { const t = JSON.parse(fs.readFileSync(GOOGLE_TOKEN_FILE, 'utf8')); return !!(t.refresh_token || t.access_token); } catch { return false; } }
+
+// Resolve the five existing folders by name; never write to a stale hard-coded folder ID.
+async function resolveGoogleDriveFolders(drive) {
+  const folders = {};
+  for (const name of GOOGLE_DRIVE_FOLDER_NAMES) {
+    const response = await drive.files.list({
+      q: "name = '" + name + "' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+      pageSize: 100, fields: 'files(id,name,mimeType,capabilities(canAddChildren,canEdit))',
+      supportsAllDrives: true, includeItemsFromAllDrives: true,
+    });
+    const matches = response.data.files || [];
+    if (!matches.length) throw new Error('Google Drive folder "' + name + '" was not found. Make sure it exists and is shared with the connected Google account.');
+    if (matches.length > 1) throw new Error('More than one Google Drive folder is named "' + name + '". Rename duplicates so Bankroll can safely select the correct folder.');
+    const folder = matches[0];
+    if (folder.capabilities?.canAddChildren === false) throw new Error('The connected Google account cannot add files to "' + name + '". Share that folder with the OAuth account as Editor.');
+    folders[name] = folder;
+  }
+  return folders;
+}
 async function backupToGoogleDrive(databaseFiles, storedPaths) {
   if (!googleDriveIsConnected()) return { connected: false, uploaded: 0, skipped: true };
   const { google } = require('googleapis');
   const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
-  const existing = new Map(); let pageToken;
-  do {
-    const page = await drive.files.list({ q: "'" + GOOGLE_DRIVE_FOLDER_ID + "' in parents and trashed = false", pageSize: 1000, pageToken, fields: 'nextPageToken,files(id,name,appProperties)', supportsAllDrives: true, includeItemsFromAllDrives: true });
-    for (const f of (page.data.files || [])) existing.set(f.name, f);
-    pageToken = page.data.nextPageToken;
-  } while (pageToken);
+  const folders = await resolveGoogleDriveFolders(drive);
+  const existingByFolder = new Map();
+  for (const name of GOOGLE_DRIVE_FOLDER_NAMES) {
+    const existing = new Map(); let pageToken;
+    do {
+      const page = await drive.files.list({ q: "'" + folders[name].id + "' in parents and trashed = false", pageSize: 1000, pageToken, fields: 'nextPageToken,files(id,name,appProperties)', supportsAllDrives: true, includeItemsFromAllDrives: true });
+      for (const f of (page.data.files || [])) existing.set(f.name, f);
+      pageToken = page.data.nextPageToken;
+    } while (pageToken);
+    existingByFolder.set(name, existing);
+  }
   let uploaded = 0;
-  const uploadOne = async (name, signature, body, mimeType) => {
-    const old = existing.get(name); if (old && old.appProperties && old.appProperties.bankrollSignature === signature) return;
+  const uploadOne = async (folderName, name, signature, body, mimeType) => {
+    const existing = existingByFolder.get(folderName);
+    const old = existing.get(name);
+    if (old?.appProperties?.bankrollSignature === signature) return;
     const requestBody = { name, appProperties: { bankrollSignature: signature, bankrollBackup: 'true' } };
     const media = { mimeType: mimeType || 'application/octet-stream', body };
-    if (old && old.id) await drive.files.update({ fileId: old.id, requestBody, media, fields: 'id,name' });
-    else { const created = await drive.files.create({ requestBody: { ...requestBody, parents: [GOOGLE_DRIVE_FOLDER_ID] }, media, fields: 'id,name' }); existing.set(name, created.data); }
-    uploaded++; console.log('Google Drive backup uploaded:', name);
+    try {
+      if (old?.id) await drive.files.update({ fileId: old.id, requestBody, media, fields: 'id,name' });
+      else { const created = await drive.files.create({ requestBody: { ...requestBody, parents: [folders[folderName].id] }, media, fields: 'id,name' }); existing.set(name, created.data); }
+    } catch (e) {
+      if (/insufficient permissions|not have permission|forbidden/i.test(String(e.message || e))) throw new Error('Google Drive cannot write to "' + folderName + '". Share that folder with the connected Google account as Editor. Google said: ' + String(e.message || e));
+      throw e;
+    }
+    uploaded++;
+    console.log('Google Drive backup uploaded to ' + folderName + ': ' + name);
   };
-  for (const file of databaseFiles || []) { const sig = crypto.createHash('sha256').update(file.buffer).digest('hex'); await uploadOne('db_' + file.name, sig, Readable.from([file.buffer]), 'application/json'); }
+  for (const file of databaseFiles || []) {
+    const sig = crypto.createHash('sha256').update(file.buffer).digest('hex');
+    await uploadOne('DATABASE', file.name, sig, Readable.from([file.buffer]), 'application/json');
+  }
+  let vaultFileCount = 0;
   for (const fp of storedPaths || []) {
-    if (!fp || !fs.existsSync(fp)) continue; const rel = relData(fp); if (!rel) continue;
+    if (!fp || !fs.existsSync(fp)) continue;
+    const rel = relData(fp); if (!rel) continue;
     const st = fs.statSync(fp); if (!st.isFile() || !st.size) continue;
     if (st.size > 150 * 1024 * 1024) throw new Error('Google Drive backup file exceeds 150 MiB: ' + rel);
-    const sig = await sha256FileCached(fp, st); const key = crypto.createHash('sha256').update(rel).digest('hex').slice(0, 16);
-    const name = 'file_' + key + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
-    await uploadOne(name, st.size + ':' + sig, fs.createReadStream(fp));
+    const sig = await sha256FileCached(fp, st);
+    const key = crypto.createHash('sha256').update(rel).digest('hex').slice(0, 16);
+    const name = key + '_' + path.basename(rel).replace(/[^\\w.\\-]/g, '_');
+    await uploadOne('VAULT', name, st.size + ':' + sig, fs.createReadStream(fp));
+    vaultFileCount++;
   }
-  console.log('Google Drive backup complete: ' + uploaded + ' file(s) uploaded.'); return { connected: true, uploaded };
+  const manifest = { format: 'bankroll-drive-layout-v1', createdAt: new Date().toISOString(), databaseFiles: (databaseFiles || []).map((f) => f.name), vaultFileCount, folders: Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map((name) => [name, folders[name].id])) };
+  const manifestBuffer = Buffer.from(JSON.stringify(manifest, null, 2));
+  const manifestSig = crypto.createHash('sha256').update(manifestBuffer).digest('hex');
+  await uploadOne('BACKUPS', 'bankroll-drive-manifest.json', manifestSig, Readable.from([manifestBuffer]), 'application/json');
+  console.log('Google Drive backup complete: ' + uploaded + ' changed file(s) uploaded across the Bankroll folders.');
+  return { connected: true, uploaded, folders };
 }
 async function cmdDrive(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage Google Drive backups.');
@@ -7172,14 +7216,19 @@ async function cmdDrive(interaction) {
   }
   if (sub === 'status') {
     if (!googleDriveIsConnected()) return interaction.editReply('❌ Google Drive is not connected yet. Run `/drive connect`.');
-    try { const { google } = require('googleapis'); const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() }); const folder = await drive.files.get({ fileId: GOOGLE_DRIVE_FOLDER_ID, fields: 'id,name,mimeType,trashed' }); return interaction.editReply('✅ Google Drive is connected.\n**Folder:** ' + folder.data.name + '\n**Automatic backup:** enabled alongside the existing Discord backup.\n**Storage:** ' + DATA_DIR_STATUS); }
-    catch (e) { return interaction.editReply('⚠️ A Google token is saved, but Drive access failed: ' + short(e.message, 700)); }
+    try {
+      const { google } = require('googleapis');
+      const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+      const folders = await resolveGoogleDriveFolders(drive);
+      const lines = GOOGLE_DRIVE_FOLDER_NAMES.map((name) => '• **' + name + '**');
+      return interaction.editReply('✅ Google Drive is connected; all five Bankroll folders were found.\\n' + lines.join('\\n') + '\\n**Automatic backup:** enabled alongside Discord backup.\\n**Storage:** ' + DATA_DIR_STATUS);
+    } catch (e) { return interaction.editReply('⚠️ Google Drive folder check failed: ' + short(e.message, 900)); }
   }
   if (sub === 'backup') {
     await interaction.editReply('Starting an immediate Bankroll backup to Discord and Google Drive…'); const result = await backupData();
     if (!result || !result.ok) return interaction.editReply('❌ Backup failed: ' + short(result && result.error || 'Unknown backup error', 800));
     if (!googleDriveIsConnected()) return interaction.editReply('⚠️ The existing Discord backup completed, but Google Drive is not connected. Run `/drive connect` first.');
-    return interaction.editReply('✅ Backup completed. Bankroll checked and uploaded changed database and stored files to the configured Google Drive folder.');
+    return interaction.editReply('✅ Backup completed. Database files are in **DATABASE**, vault/order files are in **VAULT**, and the backup manifest is in **BACKUPS**. **LOGS** and **SYSTEM** are recognised for their respective exports.');
   }
 }
 
