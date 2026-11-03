@@ -1711,7 +1711,8 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
 
   if (!dlink && d.path && fs.existsSync(d.path) && BASE_URL) {
     const size = fs.statSync(d.path).size;
-    if (d.mode === 'link' || size > ATTACH_MAX_BYTES) {
+    // ZIP deliveries always use the hosted Download button; never attach the ZIP as a reply.
+    if (isZip || d.mode === 'link' || size > ATTACH_MAX_BYTES) {
       dlink = await makeDownloadLink(d, paymentIntentId);
       hosted = true;
       d.fallbackLink = dlink;
@@ -1727,6 +1728,9 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   }
 
   const isZip = /\.zip$/i.test(String(d.name || ''));
+  if (isZip && !d.link && !dlink && d.path && fs.existsSync(d.path) && !BASE_URL) {
+    throw new Error('ZIP delivery is configured to use the Download button only, but PUBLIC_URL is missing. Set PUBLIC_URL in Render so Bankroll can create a hosted download link.');
+  }
   const deliverySize = d.path && fs.existsSync(d.path) ? fs.statSync(d.path).size : undefined;
   // When the file is attached directly, also include a one-time download link next to it.
   let attachLink = null;
@@ -1778,14 +1782,16 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   try {
     const replyText = noFile
       ? 'Payment received — thank you!'
-      : dlink
-        ? `Payment received — your complete ${isZip ? 'ZIP' : 'file'} is ready to download below.`
-        : 'Payment received — your complete file is attached below.';
+      : (isZip && dlink)
+        ? undefined
+        : dlink
+          ? `Payment received — your complete ${isZip ? 'ZIP' : 'file'} is ready to download below.`
+          : 'Payment received — your complete file is attached below.';
     const live = liveInteractions.get(key);
     let lastError = null;
     if (live?.interaction && Date.now() - live.at < 14 * 60 * 1000) {
       try {
-        invoiceReply = await sendWithFallback((p) => live.interaction.followUp({ ...p, content: replyText, allowedMentions: { parse: [] } }));
+        invoiceReply = await sendWithFallback((p) => live.interaction.followUp({ ...p, ...(replyText ? { content: replyText } : { content: undefined }), allowedMentions: { parse: [] } }));
         sentTo = 'a reply to the original invoice';
       } catch (e) { lastError = e; console.error(`Live invoice reply failed for ${key}:`, e.message); }
     }
@@ -1793,7 +1799,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
       try {
         const invoice = await getInvoiceMessage(d, key);
         if (!invoice) throw new Error('The original invoice message could not be found.');
-        invoiceReply = await sendWithFallback((p) => invoice.reply({ ...p, content: replyText, allowedMentions: { parse: [] }, failIfNotExists: true }));
+        invoiceReply = await sendWithFallback((p) => invoice.reply({ ...p, ...(replyText ? { content: replyText } : { content: undefined }), allowedMentions: { parse: [] }, failIfNotExists: true }));
         sentTo = 'a reply to the original invoice';
       } catch (e) { lastError = lastError || e; if (!sentTo) throw e; }
     }
