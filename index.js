@@ -2831,7 +2831,10 @@ const onReady = async () => {
   // Publish a guild-scoped copy for immediate visibility in the configured server.
   if (DISCORD_GUILD_ID) {
     try {
-      const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
+      const guild = DISCORD_GUILD_ID
+        ? await client.guilds.fetch(DISCORD_GUILD_ID)
+        : client.guilds.cache.first();
+      if (!guild) throw new Error('No server is available for guild command registration. Set DISCORD_GUILD_ID in Render.');
       const guildCommandJson = commands.map((command) => {
         const { integration_types, contexts, ...guildCommand } = command.toJSON();
         return guildCommand;
