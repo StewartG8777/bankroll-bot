@@ -6108,7 +6108,7 @@ async function onAutocomplete(interaction) {
     
     // Vault remove/info autocomplete
     if (
-      (interaction.commandName === 'vault' && ['remove', 'info', 'edit', 'verify', 'rename', 'export'].includes(interaction.options.getSubcommand())) ||
+      (interaction.commandName === 'vault' && ['remove', 'info', 'edit', 'verify', 'rename', 'export', 'replace'].includes(interaction.options.getSubcommand())) ||
       interaction.commandName === 'bankroll' ||
       interaction.commandName === 'bankroll-monzo' ||
       interaction.commandName === 'test' ||
