@@ -59,6 +59,7 @@ const {
   RENDER_OWNER_ID = '',
   RENDER_WEBHOOK_SECRET = '',
   RENDER_ALERT_CHANNEL_ID = '',
+  SHAREX_UPLOAD_TOKEN = '',
 } = process.env;
 
 const MONZO_LINK = (MONZO_ME_URL || (MONZO_USERNAME ? `https://monzo.me/${MONZO_USERNAME.replace(/^\/+|\/+$/g, '')}` : '')).replace(/\/+$/, '');
@@ -2902,6 +2903,24 @@ const onReady = async () => {
   if (started) return;
   started = true;
   console.log(`Logged in as ${client.user.tag}`);
+  // Ensure the ShareX destination exists. The upload route also retries creation
+  // if the channel is deleted while the bot is running.
+  if (DISCORD_GUILD_ID) {
+    try {
+      const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
+      let screenshots = guild.channels.cache.find(c => c.name === 'screenshots' && c.type === ChannelType.GuildText);
+      if (!screenshots) screenshots = await guild.channels.create({
+        name: 'screenshots',
+        type: ChannelType.GuildText,
+        topic: 'Automatic screenshots uploaded through ShareX.',
+        reason: 'Bankroll ShareX screenshot destination'
+      });
+      console.log(`ShareX destination ready: #${screenshots.name} (${screenshots.id})`);
+    } catch (error) {
+      console.error('Could not create/find #screenshots. Check DISCORD_GUILD_ID and Manage Channels permission:', error.message);
+    }
+  }
+
   // Register the slash commands from this deployed version on every startup.
   // This ensures new/changed commands are published after a Render deployment.
   try {
@@ -7548,6 +7567,42 @@ async function monitorRenderDeployments() {
 }
 // ---------- Render deployment webhook ----------
 const app = express();
+
+// ShareX uploads are authenticated with a dedicated secret. ShareX sends the
+// captured image as the raw request body (Content-Type: image/png/jpeg/webp).
+app.post('/sharex/upload', express.raw({ type: ['image/png', 'image/jpeg', 'image/webp'], limit: '8mb' }), async (req, res) => {
+  try {
+    if (!SHAREX_UPLOAD_TOKEN) return res.status(503).json({ error: 'ShareX upload is not configured. Set SHAREX_UPLOAD_TOKEN in Render.' });
+    const supplied = String(req.query.token || req.headers['x-sharex-token'] || '');
+    const expected = Buffer.from(SHAREX_UPLOAD_TOKEN);
+    const actual = Buffer.from(supplied);
+    if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return res.status(401).json({ error: 'Unauthorised' });
+    if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'No image received' });
+    const mime = String(req.headers['content-type'] || '').split(';')[0].toLowerCase();
+    const ext = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' })[mime];
+    if (!ext) return res.status(415).json({ error: 'Only PNG, JPEG and WebP screenshots are supported' });
+    if (!client.isReady()) return res.status(503).json({ error: 'Bankroll is not connected to Discord yet' });
+    const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
+    let channel = guild.channels.cache.find(c => c.name === 'screenshots' && c.type === ChannelType.GuildText);
+    if (!channel) channel = await guild.channels.create({
+      name: 'screenshots',
+      type: ChannelType.GuildText,
+      topic: 'Automatic screenshots uploaded through ShareX.',
+      reason: 'Bankroll ShareX screenshot destination'
+    });
+    const fileName = `sharex-${Date.now()}.${ext}`;
+    const message = await channel.send({
+      files: [new AttachmentBuilder(req.body, { name: fileName })],
+      allowedMentions: { parse: [] }
+    });
+    const attachment = message.attachments.first();
+    if (!attachment) throw new Error('Discord did not return the uploaded attachment');
+    return res.json({ url: attachment.url, id: attachment.id });
+  } catch (error) {
+    console.error('ShareX upload failed:', error.stack || error);
+    return res.status(500).json({ error: 'Screenshot upload failed' });
+  }
+});
 // Bind the HTTP port immediately so Render detects the service even while the
 // remaining routes and Discord startup logic are being initialized.
 const httpServer = app.listen(Number(PORT) || 3000, '0.0.0.0', () => {
