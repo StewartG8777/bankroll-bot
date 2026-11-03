@@ -2825,12 +2825,24 @@ const onReady = async () => {
       console.log(`Verified all ${publishedBefore.size} global slash/context commands already exist in Discord.`);
     }
     try { atomicWrite(commandHashFile, commandHash); } catch {}
-    if (DISCORD_GUILD_ID) {
-      const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
-      if (guild) await guild.commands.set([]);
-    }
   } catch (error) {
-    console.error('Automatic slash-command refresh failed:', error);
+    console.error('Automatic global slash-command refresh failed:', error);
+  }
+  // Publish a guild-scoped copy for immediate visibility in the configured server.
+  if (DISCORD_GUILD_ID) {
+    try {
+      const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
+      const guildCommandJson = commands.map((command) => {
+        const { integration_types, contexts, ...guildCommand } = command.toJSON();
+        return guildCommand;
+      });
+      const guildPublished = await guild.commands.set(guildCommandJson);
+      const guildNames = new Set(guildPublished.map((command) => command.name));
+      if (!guildNames.has('bankroll')) throw new Error('Guild command verification failed: /bankroll is missing.');
+      console.log('Verified ' + guildPublished.size + ' guild command(s), including /bankroll.');
+    } catch (error) {
+      console.error('Guild slash-command registration failed:', error);
+    }
   }
   // Restart-loop warning: DM the owner if the bot has started 3+ times in 10 minutes.
   try {
@@ -6677,13 +6689,16 @@ async function cmdBankrollFinance(interaction) {
     const available = stripeBalanceLines(balance.available);
     const pending = stripeBalanceLines(balance.pending);
 
-    // Stripe balance transactions include the date each pending amount is expected to become available.
+    // Pull a deeper page window so older pending credits are not silently omitted.
     const pendingByCurrencyAndDate = new Map();
+    const pendingActivity = [];
     let startingAfter;
-    for (let page = 0; page < 10; page++) {
+    let scannedTransactions = 0;
+    for (let page = 0; page < 25; page++) {
       const params = { limit: 100 };
       if (startingAfter) params.starting_after = startingAfter;
       const transactions = await stripe.balanceTransactions.list(params);
+      scannedTransactions += (transactions.data || []).length;
       for (const transaction of (transactions.data || [])) {
         if (transaction.status !== 'pending') continue;
         const currency = String(transaction.currency || '').toLowerCase();
@@ -6691,6 +6706,13 @@ async function cmdBankrollFinance(interaction) {
         if (!currency || !availableOn) continue;
         const key = currency + ':' + availableOn;
         pendingByCurrencyAndDate.set(key, (pendingByCurrencyAndDate.get(key) || 0) + Number(transaction.amount || 0));
+        if (Number(transaction.amount || 0) > 0 && pendingActivity.length < 20) {
+          pendingActivity.push(
+            money(Number(transaction.amount || 0) / 100, currency) +
+            ' — available <t:' + availableOn + ':D> — ' +
+            String(transaction.description || transaction.type || 'Stripe payment').slice(0, 100)
+          );
+        }
       }
       if (!transactions.has_more || !transactions.data?.length) break;
       startingAfter = transactions.data[transactions.data.length - 1].id;
@@ -6709,13 +6731,17 @@ async function cmdBankrollFinance(interaction) {
       : (pendingTotal > 0 ? 'Stripe has not provided an availability date for these pending funds yet.' : 'No pending funds.');
 
     const embed = new EmbedBuilder().setColor(GREEN).setTitle('BANKROLL | STRIPE BALANCE')
-      .setDescription('Live balance returned directly by Stripe.')
+      .setDescription('Live balance returned directly by Stripe. Pending transaction detail is included where Stripe supplies it.')
       .addFields(
         { name: 'Available to withdraw', value: available.join('\n') || '£0.00', inline: true },
         { name: 'Pending', value: pending.join('\n') || '£0.00', inline: true },
-        { name: 'Expected availability', value: expectedAvailability, inline: false }
+        { name: 'Expected availability by date', value: expectedAvailability, inline: false },
+        { name: 'Pending payment activity (latest credits)', value: pendingActivity.join('\n').slice(0, 1024) || 'No pending credit transactions found in the scanned history.', inline: false },
+        { name: 'Transactions checked', value: String(scannedTransactions), inline: true }
       ).setTimestamp();
-    return interaction.editReply({ embeds: [embed] });
+    await interaction.editReply({ embeds: [embed] });
+    await logToServer({ embeds: [embed] });
+    return;
   }
 
   if (sub === 'cashlogs') {
