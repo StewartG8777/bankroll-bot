@@ -1688,6 +1688,7 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
   }
 
   const noFile = !d.link && !d.path;
+  const isZip = /\.zip$/i.test(String(d.name || ''));
   if (d.path && fs.existsSync(d.path) && d.sha256 && await sha256File(d.path) !== d.sha256) {
     recordDownloadEvent('verification_failed',{file:d.name,customerId:d.customerId,agentId:d.agentId,detail:'SHA-256 checksum does not match the saved file record.'});
     d.deliveryError = 'File SHA-256 checksum does not match the saved file record.'; saveDeliveries();
@@ -1727,7 +1728,6 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     return;
   }
 
-  const isZip = /\.zip$/i.test(String(d.name || ''));
   if (isZip && !d.link && !dlink && d.path && fs.existsSync(d.path) && !BASE_URL) {
     throw new Error('ZIP delivery is configured to use the Download button only, but PUBLIC_URL is missing. Set PUBLIC_URL in Render so Bankroll can create a hosted download link.');
   }
