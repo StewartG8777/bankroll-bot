@@ -7599,7 +7599,7 @@ app.post('/sharex/upload', express.raw({ type: ['image/png', 'image/jpeg', 'imag
     const attachment = message.attachments.first();
     if (!attachment) throw new Error('Discord did not return the uploaded attachment');
     // Give ShareX a Bankroll-owned URL instead of exposing the Discord CDN URL.
-    const publicBase = String(PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\\/+$/, '');
+    const publicBase = String(PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
     const imageUrl = `${publicBase}/s/${message.id}`;
     // Put the shareable Bankroll link directly under the screenshot in #screenshots.
     await message.edit({ content: `🔗 ${imageUrl}` });
@@ -7615,14 +7615,14 @@ app.post('/sharex/upload', express.raw({ type: ['image/png', 'image/jpeg', 'imag
 app.get('/s/:messageId', async (req, res) => {
   try {
     const messageId = String(req.params.messageId || '');
-    if (!/^\\d{17,20}$/.test(messageId)) return res.status(404).send('Screenshot not found');
+    if (!/^\d{17,20}$/.test(messageId)) return res.status(404).send('Screenshot not found');
     if (!client.isReady()) return res.status(503).send('Bankroll is starting. Try again shortly.');
     const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
     const channel = guild.channels.cache.find(c => c.name === 'screenshots' && c.type === ChannelType.GuildText);
     if (!channel) return res.status(404).send('Screenshot not found');
     const message = await channel.messages.fetch(messageId).catch(() => null);
     const attachment = message?.attachments?.first();
-    if (!attachment || !/^image\\/(png|jpeg|webp)$/i.test(String(attachment.contentType || ''))) {
+    if (!attachment || !/^image\/(png|jpeg|webp)$/i.test(String(attachment.contentType || ''))) {
       return res.status(404).send('Screenshot not found');
     }
     return res.redirect(302, attachment.url);
