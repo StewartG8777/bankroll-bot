@@ -2337,6 +2337,22 @@ const wipeCmd = common(new SlashCommandBuilder().setName('wipe').setDescription(
   .addStringOption((o) => o.setName('confirm').setDescription('WIPE for one customer, WIPE ALL when no customer is chosen').setRequired(true).addChoices({ name: 'WIPE', value: 'WIPE' }, { name: 'WIPE ALL', value: 'WIPE ALL' }))
   .addUserOption((o) => o.setName('user').setDescription('Customer to wipe. Leave empty to wipe ALL customers, payments and payment records')));
 
+function previousCommandSchemaMismatch(published, desired) {
+  const simplify = (command) => ({
+    name: command.name,
+    description: command.description,
+    options: command.options || [],
+    type: command.type,
+    integration_types: command.integration_types || [],
+    contexts: command.contexts || [],
+  });
+  const existing = new Map([...published.values()].map((command) => [command.name, simplify(command)]));
+  return desired.some((command) => {
+    const current = existing.get(command.name);
+    return !current || JSON.stringify(current) !== JSON.stringify(simplify(command));
+  });
+}
+
 const commands = [sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bkCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
@@ -2813,18 +2829,34 @@ const onReady = async () => {
     const commandJson = commands.map((c) => c.toJSON());
     const commandHash = crypto.createHash('sha256').update(JSON.stringify(commandJson)).digest('hex');
     const commandHashFile = path.join(DATA_DIR, 'commands.hash');
-    let previousHash = '';
-    try { previousHash = fs.readFileSync(commandHashFile, 'utf8').trim(); } catch {}
-    if (previousHash === commandHash) {
-      console.log('Slash commands unchanged since the last start; skipping re-registration (use /bot refresh-commands to force).');
-    } else {
+
+    // Never trust the local hash as proof that Discord still has these commands.
+    // Render disks can retain commands.hash after Discord-side commands are missing
+    // or stale, which previously caused startup to skip publishing /bankroll.
+    const publishedBefore = await client.application.commands.fetch();
+    const publishedNames = new Set(publishedBefore.map((command) => command.name));
+    const requiredNames = commandJson.map((command) => command.name);
+    const missingNames = requiredNames.filter((name) => !publishedNames.has(name));
+    const mustSync = missingNames.length > 0 ||
+      publishedBefore.size !== commandJson.length ||
+      previousCommandSchemaMismatch(publishedBefore, commandJson);
+
+    if (mustSync) {
       await client.application.commands.set(commandJson);
-      console.log(`Registered ${commands.length} global slash/context command(s) from the running version.`);
-      if (DISCORD_GUILD_ID) {
-        const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
-        if (guild) await guild.commands.set([]);
+      const verified = await client.application.commands.fetch();
+      const verifiedNames = new Set(verified.map((command) => command.name));
+      const stillMissing = requiredNames.filter((name) => !verifiedNames.has(name));
+      if (stillMissing.length) {
+        throw new Error('Discord command sync verification failed; missing: ' + stillMissing.join(', '));
       }
-      try { atomicWrite(commandHashFile, commandHash); } catch {}
+      console.log(`Verified ${verified.size} global slash/context command(s): ${requiredNames.join(', ')}`);
+    } else {
+      console.log(`Verified all ${publishedBefore.size} global slash/context commands already exist in Discord.`);
+    }
+    try { atomicWrite(commandHashFile, commandHash); } catch {}
+    if (DISCORD_GUILD_ID) {
+      const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
+      if (guild) await guild.commands.set([]);
     }
   } catch (error) {
     console.error('Automatic slash-command refresh failed:', error);
