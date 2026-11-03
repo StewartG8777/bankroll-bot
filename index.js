@@ -136,7 +136,7 @@ function savePresence(status) {
   if (!['online', 'idle', 'dnd', 'invisible'].includes(status)) throw new Error('Invalid Discord presence status.');
   savedPresence = { status, updatedAt: Date.now() };
   atomicWrite(PRESENCE_FILE, JSON.stringify(savedPresence, null, 2));
-  scheduleBackup();
+  scheduleBackup(true);
 }
 let notificationHistory = [];
 try {
@@ -2477,6 +2477,14 @@ async function autoRestoreOnStartup() {
     } catch {}
     try { sendJobs = JSON.parse(fs.readFileSync(SEND_JOBS_FILE, 'utf8')); } catch {}
     try { processedWebhookEvents = JSON.parse(fs.readFileSync(WEBHOOK_EVENTS_FILE, 'utf8')); } catch {}
+    try {
+      const restoredPresence = JSON.parse(fs.readFileSync(PRESENCE_FILE, 'utf8'));
+      if (['online', 'idle', 'dnd', 'invisible'].includes(restoredPresence?.status)) {
+        savedPresence = { status: restoredPresence.status, updatedAt: Number(restoredPresence.updatedAt || 0) };
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') console.error('Could not reload restored bot presence:', error.message);
+    }
 
     fs.mkdirSync(VAULT_DIR, { recursive: true });
     fs.mkdirSync(FILES_DIR, { recursive: true });
@@ -4802,7 +4810,7 @@ async function cmdPayments(interaction) {
       at: r.created,
       text:
         `${money(r.amount / 100, r.currency)} - ${r.customerId ? `<@${r.customerId}>` : 'Unknown customer'} - ` +
-        `${short(r.description, 40)} - <t:${r.created}:d> (Card)`,
+        `${short(r.description, 40)} - <t:${r.created}:d> (Stripe card)`,
     })),
     ...monzoPaid().map((m) => ({
       at: tsec(m.paidAt),
@@ -5175,6 +5183,10 @@ async function cmdBotAdmin(interaction) {
     await client.user.setPresence({ status: presence, activities: [] });
     try {
       savePresence(presence);
+      const backupResult = await backupData();
+      if (!backupResult?.ok) {
+        return interaction.editReply(`Presence changed to **${presence}** and saved locally, but the backup failed: ${short(backupResult?.error || 'unknown backup error', 180)}`);
+      }
     } catch (error) {
       console.error('Could not persist bot presence:', error);
       return interaction.editReply(`Presence changed to **${presence}**, but could not be saved for the next restart: ${short(error.message, 180)}`);
@@ -6745,11 +6757,8 @@ async function cmdBankrollFinance(interaction) {
     const embed = new EmbedBuilder().setColor(GREEN).setTitle('BANKROLL | STRIPE BALANCE')
       .setDescription('Live balance returned directly by Stripe. Pending transaction detail is included where Stripe supplies it.')
       .addFields(
-        { name: 'Available to withdraw', value: available.join('\n') || '£0.00', inline: true },
-        { name: 'Pending', value: pending.join('\n') || '£0.00', inline: true },
-        { name: 'Expected availability by date', value: expectedAvailability, inline: false },
-        { name: 'Pending payment activity (latest credits)', value: pendingActivity.join('\n').slice(0, 1024) || 'No pending credit transactions found in the scanned history.', inline: false },
-        { name: 'Transactions checked', value: String(scannedTransactions), inline: true }
+        { name: 'Available', value: available.join('\n') || '£0.00', inline: true },
+        { name: 'Pending', value: pending.join('\n') || '£0.00', inline: true }
       ).setTimestamp();
     const snapshotFile = path.join(DATA_DIR, 'stripe_balance_snapshots.json');
     let snapshots = [];
