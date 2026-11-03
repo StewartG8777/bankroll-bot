@@ -2114,6 +2114,12 @@ const vaultCmd = common(
         .addAttachmentOption((o) => o.setName('file').setDescription('The file to store').setRequired(true))
         .addStringOption((o) => o.setName('name').setDescription('Short key/name for autocomplete (e.g. car-pack-v2)').setRequired(true))
     )
+    .addSubcommand((sub) =>
+      sub.setName('replace')
+        .setDescription('Replace a vault file while keeping its existing key and updating unpaid invoices')
+        .addStringOption((o) => o.setName('name').setDescription('Existing vault key to replace').setAutocomplete(true).setRequired(true))
+        .addAttachmentOption((o) => o.setName('file').setDescription('The replacement file').setRequired(true))
+    )
     .addSubcommand((sub) => sub.setName('list').setDescription('List all files currently in your vault'))
     .addSubcommand((sub) =>
       sub.setName('search')
@@ -4055,6 +4061,91 @@ async function cmdVault(interaction) {
     return;
   }
 
+  if (sub === 'replace') {
+    const key = interaction.options.getString('name');
+    const att = interaction.options.getAttachment('file');
+    const item = vault[key];
+    if (!item?.path || !fs.existsSync(item.path)) return interaction.editReply(`Vault item \`${key}\` was not found.`);
+    if (Number(att.size || 0) > 100 * 1024 * 1024) return interaction.editReply('The replacement file is over 100 MB.');
+    const oldName = String(item.originalName || path.basename(item.path));
+    const newName = String(att.name || oldName).replace(/[\\/:*?"<>|]/g, '_');
+    const tempPath = path.join(TMP_DIR, 'vault-replace-' + crypto.randomBytes(10).toString('hex') + '.part');
+    const replacementPath = path.join(VAULT_DIR, key + '_' + newName);
+    let info;
+    try {
+      info = await streamToFile(att.url, tempPath, 100 * 1024 * 1024);
+      if (/\\.zip$/i.test(newName)) await verifyZipIntegrity(tempPath);
+      fs.renameSync(tempPath, replacementPath);
+    } catch (error) {
+      try { fs.unlinkSync(tempPath); } catch {}
+      console.error('Vault replace failed:', error.stack || error);
+      return interaction.editReply('Could not replace the vault file: ' + short(error.message, 400));
+    }
+
+    const previousPath = item.path;
+    item.path = replacementPath;
+    item.originalName = newName;
+    item.size = info.size;
+    item.sha256 = info.sha256;
+    item.addedAt = Date.now();
+    item.replacedAt = Date.now();
+    delete blobBackedUp[relData(replacementPath)];
+    saveVault();
+
+    // Refresh copies attached to invoices that are still awaiting payment.
+    // Paid/delivered orders are deliberately left unchanged.
+    let refreshed = 0;
+    const refreshCopy = (record, sourcePath, name) => {
+      if (!record?.path || !fs.existsSync(sourcePath)) return;
+      const destination = record.path;
+      if (path.resolve(destination) === path.resolve(sourcePath)) return;
+      const tempCopy = destination + '.replace-' + crypto.randomBytes(6).toString('hex');
+      try {
+        fs.copyFileSync(sourcePath, tempCopy);
+        fs.renameSync(tempCopy, destination);
+        const st = fs.statSync(destination);
+        record.size = st.size;
+        record.sha256 = info.sha256;
+        if (name) record.name = name;
+        refreshed++;
+      } catch (error) {
+        try { fs.unlinkSync(tempCopy); } catch {}
+        console.error('Could not refresh pending invoice copy:', error.message);
+      }
+    };
+    for (const delivery of Object.values(deliveries)) {
+      if (!delivery || delivery.paid || delivery.paymentConfirmed || delivery.deliveryComplete) continue;
+      if (delivery.vaultKey === key) {
+        refreshCopy(delivery, replacementPath, newName);
+        delivery.name = newName;
+        delivery.size = info.size;
+        delivery.sha256 = info.sha256;
+      }
+      if (Array.isArray(delivery.files)) {
+        for (const file of delivery.files) {
+          if (file?.vaultKey !== key) continue;
+          refreshCopy(file, replacementPath, newName);
+          file.size = info.size;
+          file.sha256 = info.sha256;
+          file.name = newName;
+        }
+        delivery.name = delivery.files.map((file) => file.name).join(', ');
+      }
+    }
+    saveDeliveries();
+    if (previousPath !== replacementPath) {
+      try { fs.unlinkSync(previousPath); } catch {}
+      delete blobBackedUp[relData(previousPath)];
+    }
+    recordNotification('vault.replace', 'Vault file replaced', key + ': ' + oldName + ' -> ' + newName + '; refreshed ' + refreshed + ' pending invoice file(s)', 'success');
+    clearTimeout(backupTimer);
+    backupData().catch(() => {});
+    return interaction.editReply(
+      'Replaced vault item **' + key + '** with **' + newName + '**.\n' +
+      'Updated ' + refreshed + ' file copy/copies on unpaid invoices using this vault item. Those invoices will deliver the replacement after payment. Already-paid/delivered orders were not changed.'
+    );
+  }
+
   if (sub === 'search') {
     const query = interaction.options.getString('query').trim().toLowerCase();
     const matches = Object.entries(vault).filter(([key, item]) =>
@@ -5051,6 +5142,7 @@ const RECENT_UPDATES = [
   '/monzo-review: supports this month, last month, this week and last week, with editable transaction dates.',
   '/bot refresh-commands: compares the full command definition, reports added/removed/changed commands and verifies Discord registration.',
   '/sendfile: accepts any file type stored in the vault, not only ZIP archives.',
+  '/vault replace: replace an existing vault item under the same key and refresh its copies on unpaid invoices.',
   '/export index: uploads the raw index.js file to the private #bankroll-index-logs channel and records who ran it and when.',
   'Historical Monzo customer IDs are assigned to the nine reviewed sales in newest-to-oldest order.',
 ];
