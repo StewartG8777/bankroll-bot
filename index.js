@@ -218,7 +218,7 @@ async function logToServer(payload) {
     console.error('Log channel failed:', e.message);
     logChannelCache = { channel: null, at: 0 };
   }
-  if (!LOG_WEBHOOK_URL) return;
+  if (!LOG_WEBHOOK_URL) { console.error('Log event was not delivered: #bankroll-log unavailable and LOG_WEBHOOK_URL is not configured.'); return false; }
   try {
     const body = {
       username: 'Bankroll Log',
@@ -231,7 +231,8 @@ async function logToServer(payload) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!res.ok) console.error('Log webhook failed:', res.status, (await res.text()).slice(0, 200));
+    if (!res.ok) { console.error('Log webhook failed:', res.status, (await res.text()).slice(0, 200)); return false; }
+    return true;
   } catch (e) {
     console.error('Log webhook error:', e.message);
   }
@@ -1353,7 +1354,7 @@ async function backupDataOnce() {
   }
 
   try {
-    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json'];
+    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json', 'stripe_balance_history.json', 'stripe_balance_snapshots.json'];
     const files = [];
     for (const name of jsonNames) {
       const fp = path.join(DATA_DIR, name);
@@ -6705,7 +6706,7 @@ async function cmdBankrollFinance(interaction) {
     const pendingActivity = [];
     let startingAfter;
     let scannedTransactions = 0;
-    for (let page = 0; page < 25; page++) {
+    for (let page = 0; ; page++) {
       const params = { limit: 100 };
       if (startingAfter) params.starting_after = startingAfter;
       const transactions = await stripe.balanceTransactions.list(params);
@@ -6750,8 +6751,23 @@ async function cmdBankrollFinance(interaction) {
         { name: 'Pending payment activity (latest credits)', value: pendingActivity.join('\n').slice(0, 1024) || 'No pending credit transactions found in the scanned history.', inline: false },
         { name: 'Transactions checked', value: String(scannedTransactions), inline: true }
       ).setTimestamp();
+    const snapshotFile = path.join(DATA_DIR, 'stripe_balance_snapshots.json');
+    let snapshots = [];
+    try { snapshots = JSON.parse(fs.readFileSync(snapshotFile, 'utf8')); } catch {}
+    snapshots = Array.isArray(snapshots) ? snapshots : [];
+    snapshots.push({
+      capturedAt: Date.now(),
+      available: balance.available || [],
+      pending: balance.pending || [],
+      pendingByCurrencyAndDate: [...pendingByCurrencyAndDate.entries()],
+      scannedTransactions,
+      paginationComplete: scannedTransactions === 0 || scannedTransactions % 100 !== 0
+    });
+    atomicWrite(snapshotFile, JSON.stringify(snapshots.slice(-2000)));
+    scheduleBackup(true);
     await interaction.editReply({ embeds: [embed] });
-    await logToServer({ embeds: [embed] });
+    const logDelivered = await logToServer({ embeds: [embed] });
+    if (logDelivered === false) console.error('Balance snapshot is saved locally but its Discord log could not be delivered.');
     return;
   }
 
