@@ -8746,7 +8746,7 @@ app.get('/bankroll-backup-file/:token', (req, res) => {
 });
 
 const downloadAttempts = new Map();
-app.get('/:name/:token', (req, res) => {
+app.all('/:name/:token', (req, res) => {
   if (!req.params.name.startsWith('bankroll-')) return res.status(404).send('Not found');
   const token = req.params.token; const remote=String(req.ip||req.socket?.remoteAddress||'unknown');
   const attempt=downloadAttempts.get(remote)||{count:0,resetAt:Date.now()+60000}; if(Date.now()>attempt.resetAt){attempt.count=0;attempt.resetAt=Date.now()+60000;} attempt.count++;downloadAttempts.set(remote,attempt);
@@ -8757,9 +8757,9 @@ app.get('/:name/:token', (req, res) => {
   if(!t||(t.used&&(!t.multiUse||!!t.vaultKey))||activeDownloadTokens.has(token)||(t.expiresAt != null && Date.now()>Number(t.expiresAt))||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
 
   const ua = req.headers['user-agent'] || '';
-  if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) {
-    return res.status(200).send('Download link');
-  }
+  if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) return res.status(200).send('Download link');
+  if (req.method === 'GET') { res.setHeader('Cache-Control', 'no-store'); return res.status(200).type('html').send('<form method="post"><p>Press below to use this one-time download link.</p><button>Confirm download</button></form>'); }
+  if (req.method !== 'POST') return res.status(405).send('Method not allowed');
   if (!t.multiUse || t.vaultKey) t.used = true; activeDownloadTokens.add(token); saveDownloads();
   const downloadStartedAt = Date.now();
   const expectedBytes = fs.statSync(t.path).size;
