@@ -7349,7 +7349,7 @@ async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = t
   const manifestChunks = [];
   for await (const chunk of manifestResponse.data) manifestChunks.push(Buffer.from(chunk));
   const manifest = JSON.parse(Buffer.concat(manifestChunks).toString('utf8'));
-  if (!['bankroll-drive-layout-v1', 'bankroll-drive-layout-v2'].includes(manifest.format)) throw new Error('Unsupported Google Drive recovery manifest format.');
+  if (manifest.format !== 'bankroll-drive-layout-v2') throw new Error('This Google Drive recovery point uses the legacy manifest format. Run /drive backup once to create a verified v2 recovery manifest.');
   let restoredDatabase = 0, restoredVault = 0, skipped = 0;
   const downloadVerified = async (entry, destination) => {
     if (!entry?.fileId || !/^[a-f0-9]{64}$/i.test(String(entry.sha256 || '')) || !Number.isSafeInteger(Number(entry.size)) || Number(entry.size) < 0) throw new Error('Recovery manifest contains an invalid file entry.');
