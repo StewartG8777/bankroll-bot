@@ -67,7 +67,7 @@ async function recoverOAuth(client) {
       const bundle = decryptBundle(Buffer.from(await response.arrayBuffer()));
       const config = bundle.client?.web || bundle.client?.installed || bundle.client;
       if (!config?.client_id || !config?.client_secret || !bundle.token) throw new Error('The encrypted Google OAuth bundle is incomplete.');
-      return { config, token: bundle.token };
+      return { config, client: bundle.client, token: bundle.token };
     }
     before = ordered[ordered.length - 1]?.id;
     if (!before || messages.size < 100) break;
@@ -172,6 +172,10 @@ async function main() {
     await client.login(TOKEN);
     log('Connected to Discord to recover Drive credentials before loading databases.');
     const bundle = await recoverOAuth(client);
+    // The application uses these same private files for /drive status, token refresh and backups.
+    fs.writeFileSync(path.join(DATA_DIR, 'google-oauth.json'), JSON.stringify(bundle.client, null, 2), { mode: 0o600 });
+    fs.writeFileSync(path.join(DATA_DIR, 'google-drive-token.json'), JSON.stringify(bundle.token, null, 2), { mode: 0o600 });
+    try { fs.chmodSync(path.join(DATA_DIR, 'google-oauth.json'), 0o600); fs.chmodSync(path.join(DATA_DIR, 'google-drive-token.json'), 0o600); } catch {}
     const hasAnyLocalDb = localDatabases.length > 0;
     if (hasAnyLocalDb) log('Existing Render database files detected; they will be preserved and only missing files imported.');
     await restoreDriveSnapshot(bundle);
