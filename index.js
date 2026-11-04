@@ -2203,6 +2203,9 @@ const vaultCmd = common(
 );
 
 
+const backupCmd = common(new SlashCommandBuilder().setName('backup').setDescription('Run and inspect Bankroll backups (owner only)')
+  .addSubcommand((sub) => sub.setName('run').setDescription('Run an immediate Discord and Google Drive backup'))
+  .addSubcommand((sub) => sub.setName('status').setDescription('Inspect backup health, schedule and recovery sources')));
 const recoveryCmd = common(new SlashCommandBuilder().setName('recovery').setDescription('Inspect and restore missing Bankroll data from Google Drive (owner only)')
   .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive recovery point and connection'))
   .addSubcommand((sub) => sub.setName('restore').setDescription('Restore missing/empty database and vault files from Drive without overwriting existing files')));
@@ -2469,7 +2472,7 @@ function previousCommandSchemaMismatch(published, desired) {
   });
 }
 
-const commands = [recoveryCmd, systemCmd, performanceCmd, storageCmd, driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [backupCmd, recoveryCmd, systemCmd, performanceCmd, storageCmd, driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
 // are never cached.
@@ -7398,6 +7401,28 @@ function formatBytes(bytes) {
   while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
   return n.toFixed(2) + ' ' + units[i];
 }
+async function cmdBackupManagement(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage backups.');
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'status') {
+    const next = lastBackupRunAt ? Math.max(0, 6 * 60 * 60 * 1000 - (Date.now() - lastBackupRunAt)) : 0;
+    const lines = [
+      '**Last successful backup:** ' + (lastBackupAt ? '<t:' + Math.floor(lastBackupAt / 1000) + ':R>' : 'Not recorded'),
+      '**Last attempted backup:** ' + (lastBackupRunAt ? '<t:' + Math.floor(lastBackupRunAt / 1000) + ':R>' : 'Not recorded'),
+      '**Next six-hour backup window:** ' + (lastBackupRunAt ? '<t:' + Math.floor((Date.now() + next) / 1000) + ':R>' : 'Pending startup backup'),
+      '**Discord recovery:** ' + (BACKUP_CHANNEL_ID ? 'Configured channel ID' : '#bankroll-backup auto-discovery'),
+      '**Google Drive:** ' + (googleDriveIsConnected() ? 'Connected' : 'Not connected'),
+      '**Recovery status:** ' + (restoreDone ? 'Startup recovery complete' : 'Still recovering'),
+      '**Current error:** ' + short(lastBackupError || 'None', 700),
+    ];
+    return interaction.editReply(lines.join('\n'));
+  }
+  await interaction.editReply('Running a full backup. This can take a while for large vault files; normal bot commands remain available.');
+  const result = await backupData();
+  if (!result?.ok) return interaction.editReply('❌ Backup failed: ' + short(result?.error || 'Unknown backup error', 900));
+  return interaction.editReply('✅ Discord backup completed' + (googleDriveIsConnected() ? ' and Google Drive mirror completed.' : '. Google Drive is not connected, so only Discord has a recovery copy.'));
+}
+
 async function cmdRecovery(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can run recovery.');
   const sub = interaction.options.getSubcommand();
@@ -7588,6 +7613,9 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     switch (interaction.commandName) {
+      case 'backup':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdBackupManagement(interaction);
       case 'recovery':
         await interaction.deferReply({ ephemeral: true });
         return await cmdRecovery(interaction);
