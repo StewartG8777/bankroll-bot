@@ -11,6 +11,8 @@ const zlib = require('zlib');
 const { pipeline } = require('stream/promises');
 const { Readable, Transform } = require('stream');
 const { monitorEventLoopDelay } = require('perf_hooks');
+const os = require('os');
+const { getPerformanceSnapshot } = require('./systems/performance');
 const {
   Client,
   GatewayIntentBits,
@@ -2201,6 +2203,10 @@ const vaultCmd = common(
 );
 
 
+const systemCmd = common(new SlashCommandBuilder().setName('system').setDescription('View Bankroll runtime health and system status (owner only)'));
+const performanceCmd = common(new SlashCommandBuilder().setName('performance').setDescription('View Bankroll performance, memory and event-loop analytics (owner only)'));
+const storageCmd = common(new SlashCommandBuilder().setName('storage').setDescription('Inspect Bankroll storage usage and indexed files (owner only)'));
+
 const driveCmd = common(new SlashCommandBuilder().setName('drive').setDescription('Connect and manage Google Drive backups (owner only)')
   .addSubcommand((sub) => sub.setName('connect').setDescription('Connect the Google account used for backups'))
   .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive connection and backup status'))
@@ -2460,7 +2466,7 @@ function previousCommandSchemaMismatch(published, desired) {
   });
 }
 
-const commands = [driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [systemCmd, performanceCmd, storageCmd, driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
 // are never cached.
@@ -7286,6 +7292,66 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
   console.log('Google Drive backup complete: ' + uploaded + ' changed file(s) uploaded across the Bankroll folders.');
   return { connected: true, uploaded, folders };
 }
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return value + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let n = value / 1024, i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return n.toFixed(2) + ' ' + units[i];
+}
+async function cmdSystemDiagnostics(interaction, mode) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can view system diagnostics.');
+  const p = getPerformanceSnapshot();
+  const uptime = Math.floor(process.uptime());
+  const uptimeText = Math.floor(uptime / 86400) + 'd ' + Math.floor((uptime % 86400) / 3600) + 'h ' + Math.floor((uptime % 3600) / 60) + 'm';
+  const fields = [
+    { name: 'Uptime', value: uptimeText, inline: true },
+    { name: 'Node.js', value: process.version, inline: true },
+    { name: 'Platform', value: process.platform + ' / ' + process.arch, inline: true },
+    { name: 'RSS memory', value: formatBytes(p.memory.rss), inline: true },
+    { name: 'Heap used', value: formatBytes(p.memory.heapUsed) + ' / ' + formatBytes(p.memory.heapTotal), inline: true },
+    { name: 'External memory', value: formatBytes(p.memory.external), inline: true },
+    { name: 'Event-loop delay (mean)', value: p.eventLoop.meanMs === null ? 'Warming up' : p.eventLoop.meanMs.toFixed(2) + ' ms', inline: true },
+    { name: 'Event-loop delay (p99)', value: p.eventLoop.p99Ms === null ? 'Warming up' : p.eventLoop.p99Ms.toFixed(2) + ' ms', inline: true },
+    { name: 'CPU load (1m)', value: (os.loadavg()[0] || 0).toFixed(2), inline: true },
+    { name: 'Backup', value: lastBackupAt ? '<t:' + Math.floor(lastBackupAt / 1000) + ':R>' : 'No successful backup recorded', inline: true },
+    { name: 'Recovery', value: restoreDone ? 'Startup recovery complete' : 'Recovery not complete', inline: true },
+    { name: 'Last backup error', value: short(lastBackupError || 'None', 900), inline: false },
+  ];
+  const embed = new EmbedBuilder().setColor(lastBackupError ? RED : GREEN)
+    .setTitle(mode === 'performance' ? 'BANKROLL | PERFORMANCE ANALYTICS' : 'BANKROLL | SYSTEM HEALTH')
+    .addFields(fields).setTimestamp();
+  return interaction.editReply({ embeds: [embed] });
+}
+async function cmdStorageDiagnostics(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can inspect storage.');
+  const unique = new Set();
+  for (const item of Object.values(vault)) if (item?.path) unique.add(item.path);
+  for (const item of [...Object.values(deliveries), ...Object.values(downloads)]) {
+    if (item?.path && !item.backupDownload && !path.basename(String(item.path)).startsWith('download_')) unique.add(item.path);
+    for (const file of Array.isArray(item?.files) ? item.files : []) if (file?.path) unique.add(file.path);
+  }
+  let present = 0, missing = 0, bytes = 0;
+  for (const fp of unique) {
+    try { const st = await fs.promises.stat(fp); if (st.isFile()) { present++; bytes += st.size; } else missing++; }
+    catch { missing++; }
+  }
+  const embed = new EmbedBuilder().setColor(missing ? RED : GREEN).setTitle('BANKROLL | STORAGE OVERVIEW')
+    .addFields(
+      { name: 'Data directory', value: short(DATA_DIR_STATUS, 900), inline: false },
+      { name: 'Vault entries', value: String(Object.keys(vault).length), inline: true },
+      { name: 'Delivery records', value: String(Object.keys(deliveries).length), inline: true },
+      { name: 'Download records', value: String(Object.keys(downloads).length), inline: true },
+      { name: 'Indexed files present', value: String(present), inline: true },
+      { name: 'Missing/unreadable files', value: String(missing), inline: true },
+      { name: 'Indexed file size', value: formatBytes(bytes), inline: true },
+      { name: 'Last successful backup', value: lastBackupAt ? '<t:' + Math.floor(lastBackupAt / 1000) + ':R>' : 'Not recorded', inline: true },
+      { name: 'Backup health', value: short(lastBackupError || 'No current error recorded', 900), inline: false }
+    ).setTimestamp();
+  return interaction.editReply({ embeds: [embed] });
+}
+
 async function cmdDrive(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage Google Drive backups.');
   const sub = interaction.options.getSubcommand();
@@ -7401,6 +7467,15 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     switch (interaction.commandName) {
+      case 'system':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdSystemDiagnostics(interaction, 'system');
+      case 'performance':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdSystemDiagnostics(interaction, 'performance');
+      case 'storage':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdStorageDiagnostics(interaction);
       case 'drive-credentials':
         return await cmdDriveCredentials(interaction);
       case 'drive':
