@@ -4323,15 +4323,6 @@ async function cmdVault(interaction) {
     if (!item) return interaction.editReply('Vault item `' + key + '` not found.');
     if (!item.path || !fs.existsSync(item.path)) return interaction.editReply('Vault file `' + key + '` is missing from storage. Re-add it before exporting.');
 
-    if (!BASE_URL) {
-      return interaction.editReply({
-        content: 'Hosted downloads are not configured. Set PUBLIC_URL (or BASE_URL) in the Render environment, then try again.',
-        embeds: [],
-        files: [],
-        components: [],
-      });
-    }
-
     const fileName = path.basename(item.originalName || path.basename(item.path));
     const size = fs.statSync(item.path).size;
     try {
@@ -6762,6 +6753,7 @@ async function onButton(interaction) {
       }, { notificationType: 'vault.download', notificationStatus: 'success' });
     } catch (error) {
       console.error('Vault attachment delivery failed:', error);
+      if (interaction.replied || interaction.deferred) return;
       try {
         const url = await makeDownloadLink({
           path: item.path, name: fileName, customerId: clicker.id, agentId: OWNER_ID,
