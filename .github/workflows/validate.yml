@@ -20,6 +20,6 @@ jobs:
       - name: Check JavaScript syntax
         run: |
           node --check index.js
-          node --check systems/performance.js
+          for file in systems/*.js; do node --check "$file"; done
       - name: Check package metadata
         run: node -e "const p=require('./package.json'); if (!p.scripts || !p.scripts.start) process.exit(1)"
