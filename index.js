@@ -7340,11 +7340,15 @@ async function cmdDriveCredentials(interaction) {
   if (parsed.installed || parsed.web) {
     // Keep the original Google file structure intact.
   } else {
-    // Normalize a flat/wrapped OAuth JSON into Google's standard installed-client structure.
-    parsed = { installed: {
+    // Flat OAuth JSON is accepted, but Render requires a Web application client.
+    // Normalise it to Google's web shape and use Bankroll's configured callback.
+    // A Desktop client explicitly marked "installed" remains rejected by
+    // readGoogleClientConfig(), because its redirect flow is not suitable here.
+    const callback = googleRedirectUri();
+    parsed = { web: {
       client_id: clientConfig.client_id,
       client_secret: clientConfig.client_secret,
-      redirect_uris: Array.isArray(clientConfig.redirect_uris) && clientConfig.redirect_uris.length ? clientConfig.redirect_uris : ['http://localhost']
+      redirect_uris: [callback]
     } };
   }
   // Never trust the uploaded filename: Bankroll always stores it under the fixed standard name.
