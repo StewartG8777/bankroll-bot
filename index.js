@@ -4124,28 +4124,29 @@ async function cmdVault(interaction) {
     // Refresh copies attached to invoices that are still awaiting payment.
     // Paid/delivered orders are deliberately left unchanged.
     let refreshed = 0;
-    const refreshCopy = (record, sourcePath, name) => {
-      if (!record?.path || !fs.existsSync(sourcePath)) return;
+    const refreshJobs = [];
+    const refreshCopy = async (record, sourcePath, name) => {
+      if (!record?.path || path.resolve(record.path) === path.resolve(sourcePath)) return;
       const destination = record.path;
-      if (path.resolve(destination) === path.resolve(sourcePath)) return;
       const tempCopy = destination + '.replace-' + crypto.randomBytes(6).toString('hex');
       try {
-        fs.copyFileSync(sourcePath, tempCopy);
-        fs.renameSync(tempCopy, destination);
-        const st = fs.statSync(destination);
-        record.size = st.size;
+        // Keep large-file copying off the event loop and swap atomically so a
+        // payment/delivery never observes a half-written replacement.
+        await fs.promises.copyFile(sourcePath, tempCopy);
+        await fs.promises.rename(tempCopy, destination);
+        record.size = info.size;
         record.sha256 = info.sha256;
         if (name) record.name = name;
         refreshed++;
       } catch (error) {
-        try { fs.unlinkSync(tempCopy); } catch {}
+        await fs.promises.unlink(tempCopy).catch(() => {});
         console.error('Could not refresh pending invoice copy:', error.message);
       }
     };
     for (const delivery of Object.values(deliveries)) {
       if (!delivery || delivery.paid || delivery.paymentConfirmed || delivery.deliveryComplete) continue;
       if (delivery.vaultKey === key) {
-        refreshCopy(delivery, replacementPath, newName);
+        refreshJobs.push(refreshCopy(delivery, replacementPath, newName));
         delivery.name = newName;
         delivery.size = info.size;
         delivery.sha256 = info.sha256;
@@ -4153,7 +4154,7 @@ async function cmdVault(interaction) {
       if (Array.isArray(delivery.files)) {
         for (const file of delivery.files) {
           if (file?.vaultKey !== key) continue;
-          refreshCopy(file, replacementPath, newName);
+          refreshJobs.push(refreshCopy(file, replacementPath, newName));
           file.size = info.size;
           file.sha256 = info.sha256;
           file.name = newName;
@@ -4161,6 +4162,9 @@ async function cmdVault(interaction) {
         delivery.name = delivery.files.map((file) => file.name).join(', ');
       }
     }
+    // Copies are independent files: refresh them concurrently rather than
+    // serially blocking the interaction on every invoice copy.
+    await Promise.all(refreshJobs);
     saveDeliveries();
     if (previousPath !== replacementPath) {
       try { fs.unlinkSync(previousPath); } catch {}
