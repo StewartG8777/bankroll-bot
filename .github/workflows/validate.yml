@@ -20,6 +20,7 @@ jobs:
           node-version: 22
       - name: Check JavaScript syntax
         run: |
+          node --check bootstrap.js
           node --check index.js
           node --check systems/google-drive-primary-storage.js
           node --check systems/performance.js
