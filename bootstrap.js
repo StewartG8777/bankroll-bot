@@ -9,7 +9,21 @@ const crypto = require('crypto');
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
 
 const TOKEN = process.env.DISCORD_TOKEN;
-const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+const requestedDataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+function selectBootstrapDataDir() {
+  const candidates = [...new Set([requestedDataDir, path.join(__dirname, 'data'), path.join('/tmp', 'bankroll-data')].map((value) => path.resolve(value)))];
+  for (const candidate of candidates) {
+    try {
+      fs.mkdirSync(candidate, { recursive: true });
+      const probe = path.join(candidate, '.bankroll-bootstrap-probe-' + process.pid);
+      fs.writeFileSync(probe, 'ok'); fs.unlinkSync(probe);
+      if (candidate !== requestedDataDir) log('Configured DATA_DIR unavailable; matching Bankroll fallback: ' + candidate);
+      return candidate;
+    } catch {}
+  }
+  throw new Error('No writable Bankroll data directory is available.');
+}
+const DATA_DIR = selectBootstrapDataDir();
 const BACKUP_CHANNEL_ID = process.env.BACKUP_CHANNEL_ID || '';
 const PRIMARY_REQUIRED = process.env.BANKROLL_DRIVE_PRIMARY !== '0';
 const AUTH_NAME = 'google-drive-auth.enc';
