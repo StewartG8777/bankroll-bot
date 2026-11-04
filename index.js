@@ -3033,6 +3033,14 @@ const onReady = async () => {
   // Always establish a fresh recovery point after startup restore. Previously a
   // quiet bot could restart and never create a new snapshot until another save.
   void backupData();
+  // A durable recovery point is produced at least every six hours even when the
+  // bot is otherwise quiet. backupData() serialises runs through backupChain,
+  // so scheduled and event-triggered backups cannot overlap.
+  const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+  const periodicBackupTimer = setInterval(() => {
+    if (restoreDone && !shuttingDown) void backupData();
+  }, SIX_HOURS_MS);
+  periodicBackupTimer.unref?.();
   try {
     const status = ['online', 'idle', 'dnd', 'invisible'].includes(savedPresence?.status) ? savedPresence.status : 'online';
     await client.user.setPresence({ status, activities: [] });
