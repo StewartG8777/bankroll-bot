@@ -8101,30 +8101,21 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
         const embed = new EmbedBuilder()
           .setColor(GREEN)
-          .setTitle('Bankroll Checkout')
+          .setTitle('PAID | STRIPE PAYMENT RECEIVED')
           .setDescription(description || 'No description')
           .addFields(
             { name: 'Customer', value: customer_id ? `<@${customer_id}>` : 'Unknown', inline: true },
             { name: 'Sales Agent', value: agent_id ? `<@${agent_id}>` : 'Unknown', inline: true },
-            { name: 'Amount', value: money(total, s.currency || CURRENCY), inline: true },
+            { name: 'Amount Paid', value: money(total, s.currency || CURRENCY), inline: true },
             { name: 'Payment Status', value: 'PAID', inline: true },
             { name: 'Paid At', value: `<t:${event.created}:F>`, inline: true },
-            { name: 'Transaction ID', value: s.id }
+            { name: 'Transaction ID', value: String(s.payment_intent || s.id) }
           );
 
-        const components = [];
-        if (!deliveries[s.id] && s.payment_intent) {
-          components.push(
-            new ActionRowBuilder().addComponents(
-              new ButtonBuilder()
-                .setCustomId(`delivered:${s.payment_intent}`)
-                .setLabel('Mark as delivered')
-                .setStyle(ButtonStyle.Primary)
-            )
-          );
-        }
-
-        await notifyOwner({ embeds: [embed], components });
+        await notifyOwner({ embeds: [embed] }, {
+          notificationType: 'payment.stripe_received',
+          notificationStatus: 'success'
+        });
       } catch (err) {
         console.error('Failed to DM owner:', err);
       }
