@@ -3550,6 +3550,8 @@ async function sendStripeCheckout(interaction) {
       Object.assign(deliveries[session.id], { type: 'stripe', amount, currency: cur, description });
       saveDeliveries();
     }
+    try { await requireDurableDriveCommit('Stripe invoice ' + session.id); }
+    catch (error) { await stripe.checkout.sessions.expire(session.id).catch(() => {}); throw error; }
     const where = whereFrom(interaction, customer);
 
     const embed = new EmbedBuilder()
@@ -3723,6 +3725,7 @@ async function sendMonzoInvoice(interaction) {
       fileName: fileData ? fileData.name : linkUrl ? 'download link' : null,
     };
     saveMonzo();
+    await requireDurableDriveCommit('Monzo invoice ' + key);
     scheduleMonzoReminder(monzoLedger[key]);
 
     const where = whereFrom(interaction, customer);
