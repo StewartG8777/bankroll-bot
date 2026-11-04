@@ -6934,8 +6934,9 @@ async function cmdBankrollFinance(interaction, sub) {
         if (Number(transaction.amount || 0) > 0 && pendingActivity.length < 20) {
           pendingActivity.push(
             money(Number(transaction.amount || 0) / 100, currency) +
-            ' — available <t:' + availableOn + ':D> — ' +
-            String(transaction.description || transaction.type || 'Stripe payment').slice(0, 100)
+            ' — added <t:' + Number(transaction.created || 0) + ':D>' +
+            ' — available <t:' + availableOn + ':D> (<t:' + availableOn + ':R>) — ' +
+            String(transaction.description || transaction.type || 'Stripe payment').slice(0, 75)
           );
         }
       }
@@ -6959,7 +6960,8 @@ async function cmdBankrollFinance(interaction, sub) {
       .setDescription('Live balance returned directly by Stripe. Pending transaction detail is included where Stripe supplies it.')
       .addFields(
         { name: 'Available', value: available.join('\n') || '£0.00', inline: true },
-        { name: 'Pending', value: pending.join('\n') || '£0.00', inline: true }
+        { name: 'Pending', value: pending.join('\n') || '£0.00', inline: true },
+        { name: 'Pending funds — added and availability dates', value: pendingActivity.join('\n').slice(0, 1024) || 'No pending incoming transactions.', inline: false }
       ).setTimestamp();
     const snapshotFile = path.join(DATA_DIR, 'stripe_balance_snapshots.json');
     let snapshots = [];
@@ -8032,6 +8034,7 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
           { name: 'Amount Paid', value: money(amountPaid, 'gbp'), inline: true },
           { name: 'Payment Status', value: 'PAID', inline: true },
           { name: 'Paid At', value: `<t:${Math.floor(Date.now()/1000)}:F>`, inline: true },
+          { name: 'Description', value: String(d.description || 'No description').slice(0, 1024), inline: false },
           { name: 'Payment reference', value: String(d.reference || key || 'Not recorded'), inline: true },
           { name: 'Transaction ID', value: String(tx.id || data.id || key || 'Not supplied by Monzo') }
         );
@@ -8109,6 +8112,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             { name: 'Amount Paid', value: money(total, s.currency || CURRENCY), inline: true },
             { name: 'Payment Status', value: 'PAID', inline: true },
             { name: 'Paid At', value: `<t:${event.created}:F>`, inline: true },
+            { name: 'Description', value: String(description || 'No description').slice(0, 1024), inline: false },
             { name: 'Transaction ID', value: String(s.payment_intent || s.id) }
           );
 
