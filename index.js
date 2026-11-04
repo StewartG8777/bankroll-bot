@@ -8781,8 +8781,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         Object.assign(deliveries[s.id], { paymentConfirmed:true, paid:true, paymentConfirmedAt:event.created ? event.created*1000 : Date.now(), amount:(s.amount_total || 0)/100, currency:String(s.currency || CURRENCY).toLowerCase(), paymentIntentId:s.payment_intent || null });
         saveDeliveries();
       }
-      void updateStripeLedgerFromPI(s.payment_intent);
+      await updateStripeLedgerFromPI(s.payment_intent);
       await recordInStripe(s.payment_intent, { paid_at: new Date(event.created * 1000).toISOString() });
+      await requireDurableDriveCommit('Stripe payment ' + String(s.id));
       try {
         const { customer_id, agent_id, description } = s.metadata ?? {};
         const total = (s.amount_total ?? 0) / 100;
