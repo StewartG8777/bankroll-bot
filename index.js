@@ -2903,6 +2903,21 @@ async function autoRestoreOnStartup() {
     }
 
     if (Object.keys(vault).length) saveVault();
+    // Google Drive is an independent second source for the actual vault bytes.
+    // Use it as a startup fallback after Discord recovery; only missing files
+    // are written, and every downloaded object is size/SHA-256 verified.
+    if (googleDriveIsConnected()) {
+      try {
+        const driveRecovery = await restoreFromGoogleDrive({ restoreDatabase: false, restoreVault: true });
+        if (driveRecovery.restoredVault) {
+          recovered += driveRecovery.restoredVault;
+          console.log('Google Drive startup recovery restored ' + driveRecovery.restoredVault + ' missing vault file(s); SHA-256 verified.');
+        }
+      } catch (driveError) {
+        console.error('Google Drive startup recovery failed:', driveError.message);
+        recoveryNote += ' Google Drive fallback also failed: ' + driveError.message;
+      }
+    }
     // Do not mark the current local files as already backed up here. If the
     // backup channel is empty (or has no valid snapshot), doing so suppresses
     // the first real snapshot and leaves this deployment with no recovery point.
