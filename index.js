@@ -7890,7 +7890,7 @@ async function cmdDrive(interaction) {
       } while (pageToken);
       const valid = [];
       for (const file of rows) {
-        if (!/^bankroll-recovery-.*\\.json$/i.test(file.name || '')) continue;
+        if (!/^bankroll-recovery-.*\.json$/i.test(file.name || '')) continue;
         try {
           const response = await drive.files.get({ fileId: file.id, alt: 'media' }, { responseType: 'stream' });
           const chunks = []; for await (const chunk of response.data) chunks.push(Buffer.from(chunk));
