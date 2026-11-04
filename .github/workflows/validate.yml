@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - upgrade/storage-recovery-performance
+      - feature/google-drive-primary-storage
   pull_request:
     branches:
       - main
