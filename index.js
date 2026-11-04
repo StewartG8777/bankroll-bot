@@ -4344,7 +4344,7 @@ async function cmdVault(interaction) {
         agentId: interaction.user.id,
         vaultKey: key,
         description: 'vault-export',
-        multiUse: true,
+        multiUse: false,
       }, null);
       const token = url.split('/').pop();
       const exportEmbed = new EmbedBuilder()
@@ -4355,7 +4355,7 @@ async function cmdVault(interaction) {
           { name: 'Vault key', value: '`' + short(key, 80) + '`', inline: true },
           { name: 'File size', value: (size / (1024 * 1024)).toFixed(2) + ' MB', inline: true }
         )
-        .setFooter({ text: 'This download button can be reused and does not expire by time.' })
+        .setFooter({ text: 'This is a one-time download link. It becomes invalid after the file is successfully downloaded.' })
         .setTimestamp();
 
       recordDownloadEvent('vault_export_link', {
@@ -4363,9 +4363,9 @@ async function cmdVault(interaction) {
         customerId: interaction.user.id,
         agentId: interaction.user.id,
         token,
-        detail: 'Vault key ' + key + '; reusable hosted download button supplied.',
+        detail: 'Vault key ' + key + '; one-time hosted download button supplied.',
       });
-      recordNotification('vault.export', 'Vault export link created', key + ' exported using a reusable hosted download link.', 'success');
+      recordNotification('vault.export', 'Vault export link created', key + ' exported using a one-time hosted download link.', 'success');
       return interaction.editReply({
         embeds: [exportEmbed],
         components: [downloadLinkRow(url, /\\.zip$/i.test(fileName) ? 'Download ZIP' : 'Download File')],
