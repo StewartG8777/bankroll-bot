@@ -11,6 +11,8 @@ const zlib = require('zlib');
 const { pipeline } = require('stream/promises');
 const { Readable, Transform } = require('stream');
 const { monitorEventLoopDelay } = require('perf_hooks');
+const os = require('os');
+const { getPerformanceSnapshot } = require('./systems/performance');
 const {
   Client,
   GatewayIntentBits,
@@ -2201,6 +2203,24 @@ const vaultCmd = common(
 );
 
 
+const logsCmd = common(new SlashCommandBuilder().setName('logs').setDescription('Search recent Bankroll log-channel messages (owner only)')
+  .addStringOption((o) => o.setName('query').setDescription('Text to search for').setRequired(true).setMaxLength(100))
+  .addIntegerOption((o) => o.setName('count').setDescription('Maximum matches (default 10, max 20)').setMinValue(1).setMaxValue(20)));
+const settingsCmd = common(new SlashCommandBuilder().setName('settings').setDescription('Inspect Bankroll runtime and backup settings (owner only)'));
+const ordersCmd = common(new SlashCommandBuilder().setName('orders').setDescription('Search customer orders and delivery status (owner only)')
+  .addStringOption((o) => o.setName('query').setDescription('Order ID, customer name, email or file name').setRequired(true).setMaxLength(100)));
+const fileCmd = common(new SlashCommandBuilder().setName('file').setDescription('Search stored Bankroll files (owner only)')
+  .addStringOption((o) => o.setName('query').setDescription('Vault key or filename to search').setRequired(true).setMaxLength(100)));
+const backupCmd = common(new SlashCommandBuilder().setName('backup').setDescription('Run and inspect Bankroll backups (owner only)')
+  .addSubcommand((sub) => sub.setName('run').setDescription('Run an immediate Discord and Google Drive backup'))
+  .addSubcommand((sub) => sub.setName('status').setDescription('Inspect backup health, schedule and recovery sources')));
+const recoveryCmd = common(new SlashCommandBuilder().setName('recovery').setDescription('Inspect and restore missing Bankroll data from Google Drive (owner only)')
+  .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive recovery point and connection'))
+  .addSubcommand((sub) => sub.setName('restore').setDescription('Restore missing/empty database and vault files from Drive without overwriting existing files')));
+const systemCmd = common(new SlashCommandBuilder().setName('system').setDescription('View Bankroll runtime health and system status (owner only)'));
+const performanceCmd = common(new SlashCommandBuilder().setName('performance').setDescription('View Bankroll performance, memory and event-loop analytics (owner only)'));
+const storageCmd = common(new SlashCommandBuilder().setName('storage').setDescription('Inspect Bankroll storage usage and indexed files (owner only)'));
+
 const driveCmd = common(new SlashCommandBuilder().setName('drive').setDescription('Connect and manage Google Drive backups (owner only)')
   .addSubcommand((sub) => sub.setName('connect').setDescription('Connect the Google account used for backups'))
   .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive connection and backup status'))
@@ -2460,7 +2480,7 @@ function previousCommandSchemaMismatch(published, desired) {
   });
 }
 
-const commands = [driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [logsCmd, settingsCmd, ordersCmd, fileCmd, backupCmd, recoveryCmd, systemCmd, performanceCmd, storageCmd, driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
 // are never cached.
@@ -2894,6 +2914,21 @@ async function autoRestoreOnStartup() {
     }
 
     if (Object.keys(vault).length) saveVault();
+    // Google Drive is an independent second source for the actual vault bytes.
+    // Use it as a startup fallback after Discord recovery; only missing files
+    // are written, and every downloaded object is size/SHA-256 verified.
+    if (googleDriveIsConnected()) {
+      try {
+        const driveRecovery = await restoreFromGoogleDrive({ restoreDatabase: false, restoreVault: true });
+        if (driveRecovery.restoredVault) {
+          recovered += driveRecovery.restoredVault;
+          console.log('Google Drive startup recovery restored ' + driveRecovery.restoredVault + ' missing vault file(s); SHA-256 verified.');
+        }
+      } catch (driveError) {
+        console.error('Google Drive startup recovery failed:', driveError.message);
+        recoveryNote += ' Google Drive fallback also failed: ' + driveError.message;
+      }
+    }
     // Do not mark the current local files as already backed up here. If the
     // backup channel is empty (or has no valid snapshot), doing so suppresses
     // the first real snapshot and leaves this deployment with no recovery point.
@@ -3027,6 +3062,14 @@ const onReady = async () => {
   // Always establish a fresh recovery point after startup restore. Previously a
   // quiet bot could restart and never create a new snapshot until another save.
   void backupData();
+  // A durable recovery point is produced at least every six hours even when the
+  // bot is otherwise quiet. backupData() serialises runs through backupChain,
+  // so scheduled and event-triggered backups cannot overlap.
+  const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+  const periodicBackupTimer = setInterval(() => {
+    if (restoreDone && !shuttingDown) void backupData();
+  }, SIX_HOURS_MS);
+  periodicBackupTimer.unref?.();
   try {
     const status = ['online', 'idle', 'dnd', 'invisible'].includes(savedPresence?.status) ? savedPresence.status : 'online';
     await client.user.setPresence({ status, activities: [] });
@@ -7261,31 +7304,408 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
       throw e;
     }
     uploaded++;
+    const saved = existing.get(name);
     console.log('Google Drive backup uploaded to ' + folderName + ': ' + name);
+    return saved?.id || null;
   };
+  const databaseEntries = [];
   for (const file of databaseFiles || []) {
     const sig = crypto.createHash('sha256').update(file.buffer).digest('hex');
-    await uploadOne('DATABASE', file.name, sig, Readable.from([file.buffer]), 'application/json');
+    const driveName = crypto.createHash('sha256').update(file.name + ':' + sig).digest('hex').slice(0, 24) + '_' + file.name;
+    const fileId = await uploadOne('DATABASE', driveName, sig, Readable.from([file.buffer]), 'application/json');
+    const current = existingByFolder.get('DATABASE').get(driveName);
+    databaseEntries.push({ name: file.name, driveName, fileId: fileId || current?.id, size: file.buffer.length, sha256: sig });
   }
   let vaultFileCount = 0;
+  const vaultEntries = [];
   for (const fp of storedPaths || []) {
     if (!fp || !fs.existsSync(fp)) continue;
     const rel = relData(fp); if (!rel) continue;
-    const st = fs.statSync(fp); if (!st.isFile() || !st.size) continue;
+    const st = await fs.promises.stat(fp); if (!st.isFile() || !st.size) continue;
     if (st.size > 150 * 1024 * 1024) throw new Error('Google Drive backup file exceeds 150 MiB: ' + rel);
     const sig = await sha256FileCached(fp, st);
     const key = crypto.createHash('sha256').update(rel).digest('hex').slice(0, 16);
     const name = key + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
-    await uploadOne('VAULT', name, st.size + ':' + sig, fs.createReadStream(fp));
+    const driveName = key + '_' + sig.slice(0, 24) + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
+    const fileId = await uploadOne('VAULT', driveName, st.size + ':' + sig, fs.createReadStream(fp));
+    const current = existingByFolder.get('VAULT').get(driveName);
+    vaultEntries.push({ path: rel, name, driveName, fileId: fileId || current?.id, size: st.size, sha256: sig });
     vaultFileCount++;
   }
-  const manifest = { format: 'bankroll-drive-layout-v1', createdAt: new Date().toISOString(), databaseFiles: (databaseFiles || []).map((f) => f.name), vaultFileCount, folders: Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map((name) => [name, folders[name].id])) };
+  const manifest = { format: 'bankroll-drive-layout-v2', createdAt: new Date().toISOString(), databaseFiles: databaseEntries, vaultFiles: vaultEntries, vaultFileCount, folders: Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map((name) => [name, folders[name].id])) };
   const manifestBuffer = Buffer.from(JSON.stringify(manifest, null, 2));
   const manifestSig = crypto.createHash('sha256').update(manifestBuffer).digest('hex');
+  const pointName = 'bankroll-recovery-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+  await uploadOne('BACKUPS', pointName, manifestSig, Readable.from([manifestBuffer]), 'application/json');
+  // Keep a compatibility pointer for existing status/restore code; versioned points
+  // remain immutable and can be used for dated recovery once retention is enabled.
   await uploadOne('BACKUPS', 'bankroll-drive-manifest.json', manifestSig, Readable.from([manifestBuffer]), 'application/json');
+  let retention = null;
+  try { retention = await applyGoogleDriveRetention(drive, folders); console.log('Google Drive retention completed:', retention); }
+  catch (retentionError) { console.error('Google Drive retention safely skipped; no incomplete cleanup was applied:', retentionError.message); }
   console.log('Google Drive backup complete: ' + uploaded + ' changed file(s) uploaded across the Bankroll folders.');
-  return { connected: true, uploaded, folders };
+  return { connected: true, uploaded, folders, retention };
 }
+
+/**
+ * Safe Drive recovery-point retention.
+ * Keep the newest point for each of the 7 latest UTC days, 4 latest UTC weeks
+ * and 3 latest UTC months. Delete only content-addressed objects proven unused
+ * by every retained, successfully parsed v2 manifest. Any uncertainty aborts
+ * the entire cleanup before the first delete.
+ */
+async function applyGoogleDriveRetention(drive, folders) {
+  const listAll = async (folderId) => {
+    const all = []; let pageToken;
+    do {
+      const page = await drive.files.list({
+        q: "'" + folderId + "' in parents and trashed = false",
+        pageSize: 1000, pageToken,
+        fields: 'nextPageToken,files(id,name,mimeType,modifiedTime,appProperties)',
+        supportsAllDrives: true, includeItemsFromAllDrives: true,
+      });
+      all.push(...(page.data.files || []));
+      pageToken = page.data.nextPageToken;
+    } while (pageToken);
+    return all;
+  };
+  const backupFiles = await listAll(folders.BACKUPS.id);
+  const points = backupFiles.filter((f) => /^bankroll-recovery-.*\.json$/i.test(f.name || ''))
+    .sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0));
+  if (!points.length) return { kept: 0, deletedManifests: 0, deletedObjects: 0, skipped: 'No versioned recovery points' };
+
+  const parsed = [];
+  for (const file of points) {
+    const response = await drive.files.get({ fileId: file.id, alt: 'media' }, { responseType: 'stream' });
+    const chunks = [];
+    for await (const chunk of response.data) chunks.push(Buffer.from(chunk));
+    const manifest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (manifest.format !== 'bankroll-drive-layout-v2' ||
+        !Array.isArray(manifest.databaseFiles) || !Array.isArray(manifest.vaultFiles)) {
+      throw new Error('Retention halted: recovery manifest "' + file.name + '" is malformed or unsupported. No Drive files were deleted.');
+    }
+    for (const entry of [...manifest.databaseFiles, ...manifest.vaultFiles]) {
+      if (!entry?.fileId || !/^[a-f0-9]{64}$/i.test(String(entry.sha256 || '')) ||
+          !Number.isSafeInteger(Number(entry.size)) || Number(entry.size) < 0) {
+        throw new Error('Retention halted: invalid object reference in "' + file.name + '". No Drive files were deleted.');
+      }
+    }
+    parsed.push({ file, manifest, time: new Date(manifest.createdAt || file.modifiedTime || 0) });
+  }
+  const dayKey = (d) => d.toISOString().slice(0, 10);
+  const weekKey = (d) => {
+    const x = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+    x.setUTCDate(x.getUTCDate() + 4 - (x.getUTCDay() || 7));
+    const yearStart = new Date(Date.UTC(x.getUTCFullYear(), 0, 1));
+    return x.getUTCFullYear() + '-W' + String(Math.ceil((((x - yearStart) / 86400000) + 1) / 7)).padStart(2, '0');
+  };
+  const monthKey = (d) => d.toISOString().slice(0, 7);
+  const keep = new Set();
+  const takeLatestBuckets = (keyFn, count) => {
+    const buckets = new Set();
+    for (const item of parsed) {
+      if (!Number.isFinite(item.time.getTime())) throw new Error('Retention halted: invalid recovery timestamp. No Drive files were deleted.');
+      const key = keyFn(item.time);
+      if (!buckets.has(key) && buckets.size < count) { buckets.add(key); keep.add(item.file.id); }
+    }
+  };
+  takeLatestBuckets(dayKey, 7);
+  takeLatestBuckets(weekKey, 4);
+  takeLatestBuckets(monthKey, 3);
+  keep.add(parsed[0].file.id);
+
+  const referenced = new Set();
+  for (const item of parsed) if (keep.has(item.file.id)) {
+    for (const entry of [...item.manifest.databaseFiles, ...item.manifest.vaultFiles]) referenced.add(entry.fileId);
+  }
+  // Validate every retained reference still exists before allowing any deletion.
+  const dbFiles = await listAll(folders.DATABASE.id);
+  const vaultFiles = await listAll(folders.VAULT.id);
+  const objects = [...dbFiles, ...vaultFiles];
+  const objectIds = new Set(objects.map((f) => f.id));
+  for (const id of referenced) if (!objectIds.has(id)) {
+    throw new Error('Retention halted: a retained recovery point references a missing Drive object. No Drive files were deleted.');
+  }
+
+  // Plan all deletes before executing. Only our clearly content-addressed objects
+  // are eligible; legacy names and unknown files are always preserved.
+  const objectDeletes = objects.filter((f) =>
+    f.appProperties?.bankrollBackup === 'true' &&
+    (/^[a-f0-9]{24}_[a-f0-9]{64}_/.test(f.name || '') ||
+     /^[a-f0-9]{16}_[a-f0-9]{24}_/.test(f.name || '')) &&
+    !referenced.has(f.id));
+  const manifestDeletes = points.filter((f) => !keep.has(f.id));
+  let deletedObjects = 0, deletedManifests = 0;
+  for (const file of objectDeletes) {
+    await drive.files.delete({ fileId: file.id, supportsAllDrives: true });
+    deletedObjects++;
+  }
+  for (const file of manifestDeletes) {
+    await drive.files.delete({ fileId: file.id, supportsAllDrives: true });
+    deletedManifests++;
+  }
+  return { kept: keep.size, deletedManifests, deletedObjects };
+}
+
+async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = true } = {}) {
+  if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected; connect it with /drive connect first.');
+  const { google } = require('googleapis');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const folders = await resolveGoogleDriveFolders(drive);
+  const manifests = []; let manifestPageToken;
+  do {
+    const page = await drive.files.list({
+      q: "'" + folders.BACKUPS.id + "' in parents and (name = 'bankroll-drive-manifest.json' or name contains 'bankroll-recovery-') and trashed = false",
+      pageSize: 1000, pageToken: manifestPageToken, orderBy: 'modifiedTime desc',
+      fields: 'nextPageToken,files(id,name,modifiedTime)',
+      supportsAllDrives: true, includeItemsFromAllDrives: true,
+    });
+    manifests.push(...(page.data.files || []));
+    manifestPageToken = page.data.nextPageToken;
+  } while (manifestPageToken);
+  manifests.sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0));
+  if (!manifests.length) throw new Error('No Bankroll recovery manifest was found in Google Drive BACKUPS.');
+  const manifestResponse = await drive.files.get({ fileId: manifests[0].id, alt: 'media' }, { responseType: 'stream' });
+  const manifestChunks = [];
+  for await (const chunk of manifestResponse.data) manifestChunks.push(Buffer.from(chunk));
+  const manifest = JSON.parse(Buffer.concat(manifestChunks).toString('utf8'));
+  if (manifest.format !== 'bankroll-drive-layout-v2') throw new Error('This Google Drive recovery point uses the legacy manifest format. Run /drive backup once to create a verified v2 recovery manifest.');
+  let restoredDatabase = 0, restoredVault = 0, skipped = 0;
+  const downloadVerified = async (entry, destination) => {
+    if (!entry?.fileId || !/^[a-f0-9]{64}$/i.test(String(entry.sha256 || '')) || !Number.isSafeInteger(Number(entry.size)) || Number(entry.size) < 0) throw new Error('Recovery manifest contains an invalid file entry.');
+    const temp = destination + '.drive-restore-' + crypto.randomBytes(6).toString('hex');
+    await fs.promises.mkdir(path.dirname(destination), { recursive: true });
+    try {
+      const response = await drive.files.get({ fileId: entry.fileId, alt: 'media' }, { responseType: 'stream' });
+      const hash = crypto.createHash('sha256');
+      let size = 0;
+      const meter = new Transform({ transform(chunk, enc, callback) { size += chunk.length; hash.update(chunk); callback(null, chunk); } });
+      await pipeline(response.data, meter, fs.createWriteStream(temp, { flags: 'wx' }));
+      const actual = hash.digest('hex');
+      if (size !== Number(entry.size) || actual !== entry.sha256) throw new Error('SHA-256/size verification failed for ' + (entry.name || entry.path || 'recovery file'));
+      await fs.promises.rename(temp, destination);
+    } catch (error) {
+      await fs.promises.unlink(temp).catch(() => {});
+      throw error;
+    }
+  };
+  if (restoreDatabase && Array.isArray(manifest.databaseFiles)) {
+    for (const entry of manifest.databaseFiles) {
+      const name = String(entry.name || '');
+      if (!/^[a-z0-9_.-]+\.json$/i.test(name)) { skipped++; continue; }
+      const destination = path.join(DATA_DIR, name);
+      let needsRestore = false;
+      try { const st = await fs.promises.stat(destination); needsRestore = !st.isFile() || st.size === 0; }
+      catch { needsRestore = true; }
+      if (!needsRestore) { skipped++; continue; }
+      await downloadVerified(entry, destination);
+      restoredDatabase++;
+    }
+  }
+  if (restoreVault && Array.isArray(manifest.vaultFiles)) {
+    for (const entry of manifest.vaultFiles) {
+      const rel = safeBackupRel(entry.path);
+      if (!rel || !(rel.startsWith('vault/') || rel.startsWith('files/'))) { skipped++; continue; }
+      const destination = path.resolve(DATA_DIR, rel);
+      let exists = false;
+      try { exists = (await fs.promises.stat(destination)).isFile(); } catch {}
+      if (exists) { skipped++; continue; }
+      await downloadVerified(entry, destination);
+      restoredVault++;
+    }
+  }
+  return { restoredDatabase, restoredVault, skipped, manifestCreatedAt: manifest.createdAt || null };
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return value + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let n = value / 1024, i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return n.toFixed(2) + ' ' + units[i];
+}
+
+async function cmdLogsSearch(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can search logs.');
+  const query = interaction.options.getString('query').trim().toLowerCase();
+  const limit = interaction.options.getInteger('count') || 10;
+  const channels = [];
+  for (const guild of client.guilds.cache.values()) {
+    let list = guild.channels.cache;
+    if (!list.size) list = await guild.channels.fetch().catch(() => null) || list;
+    for (const channel of list.values()) if (channel?.name?.toLowerCase().includes('bankroll-log') && channel.isTextBased?.() && channel.messages?.fetch) channels.push(channel);
+  }
+  if (!channels.length) return interaction.editReply('No accessible #bankroll-logs channel was found.');
+  const found = [];
+  for (const channel of channels) {
+    const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+    if (!messages) continue;
+    for (const message of messages.values()) {
+      const body = [message.content, ...message.embeds.flatMap((embed) => [embed.title, embed.description, ...(embed.fields || []).flatMap((field) => [field.name, field.value])])].filter(Boolean).join(' ').replace(/\\s+/g, ' ');
+      if (body.toLowerCase().includes(query)) found.push({ at: message.createdTimestamp, channel: channel.name, body });
+    }
+  }
+  found.sort((a, b) => b.at - a.at);
+  if (!found.length) return interaction.editReply('No recent log messages matched ' + short(query, 80) + '.');
+  return interaction.editReply(found.slice(0, limit).map((item) => '<t:' + Math.floor(item.at / 1000) + ':R> #' + item.channel + ' — ' + short(item.body, 260)).join('\\n').slice(0, 1900));
+}
+async function cmdSettingsOverview(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can inspect system settings.');
+  const rows = [
+    '**Storage:** ' + DATA_DIR_STATUS,
+    '**Data directory:** ' + DATA_DIR,
+    '**Backup channel:** ' + (BACKUP_CHANNEL_ID || '#bankroll-backup auto-discovery'),
+    '**Backup interval:** 6 hours',
+    '**Backup retry:** 5 minutes after a failure',
+    '**Google Drive:** ' + (googleDriveIsConnected() ? 'connected' : 'not connected'),
+    '**Google OAuth client:** ' + (fs.existsSync(GOOGLE_OAUTH_FILE) ? 'present' : 'missing'),
+    '**Startup restore:** ' + (restoreDone ? 'complete' : 'in progress'),
+    '**Stripe ledger:** ' + (stripeLedgerReady ? 'ready' : 'syncing/not ready'),
+    '**Node.js:** ' + process.version,
+    '**Environment:** ' + (process.env.RENDER ? 'Render' : process.env.NODE_ENV || 'local'),
+  ];
+  return interaction.editReply(rows.join('\\n'));
+}
+async function cmdOrdersSearch(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can search orders.');
+  const q = interaction.options.getString('query').trim().toLowerCase();
+  const matches = Object.entries(deliveries).filter(([id, d]) => {
+    const haystack = [id, d?.customerName, d?.customer, d?.email, d?.name, d?.product, d?.description,
+      ...(Array.isArray(d?.files) ? d.files.flatMap((file) => [file?.name, file?.originalName]) : [])]
+      .filter(Boolean).join(' ').toLowerCase();
+    return haystack.includes(q);
+  }).slice(0, 12);
+  if (!matches.length) return interaction.editReply('No orders matched ' + short(q, 80) + '.');
+  const lines = matches.map(([id, d]) => {
+    const status = d.deliveryComplete || d.paid || d.paymentConfirmed ? 'Paid/delivered' : d.cancelled ? 'Cancelled' : 'Awaiting payment';
+    return '• **' + short(id, 70) + '** — ' + short(d.customerName || d.customer || d.email || 'Customer not recorded', 80) +
+      ' — ' + status + ' — ' + short(d.name || d.product || 'File/order', 100);
+  });
+  return interaction.editReply({ content: lines.join('\n').slice(0, 1900) });
+}
+async function cmdFileSearch(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can search stored files.');
+  const q = interaction.options.getString('query').trim().toLowerCase();
+  const results = [];
+  for (const [key, item] of Object.entries(vault)) {
+    const itemPath = item?.path || item?.filePath || '';
+    if ((key + ' ' + String(item?.originalName || item?.name || '')).toLowerCase().includes(q)) {
+      let state = 'missing'; try { if (itemPath && (await fs.promises.stat(itemPath)).isFile()) state = 'available'; } catch {}
+      results.push('• Vault ' + key + ' — ' + short(item.originalName || item.name || path.basename(itemPath || ''), 100) + ' (' + state + ')');
+    }
+  }
+  for (const [id, item] of Object.entries(deliveries)) {
+    const files = Array.isArray(item?.files) ? item.files : [item];
+    for (const file of files) {
+      if (!file?.path || !String(file.name || file.originalName || file.path).toLowerCase().includes(q)) continue;
+      let state = 'missing'; try { if ((await fs.promises.stat(file.path)).isFile()) state = 'available'; } catch {}
+      results.push('• Order ' + id + ' — ' + short(file.name || path.basename(file.path), 100) + ' (' + state + ')');
+      if (results.length >= 15) break;
+    }
+    if (results.length >= 15) break;
+  }
+  if (!results.length) return interaction.editReply('No stored files matched ' + short(q, 80) + '.');
+  return interaction.editReply(results.slice(0, 15).join('\n').slice(0, 1900));
+}
+
+async function cmdBackupManagement(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage backups.');
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'status') {
+    const next = lastBackupRunAt ? Math.max(0, 6 * 60 * 60 * 1000 - (Date.now() - lastBackupRunAt)) : 0;
+    const lines = [
+      '**Last successful backup:** ' + (lastBackupAt ? '<t:' + Math.floor(lastBackupAt / 1000) + ':R>' : 'Not recorded'),
+      '**Last attempted backup:** ' + (lastBackupRunAt ? '<t:' + Math.floor(lastBackupRunAt / 1000) + ':R>' : 'Not recorded'),
+      '**Next six-hour backup window:** ' + (lastBackupRunAt ? '<t:' + Math.floor((Date.now() + next) / 1000) + ':R>' : 'Pending startup backup'),
+      '**Discord recovery:** ' + (BACKUP_CHANNEL_ID ? 'Configured channel ID' : '#bankroll-backup auto-discovery'),
+      '**Google Drive:** ' + (googleDriveIsConnected() ? 'Connected' : 'Not connected'),
+      '**Recovery status:** ' + (restoreDone ? 'Startup recovery complete' : 'Still recovering'),
+      '**Current error:** ' + short(lastBackupError || 'None', 700),
+    ];
+    return interaction.editReply(lines.join('\n'));
+  }
+  await interaction.editReply('Running a full backup. This can take a while for large vault files; normal bot commands remain available.');
+  const result = await backupData();
+  if (!result?.ok) return interaction.editReply('❌ Backup failed: ' + short(result?.error || 'Unknown backup error', 900));
+  return interaction.editReply('✅ Discord backup completed' + (googleDriveIsConnected() ? ' and Google Drive mirror completed.' : '. Google Drive is not connected, so only Discord has a recovery copy.'));
+}
+
+async function cmdRecovery(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can run recovery.');
+  const sub = interaction.options.getSubcommand();
+  if (!googleDriveIsConnected()) return interaction.editReply('Google Drive is not connected. Run /drive connect first.');
+  if (sub === 'status') {
+    try {
+      const { google } = require('googleapis');
+      const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+      const folders = await resolveGoogleDriveFolders(drive);
+      const page = await drive.files.list({ q: "'" + folders.BACKUPS.id + "' in parents and (name = 'bankroll-drive-manifest.json' or name contains 'bankroll-recovery-') and trashed = false", pageSize: 1000, orderBy: 'modifiedTime desc', fields: 'files(id,name,modifiedTime)', supportsAllDrives: true, includeItemsFromAllDrives: true });
+      const latest = (page.data.files || []).sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0))[0];
+      if (!latest) return interaction.editReply('Google Drive is connected, but no recovery manifest exists yet. Run /drive backup to create one.');
+      return interaction.editReply('Google Drive recovery source is available. Latest manifest: <t:' + Math.floor(new Date(latest.modifiedTime).getTime() / 1000) + ':R>. Existing local files will be protected during restore.');
+    } catch (error) { return interaction.editReply('Google Drive recovery check failed: ' + short(error.message, 800)); }
+  }
+  await interaction.editReply('Checking the latest Google Drive recovery point and restoring only missing/empty files. Existing local files will not be overwritten…');
+  const result = await restoreFromGoogleDrive();
+  if (result.restoredDatabase || result.restoredVault) {
+    return interaction.editReply('Drive recovery complete. Restored ' + result.restoredDatabase + ' database file(s) and ' + result.restoredVault + ' vault file(s); skipped ' + result.skipped + ' existing/unsupported item(s). Restart Bankroll to reload any recovered database files into memory. Restored files were SHA-256 verified.');
+  }
+  return interaction.editReply('Drive recovery checked successfully. No missing/empty files needed restoring (' + result.skipped + ' skipped).');
+}
+
+async function cmdSystemDiagnostics(interaction, mode) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can view system diagnostics.');
+  const p = getPerformanceSnapshot();
+  const uptime = Math.floor(process.uptime());
+  const uptimeText = Math.floor(uptime / 86400) + 'd ' + Math.floor((uptime % 86400) / 3600) + 'h ' + Math.floor((uptime % 3600) / 60) + 'm';
+  const fields = [
+    { name: 'Uptime', value: uptimeText, inline: true },
+    { name: 'Node.js', value: process.version, inline: true },
+    { name: 'Platform', value: process.platform + ' / ' + process.arch, inline: true },
+    { name: 'RSS memory', value: formatBytes(p.memory.rss), inline: true },
+    { name: 'Heap used', value: formatBytes(p.memory.heapUsed) + ' / ' + formatBytes(p.memory.heapTotal), inline: true },
+    { name: 'External memory', value: formatBytes(p.memory.external), inline: true },
+    { name: 'Event-loop delay (mean)', value: p.eventLoop.meanMs === null ? 'Warming up' : p.eventLoop.meanMs.toFixed(2) + ' ms', inline: true },
+    { name: 'Event-loop delay (p99)', value: p.eventLoop.p99Ms === null ? 'Warming up' : p.eventLoop.p99Ms.toFixed(2) + ' ms', inline: true },
+    { name: 'CPU load (1m)', value: (os.loadavg()[0] || 0).toFixed(2), inline: true },
+    { name: 'Backup', value: lastBackupAt ? '<t:' + Math.floor(lastBackupAt / 1000) + ':R>' : 'No successful backup recorded', inline: true },
+    { name: 'Recovery', value: restoreDone ? 'Startup recovery complete' : 'Recovery not complete', inline: true },
+    { name: 'Last backup error', value: short(lastBackupError || 'None', 900), inline: false },
+  ];
+  const embed = new EmbedBuilder().setColor(lastBackupError ? RED : GREEN)
+    .setTitle(mode === 'performance' ? 'BANKROLL | PERFORMANCE ANALYTICS' : 'BANKROLL | SYSTEM HEALTH')
+    .addFields(fields).setTimestamp();
+  return interaction.editReply({ embeds: [embed] });
+}
+async function cmdStorageDiagnostics(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can inspect storage.');
+  const unique = new Set();
+  for (const item of Object.values(vault)) if (item?.path) unique.add(item.path);
+  for (const item of [...Object.values(deliveries), ...Object.values(downloads)]) {
+    if (item?.path && !item.backupDownload && !path.basename(String(item.path)).startsWith('download_')) unique.add(item.path);
+    for (const file of Array.isArray(item?.files) ? item.files : []) if (file?.path) unique.add(file.path);
+  }
+  let present = 0, missing = 0, bytes = 0;
+  for (const fp of unique) {
+    try { const st = await fs.promises.stat(fp); if (st.isFile()) { present++; bytes += st.size; } else missing++; }
+    catch { missing++; }
+  }
+  const embed = new EmbedBuilder().setColor(missing ? RED : GREEN).setTitle('BANKROLL | STORAGE OVERVIEW')
+    .addFields(
+      { name: 'Data directory', value: short(DATA_DIR_STATUS, 900), inline: false },
+      { name: 'Vault entries', value: String(Object.keys(vault).length), inline: true },
+      { name: 'Delivery records', value: String(Object.keys(deliveries).length), inline: true },
+      { name: 'Download records', value: String(Object.keys(downloads).length), inline: true },
+      { name: 'Indexed files present', value: String(present), inline: true },
+      { name: 'Missing/unreadable files', value: String(missing), inline: true },
+      { name: 'Indexed file size', value: formatBytes(bytes), inline: true },
+      { name: 'Last successful backup', value: lastBackupAt ? '<t:' + Math.floor(lastBackupAt / 1000) + ':R>' : 'Not recorded', inline: true },
+      { name: 'Backup health', value: short(lastBackupError || 'No current error recorded', 900), inline: false }
+    ).setTimestamp();
+  return interaction.editReply({ embeds: [embed] });
+}
+
 async function cmdDrive(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage Google Drive backups.');
   const sub = interaction.options.getSubcommand();
@@ -7401,6 +7821,33 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     switch (interaction.commandName) {
+      case 'logs':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdLogsSearch(interaction);
+      case 'settings':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdSettingsOverview(interaction);
+      case 'orders':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdOrdersSearch(interaction);
+      case 'file':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdFileSearch(interaction);
+      case 'backup':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdBackupManagement(interaction);
+      case 'recovery':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdRecovery(interaction);
+      case 'system':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdSystemDiagnostics(interaction, 'system');
+      case 'performance':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdSystemDiagnostics(interaction, 'performance');
+      case 'storage':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdStorageDiagnostics(interaction);
       case 'drive-credentials':
         return await cmdDriveCredentials(interaction);
       case 'drive':
