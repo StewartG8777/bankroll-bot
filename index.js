@@ -4335,44 +4335,36 @@ async function cmdVault(interaction) {
     const fileName = path.basename(item.originalName || path.basename(item.path));
     const size = fs.statSync(item.path).size;
     try {
-      // Vault exports always use the hosted download route so Discord receives
-      // one consistent embed + button, regardless of the file size.
-      const url = await makeDownloadLink({
-        path: item.path,
-        name: fileName,
-        customerId: interaction.user.id,
-        agentId: interaction.user.id,
-        vaultKey: key,
-        description: 'vault-export',
-        multiUse: false,
-      }, null);
-      const token = url.split('/').pop();
       const exportEmbed = new EmbedBuilder()
         .setColor(GREEN)
         .setTitle('Vault export ready')
-        .setDescription('**' + short(fileName, 180) + '** is ready to download.')
+        .setDescription('**' + short(fileName, 180) + '** is ready. Click below in Discord to receive the file. Bankroll records the Discord account that clicks the button.')
         .addFields(
           { name: 'Vault key', value: '`' + short(key, 80) + '`', inline: true },
           { name: 'File size', value: (size / (1024 * 1024)).toFixed(2) + ' MB', inline: true }
         )
-        .setFooter({ text: 'This is a one-time download link. It becomes invalid after the file is successfully downloaded.' })
+        .setFooter({ text: 'The recipient is identified from the Discord button interaction, not the person who created this export.' })
         .setTimestamp();
 
-      recordDownloadEvent('vault_export_link', {
+      recordDownloadEvent('vault_export_button_created', {
         file: fileName,
         customerId: interaction.user.id,
         agentId: interaction.user.id,
-        token,
-        detail: 'Vault key ' + key + '; one-time hosted download button supplied.',
+        detail: 'Vault key ' + key + '; Discord identity-tracked download button posted.',
       });
-      recordNotification('vault.export', 'Vault export link created', key + ' exported using a one-time hosted download link.', 'success');
+      recordNotification('vault.export', 'Vault export button created', key + ' exported with Discord clicker attribution.', 'success');
       return interaction.editReply({
         embeds: [exportEmbed],
-        components: [downloadLinkRow(url, /\\.zip$/i.test(fileName) ? 'Download ZIP' : 'Download File')],
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId('vaultdl:' + key)
+            .setLabel(/\\.zip$/i.test(fileName) ? 'Download ZIP' : 'Download File')
+            .setStyle(ButtonStyle.Success)
+        )],
         files: [],
       });
     } catch (error) {
-      console.error('Vault export link creation failed:', error);
+      console.error('Vault export button creation failed:', error);
       return interaction.editReply({
         content: 'Could not export `' + key + '`: ' + short(error.message, 250),
         embeds: [],
@@ -6737,6 +6729,63 @@ async function onScheduledSendButton(interaction) {
 }
 
 async function onButton(interaction) {
+  if (interaction.customId.startsWith('vaultdl:')) {
+    const key = interaction.customId.slice('vaultdl:'.length);
+    const item = vault[key];
+    if (!item?.path || !fs.existsSync(item.path)) {
+      return interaction.reply({ content: 'This vault file is no longer available. Ask the exporter to create a fresh export.', ephemeral: true });
+    }
+    const fileName = path.basename(item.originalName || item.path);
+    const clicker = interaction.user;
+    try {
+      await interaction.reply({
+        content: 'Here is **' + short(fileName, 180) + '**. Your Discord account has been recorded as the recipient.',
+        files: [new AttachmentBuilder(item.path, { name: fileName })],
+        ephemeral: true,
+      });
+      const size = fs.statSync(item.path).size;
+      recordDownloadEvent('vault_download_delivered', {
+        file: fileName,
+        customerId: clicker.id,
+        agentId: null,
+        detail: 'Discord file attachment delivered directly to clicking account @' + clicker.username + ' (' + clicker.id + '); vault key ' + key + '; ' + size + ' bytes.',
+      });
+      recordNotification('vault.download', 'Vault file delivered to Discord recipient', fileName + ' delivered to @' + clicker.username + ' (Discord ID ' + clicker.id + ').', 'success');
+      await notifyOwner({
+        embeds: [new EmbedBuilder().setColor(GREEN).setTitle('Vault file downloaded')
+          .setDescription('**' + short(fileName, 180) + '** was delivered directly in Discord.')
+          .addFields(
+            { name: 'Recipient', value: '<@' + clicker.id + '>\n`' + clicker.id + '`', inline: true },
+            { name: 'Vault key', value: '`' + short(key, 80) + '`', inline: true },
+            { name: 'File size', value: (size / (1024 * 1024)).toFixed(2) + ' MB', inline: true }
+          ).setTimestamp()]
+      }, { notificationType: 'vault.download', notificationStatus: 'success' });
+    } catch (error) {
+      console.error('Vault attachment delivery failed:', error);
+      try {
+        const url = await makeDownloadLink({
+          path: item.path, name: fileName, customerId: clicker.id, agentId: OWNER_ID,
+          vaultKey: key, description: 'vault-export-fallback', multiUse: false,
+        }, null);
+        recordDownloadEvent('vault_download_link_fallback', {
+          file: fileName, customerId: clicker.id, agentId: OWNER_ID,
+          token: url.split('/').pop(),
+          detail: 'Discord attachment could not be sent; a hosted fallback link was issued after this account clicked the Discord button. Browser downloader identity cannot be independently verified.',
+        });
+        return interaction.reply({
+          content: 'Discord could not attach this file (it may exceed the upload limit). Use this hosted link instead. Bankroll has recorded your Discord account as the person who requested it: <@' + clicker.id + '>.',
+          components: [downloadLinkRow(url, /\\.zip$/i.test(fileName) ? 'Download ZIP' : 'Download File')],
+          ephemeral: true,
+        });
+      } catch (fallbackError) {
+        console.error('Vault fallback link creation failed:', fallbackError);
+        if (!interaction.replied && !interaction.deferred) {
+          return interaction.reply({ content: 'Could not deliver this file: ' + short(fallbackError.message, 250), ephemeral: true });
+        }
+      }
+    }
+    return;
+  }
   if (interaction.customId === 'monzo_review_page_prev' || interaction.customId === 'monzo_review_page_next') {
     if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'Only the bot owner can review these transactions.', ephemeral: true });
     const embed = interaction.message?.embeds?.[0];
