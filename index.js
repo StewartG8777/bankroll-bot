@@ -2203,6 +2203,10 @@ const vaultCmd = common(
 );
 
 
+const ordersCmd = common(new SlashCommandBuilder().setName('orders').setDescription('Search customer orders and delivery status (owner only)')
+  .addStringOption((o) => o.setName('query').setDescription('Order ID, customer name, email or file name').setRequired(true).setMaxLength(100)));
+const fileCmd = common(new SlashCommandBuilder().setName('file').setDescription('Search stored Bankroll files (owner only)')
+  .addStringOption((o) => o.setName('query').setDescription('Vault key or filename to search').setRequired(true).setMaxLength(100)));
 const backupCmd = common(new SlashCommandBuilder().setName('backup').setDescription('Run and inspect Bankroll backups (owner only)')
   .addSubcommand((sub) => sub.setName('run').setDescription('Run an immediate Discord and Google Drive backup'))
   .addSubcommand((sub) => sub.setName('status').setDescription('Inspect backup health, schedule and recovery sources')));
@@ -2472,7 +2476,7 @@ function previousCommandSchemaMismatch(published, desired) {
   });
 }
 
-const commands = [backupCmd, recoveryCmd, systemCmd, performanceCmd, storageCmd, driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [ordersCmd, fileCmd, backupCmd, recoveryCmd, systemCmd, performanceCmd, storageCmd, driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
 // are never cached.
@@ -7401,6 +7405,48 @@ function formatBytes(bytes) {
   while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
   return n.toFixed(2) + ' ' + units[i];
 }
+
+async function cmdOrdersSearch(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can search orders.');
+  const q = interaction.options.getString('query').trim().toLowerCase();
+  const matches = Object.entries(deliveries).filter(([id, d]) => {
+    const haystack = [id, d?.customerName, d?.customer, d?.email, d?.name, d?.product, d?.description,
+      ...(Array.isArray(d?.files) ? d.files.flatMap((file) => [file?.name, file?.originalName]) : [])]
+      .filter(Boolean).join(' ').toLowerCase();
+    return haystack.includes(q);
+  }).slice(0, 12);
+  if (!matches.length) return interaction.editReply('No orders matched ' + short(q, 80) + '.');
+  const lines = matches.map(([id, d]) => {
+    const status = d.deliveryComplete || d.paid || d.paymentConfirmed ? 'Paid/delivered' : d.cancelled ? 'Cancelled' : 'Awaiting payment';
+    return '• **' + short(id, 70) + '** — ' + short(d.customerName || d.customer || d.email || 'Customer not recorded', 80) +
+      ' — ' + status + ' — ' + short(d.name || d.product || 'File/order', 100);
+  });
+  return interaction.editReply({ content: lines.join('\\n').slice(0, 1900) });
+}
+async function cmdFileSearch(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can search stored files.');
+  const q = interaction.options.getString('query').trim().toLowerCase();
+  const results = [];
+  for (const [key, item] of Object.entries(vault)) {
+    if ((key + ' ' + String(item?.originalName || '')).toLowerCase().includes(q)) {
+      let state = 'missing'; try { if ((await fs.promises.stat(item.path)).isFile()) state = 'available'; } catch {}
+      results.push('• Vault ' + key + ' — ' + short(item.originalName || path.basename(item.path || ''), 100) + ' (' + state + ')');
+    }
+  }
+  for (const [id, item] of Object.entries(deliveries)) {
+    const files = Array.isArray(item?.files) ? item.files : [item];
+    for (const file of files) {
+      if (!file?.path || !String(file.name || file.originalName || file.path).toLowerCase().includes(q)) continue;
+      let state = 'missing'; try { if ((await fs.promises.stat(file.path)).isFile()) state = 'available'; } catch {}
+      results.push('• Order ' + id + ' — ' + short(file.name || path.basename(file.path), 100) + ' (' + state + ')');
+      if (results.length >= 15) break;
+    }
+    if (results.length >= 15) break;
+  }
+  if (!results.length) return interaction.editReply('No stored files matched ' + short(q, 80) + '.');
+  return interaction.editReply(results.slice(0, 15).join('\\n').slice(0, 1900));
+}
+
 async function cmdBackupManagement(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage backups.');
   const sub = interaction.options.getSubcommand();
@@ -7613,6 +7659,12 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     switch (interaction.commandName) {
+      case 'orders':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdOrdersSearch(interaction);
+      case 'file':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdFileSearch(interaction);
       case 'backup':
         await interaction.deferReply({ ephemeral: true });
         return await cmdBackupManagement(interaction);
