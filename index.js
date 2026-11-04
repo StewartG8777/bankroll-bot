@@ -7689,8 +7689,8 @@ async function cmdStorageDiagnostics(interaction) {
   let present = 0, missing = 0, bytes = 0;
   const missingPaths = [];
   for (const fp of unique) {
-    try { const st = await fs.promises.stat(fp); if (st.isFile()) { present++; bytes += st.size; } else missing++; }
-    catch { missing++; }
+    try { const st = await fs.promises.stat(fp); if (st.isFile()) { present++; bytes += st.size; } else { missing++; missingPaths.push(String(fp)); } }
+    catch { missing++; missingPaths.push(String(fp)); }
   }
   const embed = new EmbedBuilder().setColor(missing ? RED : GREEN).setTitle('BANKROLL | STORAGE OVERVIEW')
     .addFields(
