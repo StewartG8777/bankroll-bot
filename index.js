@@ -7385,7 +7385,7 @@ async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = t
   if (restoreVault && Array.isArray(manifest.vaultFiles)) {
     for (const entry of manifest.vaultFiles) {
       const rel = safeBackupRel(entry.path);
-      if (!rel || !rel.startsWith('vault/')) { skipped++; continue; }
+      if (!rel || !(rel.startsWith('vault/') || rel.startsWith('files/'))) { skipped++; continue; }
       const destination = path.resolve(DATA_DIR, rel);
       let exists = false;
       try { exists = (await fs.promises.stat(destination)).isFile(); } catch {}
@@ -7421,7 +7421,7 @@ async function cmdOrdersSearch(interaction) {
     return '• **' + short(id, 70) + '** — ' + short(d.customerName || d.customer || d.email || 'Customer not recorded', 80) +
       ' — ' + status + ' — ' + short(d.name || d.product || 'File/order', 100);
   });
-  return interaction.editReply({ content: lines.join('\\n').slice(0, 1900) });
+  return interaction.editReply({ content: lines.join('\n').slice(0, 1900) });
 }
 async function cmdFileSearch(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can search stored files.');
@@ -7444,7 +7444,7 @@ async function cmdFileSearch(interaction) {
     if (results.length >= 15) break;
   }
   if (!results.length) return interaction.editReply('No stored files matched ' + short(q, 80) + '.');
-  return interaction.editReply(results.slice(0, 15).join('\\n').slice(0, 1900));
+  return interaction.editReply(results.slice(0, 15).join('\n').slice(0, 1900));
 }
 
 async function cmdBackupManagement(interaction) {
