@@ -470,6 +470,15 @@ function atomicWrite(file, data) {
   const tmp = `${file}.tmp`;
   fs.writeFileSync(tmp, data);
   fs.renameSync(tmp, file);
+  // Every completed durable data-file replacement schedules an urgent snapshot.
+  // The backup runner serialises runs and coalesces bursts, so multi-file updates
+  // produce one consistent latest-state recovery point rather than overlapping uploads.
+  const resolved = path.resolve(file);
+  const insideData = resolved.startsWith(path.resolve(DATA_DIR) + path.sep);
+  const secretOrTransient = /(?:^|[\\/])(?:google-oauth\.json|google-drive-token\.json|\.env|[^\\/]+\.tmp)$/i.test(resolved);
+  if (insideData && !secretOrTransient && typeof scheduleBackup === 'function') {
+    try { scheduleBackup(true); } catch (error) { console.error('Could not queue Drive/Discord persistence after write:', error.message); }
+  }
 }
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
