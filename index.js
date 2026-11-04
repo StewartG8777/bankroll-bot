@@ -1060,7 +1060,7 @@ function cleanDownloads() {
   for (const [token, dl] of Object.entries(downloads)) {
     const expired = !dl || (dl.expiresAt != null && Number.isFinite(Number(dl.expiresAt)) && now > Number(dl.expiresAt));
     const missing = !dl?.path || !fs.existsSync(dl.path);
-    if ((expired || missing || (dl.used && !dl.multiUse)) && !activeDownloadTokens.has(token)) {
+    if ((expired || missing || (dl.used && (!dl.multiUse || !!dl.vaultKey))) && !activeDownloadTokens.has(token)) {
       if (dl?.path) { try { fs.unlinkSync(dl.path); } catch {} }
       delete downloads[token]; removed++;
       if (expired) recordDownloadEvent('expired', { file: dl?.name, customerId: dl?.customerId, token, detail: 'Expired link/file removed by cleanup.' });
@@ -8754,13 +8754,13 @@ app.get('/:name/:token', (req, res) => {
   if(downloadAttempts.size>5000){for(const [ip,value] of downloadAttempts)if(Date.now()>value.resetAt)downloadAttempts.delete(ip);}
   if(!/^[a-f0-9]{48,64}$/i.test(token)){recordDownloadEvent('access_denied',{detail:'Malformed download token.'});return res.status(404).send('Not found');}
   const t=downloads[token]; const filesRoot=path.resolve(FILES_DIR)+path.sep; const safePath=t?.path&&path.resolve(String(t.path)).startsWith(filesRoot);
-  if(!t||(t.used&&!t.multiUse)||activeDownloadTokens.has(token)||(t.expiresAt != null && Date.now()>Number(t.expiresAt))||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
+  if(!t||(t.used&&(!t.multiUse||!!t.vaultKey))||activeDownloadTokens.has(token)||(t.expiresAt != null && Date.now()>Number(t.expiresAt))||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
 
   const ua = req.headers['user-agent'] || '';
   if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) {
     return res.status(200).send('Download link');
   }
-  if (!t.multiUse) t.used = true; activeDownloadTokens.add(token); saveDownloads();
+  if (!t.multiUse || t.vaultKey) t.used = true; activeDownloadTokens.add(token); saveDownloads();
   const downloadStartedAt = Date.now();
   const expectedBytes = fs.statSync(t.path).size;
   res.setHeader('Content-Type', 'application/octet-stream');
@@ -8771,7 +8771,7 @@ app.get('/:name/:token', (req, res) => {
     finished = true;
     const downloadedAt = Date.now();
     const elapsedMs = downloadedAt - downloadStartedAt;
-    if (!t.multiUse) {
+    if (!t.multiUse || t.vaultKey) {
       try { fs.unlinkSync(t.path); } catch {}
       delete downloads[token];
     }
