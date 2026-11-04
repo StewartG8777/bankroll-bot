@@ -13,6 +13,7 @@ const { Readable, Transform } = require('stream');
 const { monitorEventLoopDelay } = require('perf_hooks');
 const os = require('os');
 const { getPerformanceSnapshot } = require('./systems/performance');
+const { isManagedContentAddressedBackup } = require('./systems/backup-retention');
 const {
   Client,
   GatewayIntentBits,
@@ -7293,7 +7294,7 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
   const uploadOne = async (folderName, name, signature, body, mimeType) => {
     const existing = existingByFolder.get(folderName);
     const old = existing.get(name);
-    if (old?.appProperties?.bankrollSignature === signature) return;
+    if (old?.appProperties?.bankrollSignature === signature) return old.id || null;
     const requestBody = { name, appProperties: { bankrollSignature: signature, bankrollBackup: 'true' } };
     const media = { mimeType: mimeType || 'application/octet-stream', body };
     try {
@@ -7431,8 +7432,7 @@ async function applyGoogleDriveRetention(drive, folders) {
   // are eligible; legacy names and unknown files are always preserved.
   const objectDeletes = objects.filter((f) =>
     f.appProperties?.bankrollBackup === 'true' &&
-    (/^[a-f0-9]{24}_[a-f0-9]{64}_/.test(f.name || '') ||
-     /^[a-f0-9]{16}_[a-f0-9]{24}_/.test(f.name || '')) &&
+    isManagedContentAddressedBackup(f.name || '') &&
     !referenced.has(f.id));
   const manifestDeletes = points.filter((f) => !keep.has(f.id));
   let deletedObjects = 0, deletedManifests = 0;
@@ -7687,6 +7687,7 @@ async function cmdStorageDiagnostics(interaction) {
     for (const file of Array.isArray(item?.files) ? item.files : []) if (file?.path) unique.add(file.path);
   }
   let present = 0, missing = 0, bytes = 0;
+  const missingPaths = [];
   for (const fp of unique) {
     try { const st = await fs.promises.stat(fp); if (st.isFile()) { present++; bytes += st.size; } else missing++; }
     catch { missing++; }
@@ -7701,6 +7702,7 @@ async function cmdStorageDiagnostics(interaction) {
       { name: 'Missing/unreadable files', value: String(missing), inline: true },
       { name: 'Indexed file size', value: formatBytes(bytes), inline: true },
       { name: 'Last successful backup', value: lastBackupAt ? '<t:' + Math.floor(lastBackupAt / 1000) + ':R>' : 'Not recorded', inline: true },
+      { name: 'Missing file paths', value: missingPaths.length ? short(missingPaths.slice(0, 8).join('\n'), 900) : 'None', inline: false },
       { name: 'Backup health', value: short(lastBackupError || 'No current error recorded', 900), inline: false }
     ).setTimestamp();
   return interaction.editReply({ embeds: [embed] });
