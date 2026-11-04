@@ -209,10 +209,69 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
       }
     });
   }
+  async function listGenerations() {
+    const response = await drive.files.list({
+      q: "'" + folderIds.BACKUPS + "' in parents and name contains 'bankroll-primary-' and trashed = false",
+      pageSize: 1000, orderBy: 'createdTime desc',
+      fields: 'nextPageToken,files(id,name,createdTime)',
+      supportsAllDrives: true, includeItemsFromAllDrives: true,
+    });
+    const rows = [];
+    for (const file of response.data.files || []) {
+      if (!String(file.name || '').endsWith('.json') || !String(file.name).startsWith('bankroll-primary-')) continue;
+      try {
+        const chunks = [];
+        const stream = await drive.files.get({ fileId: file.id, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' });
+        for await (const chunk of stream.data) chunks.push(Buffer.from(chunk));
+        const manifest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        if (manifest.format !== FORMAT || !manifest.generation || !Array.isArray(manifest.files) || !manifest.files.length) continue;
+        rows.push({ generation: manifest.generation, manifestId: file.id, createdAt: manifest.createdAt || file.createdTime, files: manifest.files.length });
+      } catch (error) {
+        logger.warn?.('[DriveStorage] Skipping invalid generation manifest ' + file.id + ': ' + error.message);
+      }
+    }
+    return rows.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  }
+  async function restoreGeneration(generation, { beforeApply = async () => {} } = {}) {
+    return serial(async () => {
+      const matches = (await listGenerations()).filter((item) => item.generation === String(generation));
+      if (matches.length !== 1) throw new Error(matches.length ? 'Generation identifier is ambiguous.' : 'Requested Drive generation was not found.');
+      const selected = matches[0];
+      const manifestResponse = await drive.files.get({ fileId: selected.manifestId, alt: 'media', supportsAllDrives: true });
+      const manifest = manifestResponse.data;
+      if (!manifest || manifest.format !== FORMAT || manifest.generation !== selected.generation || !Array.isArray(manifest.files)) {
+        throw new Error('Selected rollback manifest is invalid.');
+      }
+      const root = path.resolve(dataDir);
+      const staging = path.join(root, '.drive-rollback-' + crypto.randomUUID());
+      const prepared = [];
+      try {
+        for (const entry of manifest.files) {
+          const relative = safeRelativePath(entry.path);
+          const destination = relative && path.resolve(root, relative);
+          if (!relative || !isAllowedRelativePath(relative) || !destination.startsWith(root + path.sep)) throw new Error('Rollback manifest contains an unsafe path.');
+          const staged = path.join(staging, relative);
+          await downloadObject(entry, staged);
+          prepared.push({ staged, destination });
+        }
+        await beforeApply({ generation: selected.generation, files: prepared.length });
+        for (const item of prepared) {
+          await fs.promises.mkdir(path.dirname(item.destination), { recursive: true });
+          const temp = item.destination + '.drive-rollback-new-' + crypto.randomBytes(6).toString('hex');
+          await fs.promises.copyFile(item.staged, temp);
+          await fs.promises.rename(temp, item.destination);
+        }
+        logger.info?.('[DriveStorage] Rolled back to generation ' + selected.generation + ' (' + prepared.length + ' files).');
+        return { generation: selected.generation, files: prepared.length, createdAt: manifest.createdAt };
+      } finally {
+        await fs.promises.rm(staging, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+  }
   async function status() {
     const { pointer, manifest } = await readCurrentManifest();
     return { connected: true, generation: pointer.generation, createdAt: manifest.createdAt, files: manifest.files.length };
   }
-  return { snapshot: (options) => serial(() => snapshot(options)), restore, status };
+  return { snapshot: (options) => serial(() => snapshot(options)), restore, restoreGeneration, listGenerations, status };
 }
 module.exports = { FORMAT, createGoogleDrivePrimaryStorage, safeRelativePath, isAllowedRelativePath, walkFiles };
