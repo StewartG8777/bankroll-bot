@@ -7307,9 +7307,10 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
   const databaseEntries = [];
   for (const file of databaseFiles || []) {
     const sig = crypto.createHash('sha256').update(file.buffer).digest('hex');
-    const fileId = await uploadOne('DATABASE', file.name, sig, Readable.from([file.buffer]), 'application/json');
-    const current = existingByFolder.get('DATABASE').get(file.name);
-    databaseEntries.push({ name: file.name, fileId: fileId || current?.id, size: file.buffer.length, sha256: sig });
+    const driveName = crypto.createHash('sha256').update(file.name + ':' + sig).digest('hex').slice(0, 24) + '_' + file.name;
+    const fileId = await uploadOne('DATABASE', driveName, sig, Readable.from([file.buffer]), 'application/json');
+    const current = existingByFolder.get('DATABASE').get(driveName);
+    databaseEntries.push({ name: file.name, driveName, fileId: fileId || current?.id, size: file.buffer.length, sha256: sig });
   }
   let vaultFileCount = 0;
   const vaultEntries = [];
@@ -7321,14 +7322,19 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
     const sig = await sha256FileCached(fp, st);
     const key = crypto.createHash('sha256').update(rel).digest('hex').slice(0, 16);
     const name = key + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
-    const fileId = await uploadOne('VAULT', name, st.size + ':' + sig, fs.createReadStream(fp));
-    const current = existingByFolder.get('VAULT').get(name);
-    vaultEntries.push({ path: rel, name, fileId: fileId || current?.id, size: st.size, sha256: sig });
+    const driveName = key + '_' + sig.slice(0, 24) + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
+    const fileId = await uploadOne('VAULT', driveName, st.size + ':' + sig, fs.createReadStream(fp));
+    const current = existingByFolder.get('VAULT').get(driveName);
+    vaultEntries.push({ path: rel, name, driveName, fileId: fileId || current?.id, size: st.size, sha256: sig });
     vaultFileCount++;
   }
   const manifest = { format: 'bankroll-drive-layout-v2', createdAt: new Date().toISOString(), databaseFiles: databaseEntries, vaultFiles: vaultEntries, vaultFileCount, folders: Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map((name) => [name, folders[name].id])) };
   const manifestBuffer = Buffer.from(JSON.stringify(manifest, null, 2));
   const manifestSig = crypto.createHash('sha256').update(manifestBuffer).digest('hex');
+  const pointName = 'bankroll-recovery-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+  await uploadOne('BACKUPS', pointName, manifestSig, Readable.from([manifestBuffer]), 'application/json');
+  // Keep a compatibility pointer for existing status/restore code; versioned points
+  // remain immutable and can be used for dated recovery once retention is enabled.
   await uploadOne('BACKUPS', 'bankroll-drive-manifest.json', manifestSig, Readable.from([manifestBuffer]), 'application/json');
   console.log('Google Drive backup complete: ' + uploaded + ' changed file(s) uploaded across the Bankroll folders.');
   return { connected: true, uploaded, folders };
@@ -7339,11 +7345,11 @@ async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = t
   const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
   const folders = await resolveGoogleDriveFolders(drive);
   const page = await drive.files.list({
-    q: "'" + folders.BACKUPS.id + "' in parents and name = 'bankroll-drive-manifest.json' and trashed = false",
+    q: "'" + folders.BACKUPS.id + "' in parents and (name = 'bankroll-drive-manifest.json' or name contains 'bankroll-recovery-') and trashed = false",
     pageSize: 100, orderBy: 'modifiedTime desc', fields: 'files(id,name,modifiedTime)',
     supportsAllDrives: true, includeItemsFromAllDrives: true,
   });
-  const manifests = page.data.files || [];
+  const manifests = (page.data.files || []).sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0));
   if (!manifests.length) throw new Error('No Bankroll recovery manifest was found in Google Drive BACKUPS.');
   const manifestResponse = await drive.files.get({ fileId: manifests[0].id, alt: 'media' }, { responseType: 'stream' });
   const manifestChunks = [];
