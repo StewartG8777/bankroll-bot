@@ -7340,20 +7340,130 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
   // Keep a compatibility pointer for existing status/restore code; versioned points
   // remain immutable and can be used for dated recovery once retention is enabled.
   await uploadOne('BACKUPS', 'bankroll-drive-manifest.json', manifestSig, Readable.from([manifestBuffer]), 'application/json');
+  let retention = null;
+  try { retention = await applyGoogleDriveRetention(drive, folders); console.log('Google Drive retention completed:', retention); }
+  catch (retentionError) { console.error('Google Drive retention safely skipped; no incomplete cleanup was applied:', retentionError.message); }
   console.log('Google Drive backup complete: ' + uploaded + ' changed file(s) uploaded across the Bankroll folders.');
-  return { connected: true, uploaded, folders };
+  return { connected: true, uploaded, folders, retention };
 }
+
+/**
+ * Safe Drive recovery-point retention.
+ * Keep the newest point for each of the 7 latest UTC days, 4 latest UTC weeks
+ * and 3 latest UTC months. Delete only content-addressed objects proven unused
+ * by every retained, successfully parsed v2 manifest. Any uncertainty aborts
+ * the entire cleanup before the first delete.
+ */
+async function applyGoogleDriveRetention(drive, folders) {
+  const listAll = async (folderId) => {
+    const all = []; let pageToken;
+    do {
+      const page = await drive.files.list({
+        q: "'" + folderId + "' in parents and trashed = false",
+        pageSize: 1000, pageToken,
+        fields: 'nextPageToken,files(id,name,mimeType,modifiedTime,appProperties)',
+        supportsAllDrives: true, includeItemsFromAllDrives: true,
+      });
+      all.push(...(page.data.files || []));
+      pageToken = page.data.nextPageToken;
+    } while (pageToken);
+    return all;
+  };
+  const backupFiles = await listAll(folders.BACKUPS.id);
+  const points = backupFiles.filter((f) => /^bankroll-recovery-.*\.json$/i.test(f.name || ''))
+    .sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0));
+  if (!points.length) return { kept: 0, deletedManifests: 0, deletedObjects: 0, skipped: 'No versioned recovery points' };
+
+  const parsed = [];
+  for (const file of points) {
+    const response = await drive.files.get({ fileId: file.id, alt: 'media' }, { responseType: 'stream' });
+    const chunks = [];
+    for await (const chunk of response.data) chunks.push(Buffer.from(chunk));
+    const manifest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (manifest.format !== 'bankroll-drive-layout-v2' ||
+        !Array.isArray(manifest.databaseFiles) || !Array.isArray(manifest.vaultFiles)) {
+      throw new Error('Retention halted: recovery manifest "' + file.name + '" is malformed or unsupported. No Drive files were deleted.');
+    }
+    for (const entry of [...manifest.databaseFiles, ...manifest.vaultFiles]) {
+      if (!entry?.fileId || !/^[a-f0-9]{64}$/i.test(String(entry.sha256 || '')) ||
+          !Number.isSafeInteger(Number(entry.size)) || Number(entry.size) < 0) {
+        throw new Error('Retention halted: invalid object reference in "' + file.name + '". No Drive files were deleted.');
+      }
+    }
+    parsed.push({ file, manifest, time: new Date(manifest.createdAt || file.modifiedTime || 0) });
+  }
+  const dayKey = (d) => d.toISOString().slice(0, 10);
+  const weekKey = (d) => {
+    const x = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+    x.setUTCDate(x.getUTCDate() + 4 - (x.getUTCDay() || 7));
+    const yearStart = new Date(Date.UTC(x.getUTCFullYear(), 0, 1));
+    return x.getUTCFullYear() + '-W' + String(Math.ceil((((x - yearStart) / 86400000) + 1) / 7)).padStart(2, '0');
+  };
+  const monthKey = (d) => d.toISOString().slice(0, 7);
+  const keep = new Set();
+  const takeLatestBuckets = (keyFn, count) => {
+    const buckets = new Set();
+    for (const item of parsed) {
+      if (!Number.isFinite(item.time.getTime())) throw new Error('Retention halted: invalid recovery timestamp. No Drive files were deleted.');
+      const key = keyFn(item.time);
+      if (!buckets.has(key) && buckets.size < count) { buckets.add(key); keep.add(item.file.id); }
+    }
+  };
+  takeLatestBuckets(dayKey, 7);
+  takeLatestBuckets(weekKey, 4);
+  takeLatestBuckets(monthKey, 3);
+  keep.add(parsed[0].file.id);
+
+  const referenced = new Set();
+  for (const item of parsed) if (keep.has(item.file.id)) {
+    for (const entry of [...item.manifest.databaseFiles, ...item.manifest.vaultFiles]) referenced.add(entry.fileId);
+  }
+  // Validate every retained reference still exists before allowing any deletion.
+  const dbFiles = await listAll(folders.DATABASE.id);
+  const vaultFiles = await listAll(folders.VAULT.id);
+  const objects = [...dbFiles, ...vaultFiles];
+  const objectIds = new Set(objects.map((f) => f.id));
+  for (const id of referenced) if (!objectIds.has(id)) {
+    throw new Error('Retention halted: a retained recovery point references a missing Drive object. No Drive files were deleted.');
+  }
+
+  // Plan all deletes before executing. Only our clearly content-addressed objects
+  // are eligible; legacy names and unknown files are always preserved.
+  const objectDeletes = objects.filter((f) =>
+    f.appProperties?.bankrollBackup === 'true' &&
+    (/^[a-f0-9]{24}_[a-f0-9]{64}_/.test(f.name || '') ||
+     /^[a-f0-9]{16}_[a-f0-9]{24}_/.test(f.name || '')) &&
+    !referenced.has(f.id));
+  const manifestDeletes = points.filter((f) => !keep.has(f.id));
+  let deletedObjects = 0, deletedManifests = 0;
+  for (const file of objectDeletes) {
+    await drive.files.delete({ fileId: file.id, supportsAllDrives: true });
+    deletedObjects++;
+  }
+  for (const file of manifestDeletes) {
+    await drive.files.delete({ fileId: file.id, supportsAllDrives: true });
+    deletedManifests++;
+  }
+  return { kept: keep.size, deletedManifests, deletedObjects };
+}
+
 async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = true } = {}) {
   if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected; connect it with /drive connect first.');
   const { google } = require('googleapis');
   const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
   const folders = await resolveGoogleDriveFolders(drive);
-  const page = await drive.files.list({
-    q: "'" + folders.BACKUPS.id + "' in parents and (name = 'bankroll-drive-manifest.json' or name contains 'bankroll-recovery-') and trashed = false",
-    pageSize: 100, orderBy: 'modifiedTime desc', fields: 'files(id,name,modifiedTime)',
-    supportsAllDrives: true, includeItemsFromAllDrives: true,
-  });
-  const manifests = (page.data.files || []).sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0));
+  const manifests = []; let manifestPageToken;
+  do {
+    const page = await drive.files.list({
+      q: "'" + folders.BACKUPS.id + "' in parents and (name = 'bankroll-drive-manifest.json' or name contains 'bankroll-recovery-') and trashed = false",
+      pageSize: 1000, pageToken: manifestPageToken, orderBy: 'modifiedTime desc',
+      fields: 'nextPageToken,files(id,name,modifiedTime)',
+      supportsAllDrives: true, includeItemsFromAllDrives: true,
+    });
+    manifests.push(...(page.data.files || []));
+    manifestPageToken = page.data.nextPageToken;
+  } while (manifestPageToken);
+  manifests.sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0));
   if (!manifests.length) throw new Error('No Bankroll recovery manifest was found in Google Drive BACKUPS.');
   const manifestResponse = await drive.files.get({ fileId: manifests[0].id, alt: 'media' }, { responseType: 'stream' });
   const manifestChunks = [];
@@ -7479,9 +7589,10 @@ async function cmdFileSearch(interaction) {
   const q = interaction.options.getString('query').trim().toLowerCase();
   const results = [];
   for (const [key, item] of Object.entries(vault)) {
-    if ((key + ' ' + String(item?.originalName || '')).toLowerCase().includes(q)) {
-      let state = 'missing'; try { if ((await fs.promises.stat(item.path)).isFile()) state = 'available'; } catch {}
-      results.push('• Vault ' + key + ' — ' + short(item.originalName || path.basename(item.path || ''), 100) + ' (' + state + ')');
+    const itemPath = item?.path || item?.filePath || '';
+    if ((key + ' ' + String(item?.originalName || item?.name || '')).toLowerCase().includes(q)) {
+      let state = 'missing'; try { if (itemPath && (await fs.promises.stat(itemPath)).isFile()) state = 'available'; } catch {}
+      results.push('• Vault ' + key + ' — ' + short(item.originalName || item.name || path.basename(itemPath || ''), 100) + ' (' + state + ')');
     }
   }
   for (const [id, item] of Object.entries(deliveries)) {
@@ -7529,8 +7640,8 @@ async function cmdRecovery(interaction) {
       const { google } = require('googleapis');
       const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
       const folders = await resolveGoogleDriveFolders(drive);
-      const page = await drive.files.list({ q: "'" + folders.BACKUPS.id + "' in parents and (name = 'bankroll-drive-manifest.json' or name contains 'bankroll-recovery-') and trashed = false", pageSize: 100, orderBy: 'modifiedTime desc', fields: 'files(id,name,modifiedTime)', supportsAllDrives: true, includeItemsFromAllDrives: true });
-      const latest = page.data.files?.[0];
+      const page = await drive.files.list({ q: "'" + folders.BACKUPS.id + "' in parents and (name = 'bankroll-drive-manifest.json' or name contains 'bankroll-recovery-') and trashed = false", pageSize: 1000, orderBy: 'modifiedTime desc', fields: 'files(id,name,modifiedTime)', supportsAllDrives: true, includeItemsFromAllDrives: true });
+      const latest = (page.data.files || []).sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0))[0];
       if (!latest) return interaction.editReply('Google Drive is connected, but no recovery manifest exists yet. Run /drive backup to create one.');
       return interaction.editReply('Google Drive recovery source is available. Latest manifest: <t:' + Math.floor(new Date(latest.modifiedTime).getTime() / 1000) + ':R>. Existing local files will be protected during restore.');
     } catch (error) { return interaction.editReply('Google Drive recovery check failed: ' + short(error.message, 800)); }
