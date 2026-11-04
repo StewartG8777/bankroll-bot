@@ -2225,7 +2225,10 @@ const storageCmd = common(new SlashCommandBuilder().setName('storage').setDescri
 const driveCmd = common(new SlashCommandBuilder().setName('drive').setDescription('Connect and manage Google Drive backups (owner only)')
   .addSubcommand((sub) => sub.setName('connect').setDescription('Connect the Google account used for backups'))
   .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive connection and backup status'))
-  .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate Discord and Google Drive backup')));
+  .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate Discord and Google Drive backup'))
+  .addSubcommand((sub) => sub.setName('rollback').setDescription('Restore a previous verified Drive generation (owner only)')
+    .addStringOption((o) => o.setName('generation').setDescription('Exact recovery manifest filename or Drive file ID').setRequired(true).setMaxLength(180))
+    .addStringOption((o) => o.setName('confirm').setDescription('Type ROLLBACK to confirm overwriting current files').setRequired(true).setMaxLength(20))));
 
 const driveCredentialsCmd = common(
   new SlashCommandBuilder()
@@ -7770,6 +7773,75 @@ async function cmdStorageDiagnostics(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
+async function rollbackGoogleDriveGeneration(identifier) {
+  if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected.');
+  const { google } = require('googleapis');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const folders = await resolveGoogleDriveFolders(drive);
+  const files = []; let pageToken;
+  do {
+    const page = await drive.files.list({
+      q: "'" + folders.BACKUPS.id + "' in parents and name contains 'bankroll-recovery-' and trashed = false",
+      pageSize: 1000, pageToken, orderBy: 'modifiedTime desc',
+      fields: 'nextPageToken,files(id,name,modifiedTime)',
+      supportsAllDrives: true, includeItemsFromAllDrives: true,
+    });
+    files.push(...(page.data.files || [])); pageToken = page.data.nextPageToken;
+  } while (pageToken);
+  const matches = files.filter((f) => f.id === identifier || f.name === identifier);
+  if (matches.length !== 1) throw new Error(matches.length ? 'That identifier is ambiguous; use the exact Drive file ID.' : 'No matching recovery generation was found.');
+  const response = await drive.files.get({ fileId: matches[0].id, alt: 'media' }, { responseType: 'stream' });
+  const chunks = []; for await (const chunk of response.data) chunks.push(Buffer.from(chunk));
+  const manifest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  if (manifest.format !== 'bankroll-drive-layout-v2' || !Array.isArray(manifest.databaseFiles) || !Array.isArray(manifest.vaultFiles)) {
+    throw new Error('The selected recovery point is not a supported, verified Bankroll v2 generation.');
+  }
+  const stageRoot = path.join(DATA_DIR, '.drive-rollback-stage-' + crypto.randomBytes(8).toString('hex'));
+  const staged = [];
+  const stageEntry = async (entry, relative) => {
+    if (!entry?.fileId || !/^[a-f0-9]{64}$/i.test(String(entry.sha256 || '')) || !Number.isSafeInteger(Number(entry.size)) || Number(entry.size) < 0) {
+      throw new Error('The selected recovery manifest contains an invalid file record.');
+    }
+    const safe = safeBackupRel(relative);
+    if (!safe || safe.startsWith('../') || safe.includes('/../') || safe === 'google-oauth.json' || safe === 'google-drive-token.json' || safe === '.env') {
+      throw new Error('The selected recovery manifest contains an unsafe destination path.');
+    }
+    const stagedPath = path.resolve(stageRoot, safe);
+    if (!stagedPath.startsWith(stageRoot + path.sep)) throw new Error('Unsafe staging path rejected.');
+    await fs.promises.mkdir(path.dirname(stagedPath), { recursive: true });
+    const download = await drive.files.get({ fileId: entry.fileId, alt: 'media' }, { responseType: 'stream' });
+    const hash = crypto.createHash('sha256'); let size = 0;
+    const meter = new Transform({ transform(chunk, enc, callback) { size += chunk.length; hash.update(chunk); callback(null, chunk); } });
+    await pipeline(download.data, meter, fs.createWriteStream(stagedPath, { flags: 'wx' }));
+    if (size !== Number(entry.size) || hash.digest('hex') !== entry.sha256) throw new Error('SHA-256/size verification failed for ' + safe);
+    staged.push({ stagedPath, destination: path.resolve(DATA_DIR, safe) });
+  };
+  try {
+    for (const entry of manifest.databaseFiles) {
+      const name = String(entry.name || '');
+      if (!/^[a-z0-9_.-]+\.json$/i.test(name)) throw new Error('Unsafe database filename in recovery manifest.');
+      await stageEntry(entry, name);
+    }
+    for (const entry of manifest.vaultFiles) {
+      const relative = safeBackupRel(entry.path);
+      if (!relative || !(relative.startsWith('vault/') || relative.startsWith('files/'))) throw new Error('Unsafe vault path in recovery manifest.');
+      await stageEntry(entry, relative);
+    }
+    // Preserve a fresh pre-rollback recovery point before replacing anything.
+    const safety = await backupData();
+    if (!safety?.ok) throw new Error('Could not create a fresh pre-rollback backup. No files were changed.');
+    for (const item of staged) {
+      await fs.promises.mkdir(path.dirname(item.destination), { recursive: true });
+      const temp = item.destination + '.rollback-' + crypto.randomBytes(6).toString('hex');
+      await fs.promises.copyFile(item.stagedPath, temp);
+      await fs.promises.rename(temp, item.destination);
+    }
+    return { generation: matches[0].name, createdAt: manifest.createdAt, restored: staged.length, database: manifest.databaseFiles.length, vault: manifest.vaultFiles.length };
+  } finally {
+    await fs.promises.rm(stageRoot, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function cmdDrive(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage Google Drive backups.');
   const sub = interaction.options.getSubcommand();
@@ -7795,6 +7867,16 @@ async function cmdDrive(interaction) {
     if (!result || !result.ok) return interaction.editReply('❌ Backup failed: ' + short(result && result.error || 'Unknown backup error', 800));
     if (!googleDriveIsConnected()) return interaction.editReply('⚠️ The existing Discord backup completed, but Google Drive is not connected. Run `/drive connect` first.');
     return interaction.editReply('✅ Backup completed. Database files are in **DATABASE**, vault/order files are in **VAULT**, and the backup manifest is in **BACKUPS**. **LOGS** and **SYSTEM** are recognised for their respective exports.');
+  }
+  if (sub === 'rollback') {
+    const identifier = interaction.options.getString('generation', true).trim();
+    const confirmation = interaction.options.getString('confirm', true).trim();
+    if (confirmation !== 'ROLLBACK') return interaction.editReply('Rollback cancelled. To proceed, run `/drive rollback` again and type exactly `ROLLBACK` in the confirmation field.');
+    await interaction.editReply('Creating a fresh safety backup, downloading the selected generation and verifying every file before applying it…');
+    try {
+      const result = await rollbackGoogleDriveGeneration(identifier);
+      return interaction.editReply('✅ **Drive generation restored and verified.**\n**Generation:** `' + result.generation + '`\n**Snapshot date:** ' + (result.createdAt ? new Date(result.createdAt).toISOString() : 'Not recorded') + '\n**Files restored:** ' + result.restored + ' (' + result.database + ' database, ' + result.vault + ' vault).\n\n**Restart Bankroll now** so its in-memory invoice, payment, Monzo and vault indexes reload from the restored files. A fresh pre-rollback recovery point was created first.');
+    } catch (error) { return interaction.editReply('❌ **Rollback stopped.** ' + short(error.message, 900) + '\nNo intentional file replacement was performed unless the verified apply phase had already begun.'); }
   }
 }
 
