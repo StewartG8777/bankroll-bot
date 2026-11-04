@@ -20,6 +20,7 @@ test('allows safe Bankroll data paths and excludes secrets/temp folders', () => 
   assert.equal(isAllowedRelativePath('vault/catalog.json'), true);
   assert.equal(isAllowedRelativePath('files/customer.bin'), true);
   assert.equal(isAllowedRelativePath('google-oauth.json'), false);
+  assert.equal(isAllowedRelativePath('google-drive-token.json'), false);
   assert.equal(isAllowedRelativePath('.env'), false);
   assert.equal(isAllowedRelativePath('tmp/upload.part'), false);
   assert.equal(isAllowedRelativePath('node_modules/pkg/index.js'), false);
@@ -32,6 +33,7 @@ test('walkFiles includes data files but excludes temporary and OAuth files', asy
     await fs.promises.mkdir(path.join(root, 'tmp'), { recursive: true });
     await fs.promises.writeFile(path.join(root, 'deliveries.json'), '{}');
     await fs.promises.writeFile(path.join(root, 'google-oauth.json'), '{"secret":true}');
+    await fs.promises.writeFile(path.join(root, 'google-drive-token.json'), '{"refresh_token":"secret"}');
     await fs.promises.writeFile(path.join(root, 'vault', 'file.bin'), Buffer.from([1, 2, 3]));
     await fs.promises.writeFile(path.join(root, 'tmp', 'upload.part'), 'temp');
     const files = await walkFiles(root);
