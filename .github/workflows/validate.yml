@@ -20,6 +20,7 @@ jobs:
       - name: Check JavaScript syntax
         run: |
           node --check index.js
+          node --check systems/google-drive-primary-storage.js
           node --check systems/performance.js
           node --check systems/backup-retention.js
       - name: Run unit tests
