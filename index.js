@@ -7484,7 +7484,7 @@ async function cmdRecovery(interaction) {
       const { google } = require('googleapis');
       const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
       const folders = await resolveGoogleDriveFolders(drive);
-      const page = await drive.files.list({ q: "'" + folders.BACKUPS.id + "' in parents and name = 'bankroll-drive-manifest.json' and trashed = false", pageSize: 10, orderBy: 'modifiedTime desc', fields: 'files(id,name,modifiedTime)', supportsAllDrives: true, includeItemsFromAllDrives: true });
+      const page = await drive.files.list({ q: "'" + folders.BACKUPS.id + "' in parents and (name = 'bankroll-drive-manifest.json' or name contains 'bankroll-recovery-') and trashed = false", pageSize: 100, orderBy: 'modifiedTime desc', fields: 'files(id,name,modifiedTime)', supportsAllDrives: true, includeItemsFromAllDrives: true });
       const latest = page.data.files?.[0];
       if (!latest) return interaction.editReply('Google Drive is connected, but no recovery manifest exists yet. Run /drive backup to create one.');
       return interaction.editReply('Google Drive recovery source is available. Latest manifest: <t:' + Math.floor(new Date(latest.modifiedTime).getTime() / 1000) + ':R>. Existing local files will be protected during restore.');
