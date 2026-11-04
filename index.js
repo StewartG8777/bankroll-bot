@@ -7275,25 +7275,33 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
       throw e;
     }
     uploaded++;
+    const saved = existing.get(name);
     console.log('Google Drive backup uploaded to ' + folderName + ': ' + name);
+    return saved?.id || null;
   };
+  const databaseEntries = [];
   for (const file of databaseFiles || []) {
     const sig = crypto.createHash('sha256').update(file.buffer).digest('hex');
-    await uploadOne('DATABASE', file.name, sig, Readable.from([file.buffer]), 'application/json');
+    const fileId = await uploadOne('DATABASE', file.name, sig, Readable.from([file.buffer]), 'application/json');
+    const current = existingByFolder.get('DATABASE').get(file.name);
+    databaseEntries.push({ name: file.name, fileId: fileId || current?.id, size: file.buffer.length, sha256: sig });
   }
   let vaultFileCount = 0;
+  const vaultEntries = [];
   for (const fp of storedPaths || []) {
     if (!fp || !fs.existsSync(fp)) continue;
     const rel = relData(fp); if (!rel) continue;
-    const st = fs.statSync(fp); if (!st.isFile() || !st.size) continue;
+    const st = await fs.promises.stat(fp); if (!st.isFile() || !st.size) continue;
     if (st.size > 150 * 1024 * 1024) throw new Error('Google Drive backup file exceeds 150 MiB: ' + rel);
     const sig = await sha256FileCached(fp, st);
     const key = crypto.createHash('sha256').update(rel).digest('hex').slice(0, 16);
     const name = key + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
-    await uploadOne('VAULT', name, st.size + ':' + sig, fs.createReadStream(fp));
+    const fileId = await uploadOne('VAULT', name, st.size + ':' + sig, fs.createReadStream(fp));
+    const current = existingByFolder.get('VAULT').get(name);
+    vaultEntries.push({ path: rel, name, fileId: fileId || current?.id, size: st.size, sha256: sig });
     vaultFileCount++;
   }
-  const manifest = { format: 'bankroll-drive-layout-v1', createdAt: new Date().toISOString(), databaseFiles: (databaseFiles || []).map((f) => f.name), vaultFileCount, folders: Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map((name) => [name, folders[name].id])) };
+  const manifest = { format: 'bankroll-drive-layout-v2', createdAt: new Date().toISOString(), databaseFiles: databaseEntries, vaultFiles: vaultEntries, vaultFileCount, folders: Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map((name) => [name, folders[name].id])) };
   const manifestBuffer = Buffer.from(JSON.stringify(manifest, null, 2));
   const manifestSig = crypto.createHash('sha256').update(manifestBuffer).digest('hex');
   await uploadOne('BACKUPS', 'bankroll-drive-manifest.json', manifestSig, Readable.from([manifestBuffer]), 'application/json');
