@@ -2203,6 +2203,10 @@ const vaultCmd = common(
 );
 
 
+const logsCmd = common(new SlashCommandBuilder().setName('logs').setDescription('Search recent Bankroll log-channel messages (owner only)')
+  .addStringOption((o) => o.setName('query').setDescription('Text to search for').setRequired(true).setMaxLength(100))
+  .addIntegerOption((o) => o.setName('count').setDescription('Maximum matches (default 10, max 20)').setMinValue(1).setMaxValue(20)));
+const settingsCmd = common(new SlashCommandBuilder().setName('settings').setDescription('Inspect Bankroll runtime and backup settings (owner only)'));
 const ordersCmd = common(new SlashCommandBuilder().setName('orders').setDescription('Search customer orders and delivery status (owner only)')
   .addStringOption((o) => o.setName('query').setDescription('Order ID, customer name, email or file name').setRequired(true).setMaxLength(100)));
 const fileCmd = common(new SlashCommandBuilder().setName('file').setDescription('Search stored Bankroll files (owner only)')
@@ -2476,7 +2480,7 @@ function previousCommandSchemaMismatch(published, desired) {
   });
 }
 
-const commands = [ordersCmd, fileCmd, backupCmd, recoveryCmd, systemCmd, performanceCmd, storageCmd, driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [logsCmd, settingsCmd, ordersCmd, fileCmd, backupCmd, recoveryCmd, systemCmd, performanceCmd, storageCmd, driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
 // are never cached.
@@ -7412,6 +7416,47 @@ function formatBytes(bytes) {
   return n.toFixed(2) + ' ' + units[i];
 }
 
+async function cmdLogsSearch(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can search logs.');
+  const query = interaction.options.getString('query').trim().toLowerCase();
+  const limit = interaction.options.getInteger('count') || 10;
+  const channels = [];
+  for (const guild of client.guilds.cache.values()) {
+    let list = guild.channels.cache;
+    if (!list.size) list = await guild.channels.fetch().catch(() => null) || list;
+    for (const channel of list.values()) if (channel?.name?.toLowerCase().includes('bankroll-log') && channel.isTextBased?.() && channel.messages?.fetch) channels.push(channel);
+  }
+  if (!channels.length) return interaction.editReply('No accessible #bankroll-logs channel was found.');
+  const found = [];
+  for (const channel of channels) {
+    const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+    if (!messages) continue;
+    for (const message of messages.values()) {
+      const body = [message.content, ...message.embeds.flatMap((embed) => [embed.title, embed.description, ...(embed.fields || []).flatMap((field) => [field.name, field.value])])].filter(Boolean).join(' ').replace(/\\s+/g, ' ');
+      if (body.toLowerCase().includes(query)) found.push({ at: message.createdTimestamp, channel: channel.name, body });
+    }
+  }
+  found.sort((a, b) => b.at - a.at);
+  if (!found.length) return interaction.editReply('No recent log messages matched ' + short(query, 80) + '.');
+  return interaction.editReply(found.slice(0, limit).map((item) => '<t:' + Math.floor(item.at / 1000) + ':R> #' + item.channel + ' — ' + short(item.body, 260)).join('\\n').slice(0, 1900));
+}
+async function cmdSettingsOverview(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can inspect system settings.');
+  const rows = [
+    '**Storage:** ' + DATA_DIR_STATUS,
+    '**Data directory:** ' + DATA_DIR,
+    '**Backup channel:** ' + (BACKUP_CHANNEL_ID || '#bankroll-backup auto-discovery'),
+    '**Backup interval:** 6 hours',
+    '**Backup retry:** 5 minutes after a failure',
+    '**Google Drive:** ' + (googleDriveIsConnected() ? 'connected' : 'not connected'),
+    '**Google OAuth client:** ' + (fs.existsSync(GOOGLE_OAUTH_FILE) ? 'present' : 'missing'),
+    '**Startup restore:** ' + (restoreDone ? 'complete' : 'in progress'),
+    '**Stripe ledger:** ' + (stripeLedgerReady ? 'ready' : 'syncing/not ready'),
+    '**Node.js:** ' + process.version,
+    '**Environment:** ' + (process.env.RENDER ? 'Render' : process.env.NODE_ENV || 'local'),
+  ];
+  return interaction.editReply(rows.join('\\n'));
+}
 async function cmdOrdersSearch(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can search orders.');
   const q = interaction.options.getString('query').trim().toLowerCase();
@@ -7665,6 +7710,12 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     switch (interaction.commandName) {
+      case 'logs':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdLogsSearch(interaction);
+      case 'settings':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdSettingsOverview(interaction);
       case 'orders':
         await interaction.deferReply({ ephemeral: true });
         return await cmdOrdersSearch(interaction);
