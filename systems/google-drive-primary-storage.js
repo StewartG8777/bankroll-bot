@@ -13,7 +13,7 @@ const { Transform, Readable } = require('node:stream');
 const FORMAT = 'bankroll-primary-snapshot-v1';
 const MAX_FILE_BYTES = 150 * 1024 * 1024;
 const EXCLUDED_DIRS = new Set(['tmp', 'logs', 'backups', 'node_modules']);
-const EXCLUDED_FILES = new Set(['google-oauth.json', '.env']);
+const EXCLUDED_FILES = new Set(['google-oauth.json', 'google-drive-token.json', '.env']);
 
 function sha256(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
