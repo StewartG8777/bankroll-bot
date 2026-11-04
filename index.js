@@ -1453,8 +1453,13 @@ async function backupDataOnce() {
       const rel = safeBackupRel(relData(fp));
       if (!rel) continue;
       let st;
-      try { st = fs.statSync(fp); } catch { continue; }
-      if (!st.isFile() || !st.size) continue;
+      try { st = fs.statSync(fp); } catch (error) {
+        // A file referenced by the vault/delivery indexes is part of the backup set.
+        // Never silently skip a missing source file and then report the whole backup healthy.
+        throw new Error(`Indexed backup file is missing and cannot be protected: ${rel} (${error.message})`);
+      }
+      if (!st.isFile()) throw new Error(`Indexed backup path is not a regular file: ${rel}`);
+      if (!st.size) continue;
       const sha256 = await sha256FileCached(fp, st);
       const signature = `${st.size}:${sha256}`;
       if (blobBackedUp[rel] === signature) continue;
