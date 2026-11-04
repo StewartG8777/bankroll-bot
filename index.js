@@ -2483,6 +2483,7 @@ async function autoRestoreOnStartup() {
       if (batch.size < 100) exhausted = true;
     }
     console.log(`Backup restore scan complete: ${msgs.length} messages in #${ch.name}.`);
+    await restoreGoogleAuthBundleFromMessages(msgs);
 
     // The bot's own backups and owner-uploaded backup files are trusted sources.
     const trusted = (msg) => msg.author?.id === client.user.id || (OWNER_ID && msg.author?.id === OWNER_ID);
@@ -7109,6 +7110,54 @@ async function handleBankrollPayoutButton(interaction) {
 const GOOGLE_OAUTH_FILE = path.join(DATA_DIR, 'google-oauth.json');
 const GOOGLE_TOKEN_FILE = path.join(DATA_DIR, 'google-drive-token.json');
 const GOOGLE_DRIVE_FOLDER_NAMES = ['BACKUPS', 'DATABASE', 'LOGS', 'SYSTEM', 'VAULT'];
+const GOOGLE_AUTH_BACKUP_NAME = 'google-drive-auth.enc';
+function googleAuthBackupKey() {
+  const secret = process.env.BANKROLL_BACKUP_ENCRYPTION_KEY || process.env.DISCORD_TOKEN;
+  if (!secret) throw new Error('Set BANKROLL_BACKUP_ENCRYPTION_KEY in Render to enable encrypted Google credential recovery.');
+  return crypto.createHash('sha256').update(String(secret)).digest();
+}
+function encryptGoogleAuthBundle(bundle) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', googleAuthBackupKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(bundle), 'utf8'), cipher.final()]);
+  return Buffer.from(JSON.stringify({ version: 1, iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), data: encrypted.toString('base64') }), 'utf8');
+}
+function decryptGoogleAuthBundle(buffer) {
+  const envelope = JSON.parse(buffer.toString('utf8'));
+  if (envelope.version !== 1) throw new Error('Unsupported encrypted Google credential backup version.');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', googleAuthBackupKey(), Buffer.from(envelope.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
+  return JSON.parse(Buffer.concat([decipher.update(Buffer.from(envelope.data, 'base64')), decipher.final()]).toString('utf8'));
+}
+async function persistGoogleAuthBundle() {
+  if (!fs.existsSync(GOOGLE_OAUTH_FILE)) return;
+  const ch = await resolveBackupChannel();
+  if (!ch) throw new Error('Cannot persist Google credentials: #bankroll-backup was not found.');
+  const bundle = { client: JSON.parse(fs.readFileSync(GOOGLE_OAUTH_FILE, 'utf8')), token: fs.existsSync(GOOGLE_TOKEN_FILE) ? JSON.parse(fs.readFileSync(GOOGLE_TOKEN_FILE, 'utf8')) : null, savedAt: Date.now() };
+  const attachment = encryptGoogleAuthBundle(bundle);
+  await ch.send({ content: 'Encrypted Google Drive recovery bundle. Only Bankroll can decrypt this using its server secret.', files: [{ attachment, name: GOOGLE_AUTH_BACKUP_NAME }] });
+}
+async function restoreGoogleAuthBundleFromMessages(messages) {
+  if (fs.existsSync(GOOGLE_OAUTH_FILE) && fs.existsSync(GOOGLE_TOKEN_FILE)) return false;
+  for (const msg of messages) {
+    if (msg.author?.id !== client.user.id) continue;
+    const att = msg.attachments?.find?.((a) => a.name === GOOGLE_AUTH_BACKUP_NAME);
+    if (!att) continue;
+    try {
+      const response = await fetch(att.url);
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const bundle = decryptGoogleAuthBundle(Buffer.from(await response.arrayBuffer()));
+      if (!bundle.client || typeof bundle.client !== 'object') throw new Error('Missing OAuth client data.');
+      atomicWrite(GOOGLE_OAUTH_FILE, JSON.stringify(bundle.client, null, 2));
+      if (bundle.token && typeof bundle.token === 'object') atomicWrite(GOOGLE_TOKEN_FILE, JSON.stringify(bundle.token, null, 2));
+      try { fs.chmodSync(GOOGLE_OAUTH_FILE, 0o600); if (fs.existsSync(GOOGLE_TOKEN_FILE)) fs.chmodSync(GOOGLE_TOKEN_FILE, 0o600); } catch {}
+      console.log('Restored encrypted Google Drive credentials from #bankroll-backup.');
+      return true;
+    } catch (error) { console.error('Encrypted Google credential recovery failed:', error.message); }
+  }
+  return false;
+}
+
 const GOOGLE_OAUTH_STATES = new Map();
 function googleRedirectUri() { const base = String(PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, ''); return base ? base + '/google/oauth/callback' : ''; }
 function readGoogleClientConfig() {
@@ -7268,6 +7317,7 @@ async function cmdDriveCredentials(interaction) {
   // Never trust the uploaded filename: Bankroll always stores it under the fixed standard name.
   const destination = path.join(DATA_DIR, 'google-oauth.json');
   atomicWrite(destination, JSON.stringify(parsed, null, 2));
+  await persistGoogleAuthBundle();
   try { fs.chmodSync(destination, 0o600); } catch {}
   console.log('Google OAuth client JSON received and saved under the standard filename (contents withheld).');
   const persistence = DATA_DIR_STATUS.includes('fallback storage')
@@ -7792,6 +7842,7 @@ app.get('/google/oauth/callback', async (req, res) => {
     const saved = { ...previous, ...result.tokens }; if (!saved.refresh_token && previous.refresh_token) saved.refresh_token = previous.refresh_token;
     if (!saved.refresh_token) throw new Error('Google did not issue a refresh token. Revoke Bankroll access in your Google Account and run /drive connect again.');
     atomicWrite(GOOGLE_TOKEN_FILE, JSON.stringify(saved, null, 2)); try { fs.chmodSync(GOOGLE_TOKEN_FILE, 0o600); } catch {}
+    await persistGoogleAuthBundle();
     res.status(200).send('<h2>Google Drive connected to Bankroll</h2><p>You can close this page and return to Discord. Run /drive status to verify the connection.</p>');
     console.log('Google Drive OAuth completed successfully; token contents withheld.');
     void client.users.fetch(OWNER_ID).then(user => user.send('✅ Google Drive has been connected to Bankroll. Run `/drive status` to verify, then `/drive backup` for the first full backup.')).catch(() => {});
