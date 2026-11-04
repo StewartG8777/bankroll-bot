@@ -1356,6 +1356,13 @@ function backupData() {
   });
   return backupChain;
 }
+async function requireDurableDriveCommit(context = 'Bankroll data change') {
+  if (!googleDriveIsConnected()) throw new Error(context + ' was saved locally but Google Drive is not connected; refusing to acknowledge it as durable.');
+  const result = await backupData();
+  if (!result?.ok) throw new Error(context + ' could not be committed to Google Drive: ' + String(result?.error || 'unknown backup failure'));
+  return result;
+}
+
 async function resolveBackupChannel() {
   if (BACKUP_CHANNEL_ID) {
     const byId = await client.channels.fetch(BACKUP_CHANNEL_ID).catch((e) => {
@@ -8689,13 +8696,17 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
     const open = Object.entries(deliveries).filter(
       ([, d]) => d.type === 'monzo' && !d.paid && Math.abs(amountPaid - d.amount) < 0.01
     );
-    let matches = open.filter(([, d]) => d.reference && text.includes(d.reference));
+    // If a previous webhook attempt saved the paid state but Drive was unavailable,
+    // retry the same Monzo transaction and finish the owed delivery after it commits.
+    const retryPaid = Object.entries(deliveries).filter(([, d]) => d.type === 'monzo' && d.paid && !d.deliveryComplete && String(d.txId || '') === String(data.id || '') && Math.abs(amountPaid - d.amount) < 0.01);
+    let matches = retryPaid.length ? retryPaid : open.filter(([, d]) => d.reference && text.includes(d.reference));
     if (!matches.length) matches = open;
 
     if (matches.length === 1) {
       const [key] = matches[0];
       const d = deliveries[key];
       markMonzoPaid(key, data.id);
+      await requireDurableDriveCommit('Monzo payment ' + String(data.id || key));
 
       const paidEmbed = new EmbedBuilder()
         .setColor(GREEN)
@@ -8731,6 +8742,7 @@ app.post('/monzo-webhook', express.json(), async (req, res) => {
       });
     }
     if (data.id) markWebhookProcessed(`monzo:${data.id}`, 'monzo.transaction.created');
+    await requireDurableDriveCommit('Monzo webhook ' + String(data.id || 'unknown transaction'));
     return res.status(200).send('OK');
   } catch (e) {
     alertOwner('Monzo webhook error', e);
@@ -8884,6 +8896,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   }
 
   markWebhookProcessed(event.id, event.type);
+  await requireDurableDriveCommit('Stripe webhook ' + String(event.id));
   res.json({ received: true });
   } catch (webhookError) {
     void alertOwner(`Stripe webhook ${event.type} failed`, webhookError);
