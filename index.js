@@ -4139,19 +4139,10 @@ async function cmdVault(interaction) {
         }
       } catch {}
     }
-    await interaction.editReply(`Successfully added **${att.name}** to the vault as \`${key}\`!${codeNote} Saving a backup copy now...`);
     clearTimeout(backupTimer);
-    backupData()
-      .then(() =>
-        interaction.followUp({
-          content: blobBackedUp[relData(filePath)]
-            ? `Backup copy of \`${key}\` is saved in the backup channel.`
-            : `Backup copy of \`${key}\` is not saved yet. The bot will keep retrying, check /vault list.`,
-          ephemeral: true,
-        })
-      )
-      .catch(() => {});
-    return;
+    try { await requireDurableDriveCommit('Vault add ' + key); }
+    catch (error) { return interaction.editReply('❌ File is on local storage but was not confirmed in Google Drive. No success was reported. ' + short(error.message, 500)); }
+    return interaction.editReply(`Successfully added **${att.name}** to the vault as \`${key}\`!${codeNote} Google Drive and Discord recovery copies are confirmed.`);
   }
 
   if (sub === 'replace') {
@@ -4236,9 +4227,10 @@ async function cmdVault(interaction) {
     }
     recordNotification('vault.replace', 'Vault file replaced', key + ': ' + oldName + ' -> ' + newName + '; refreshed ' + refreshed + ' pending invoice file(s)', 'success');
     clearTimeout(backupTimer);
-    backupData().catch(() => {});
+    try { await requireDurableDriveCommit('Vault replacement ' + key); }
+    catch (error) { return interaction.editReply('❌ Replacement is saved locally but Drive confirmation failed. Do not assume the replacement is protected yet. ' + short(error.message, 500)); }
     return interaction.editReply(
-      'Replaced vault item **' + key + '** with **' + newName + '**.\n' +
+      'Replaced vault item **' + key + '** with **' + newName + '**. Google Drive and Discord recovery copies are confirmed.\n' +
       'Updated ' + refreshed + ' file copy/copies on unpaid invoices using this vault item. Those invoices will deliver the replacement after payment. Already-paid/delivered orders were not changed.'
     );
   }
@@ -4300,7 +4292,9 @@ async function cmdVault(interaction) {
       if (d?.vaultKey === oldKey) d.vaultKey = newKey;
     }
     saveVault(); saveDeliveries(); saveDownloads();
-    await interaction.editReply(`Renamed vault key \`${oldKey}\` to \`${newKey}\`. The file itself was not changed.`);
+    try { await requireDurableDriveCommit('Vault rename ' + oldKey); }
+    catch (error) { return interaction.editReply('Rename is saved locally but Drive confirmation failed: ' + short(error.message, 500)); }
+    await interaction.editReply(`Renamed vault key \`${oldKey}\` to \`${newKey}\`. Drive and Discord recovery copies are confirmed; the file itself was not changed.`);
     recordNotification('vault.rename', 'Vault item renamed', `${oldKey} -> ${newKey}`, 'success');
     return;
   }
@@ -4454,9 +4448,11 @@ async function cmdVault(interaction) {
     if (result.skipped.length) lines.push(`Skipped: ${result.skipped.join(', ')}`);
     lines.push(`Use it on an invoice with vault_file: \`${newKey}\`. The original \`${key}\` is untouched.`);
     lines.push('Archive processed using streaming mode (' + (archiveSize / (1024 * 1024)).toFixed(1) + ' MB input); original file remains untouched.');
-    await interaction.editReply(lines.join('\n'));
     clearTimeout(backupTimer);
-    backupData().catch(() => {});
+    try { await requireDurableDriveCommit('Vault ZIP edit ' + newKey); }
+    catch (error) { return interaction.editReply('Edited ZIP is saved locally but Drive confirmation failed: ' + short(error.message, 500)); }
+    lines.push('Google Drive and Discord recovery copies are confirmed.');
+    await interaction.editReply(lines.join('\n'));
     return;
   }
 
@@ -4471,8 +4467,9 @@ async function cmdVault(interaction) {
     delete vault[key];
     saveVault();
     recordNotification('vault.remove', 'Vault file removed', key, 'success');
-
-    return interaction.editReply(`Removed \`${key}\` from the vault.`);
+    try { await requireDurableDriveCommit('Vault removal ' + key); }
+    catch (error) { return interaction.editReply('Removal is saved locally but Drive confirmation failed: ' + short(error.message, 500)); }
+    return interaction.editReply(`Removed \`${key}\` from the vault. The updated vault index is confirmed in Google Drive and Discord recovery.`);
   }
 }
 
