@@ -237,8 +237,10 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
       const matches = (await listGenerations()).filter((item) => item.generation === String(generation));
       if (matches.length !== 1) throw new Error(matches.length ? 'Generation identifier is ambiguous.' : 'Requested Drive generation was not found.');
       const selected = matches[0];
-      const manifestResponse = await drive.files.get({ fileId: selected.manifestId, alt: 'media', supportsAllDrives: true });
-      const manifest = manifestResponse.data;
+      const manifestResponse = await drive.files.get({ fileId: selected.manifestId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' });
+      const manifestChunks = [];
+      for await (const chunk of manifestResponse.data) manifestChunks.push(Buffer.from(chunk));
+      const manifest = JSON.parse(Buffer.concat(manifestChunks).toString('utf8'));
       if (!manifest || manifest.format !== FORMAT || manifest.generation !== selected.generation || !Array.isArray(manifest.files)) {
         throw new Error('Selected rollback manifest is invalid.');
       }
