@@ -1719,6 +1719,28 @@ async function deliverFileUnlocked(key, paymentIntentId, force = false) {
     }, { notificationType: 'payment.confirmed', notificationStatus: 'success' });
   }
 
+  // Post the exact payment confirmation as its own reply to the original invoice.
+  // Save its message ID so automatic delivery retries never post it twice.
+  if (!d.paymentReceiptReplyMessageId) {
+    try {
+      const receiptPayload = { content: '✅ Payment has been received.', allowedMentions: { parse: [] } };
+      const live = liveInteractions.get(key);
+      let receiptMessage = null;
+      if (live?.interaction && Date.now() - live.at < 14 * 60 * 1000) {
+        receiptMessage = await live.interaction.followUp(receiptPayload);
+      } else {
+        const invoice = await getInvoiceMessage(d, key);
+        if (!invoice) throw new Error('The original invoice message could not be found for the payment confirmation reply.');
+        receiptMessage = await invoice.reply({ ...receiptPayload, failIfNotExists: true });
+      }
+      d.paymentReceiptReplyMessageId = receiptMessage?.id || null;
+      d.paymentReceiptReplyAt = Date.now();
+      saveDeliveries();
+    } catch (receiptError) {
+      console.error(`Could not post payment confirmation reply for ${key}:`, receiptError.message);
+    }
+  }
+
   // Multiple Vault files are delivered as one clearly named download embed per file.
   if (Array.isArray(d.files) && d.files.length > 1) {
     const embeds = [];
