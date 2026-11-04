@@ -2235,6 +2235,7 @@ const driveCmd = common(new SlashCommandBuilder().setName('drive').setDescriptio
   .addSubcommand((sub) => sub.setName('connect').setDescription('Connect the Google account used for backups'))
   .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive connection and backup status'))
   .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate Discord and Google Drive backup'))
+  .addSubcommand((sub) => sub.setName('generations').setDescription('List available verified Drive recovery generations'))
   .addSubcommand((sub) => sub.setName('rollback').setDescription('Restore a previous verified Drive generation (owner only)')
     .addStringOption((o) => o.setName('generation').setDescription('Exact recovery manifest filename or Drive file ID').setRequired(true).setMaxLength(180))
     .addStringOption((o) => o.setName('confirm').setDescription('Type ROLLBACK to confirm overwriting current files').setRequired(true).setMaxLength(20))));
@@ -7870,6 +7871,41 @@ async function cmdDrive(interaction) {
       const lines = GOOGLE_DRIVE_FOLDER_NAMES.map((name) => '• **' + name + '**');
       return interaction.editReply('✅ Google Drive is connected; all five Bankroll folders were found.\\n' + lines.join('\\n') + '\\n**Automatic backup:** enabled alongside Discord backup.\\n**Storage:** ' + DATA_DIR_STATUS);
     } catch (e) { return interaction.editReply('⚠️ Google Drive folder check failed: ' + short(e.message, 900)); }
+  }
+  if (sub === 'generations') {
+    if (!googleDriveIsConnected()) return interaction.editReply('Google Drive is not connected. Run /drive connect first.');
+    try {
+      const { google } = require('googleapis');
+      const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+      const folders = await resolveGoogleDriveFolders(drive);
+      const rows = []; let pageToken;
+      do {
+        const page = await drive.files.list({
+          q: "'" + folders.BACKUPS.id + "' in parents and name contains 'bankroll-recovery-' and trashed = false",
+          pageSize: 1000, pageToken, orderBy: 'modifiedTime desc',
+          fields: 'nextPageToken,files(id,name,modifiedTime)',
+          supportsAllDrives: true, includeItemsFromAllDrives: true,
+        });
+        rows.push(...(page.data.files || [])); pageToken = page.data.nextPageToken;
+      } while (pageToken);
+      const valid = [];
+      for (const file of rows) {
+        if (!/^bankroll-recovery-.*\\.json$/i.test(file.name || '')) continue;
+        try {
+          const response = await drive.files.get({ fileId: file.id, alt: 'media' }, { responseType: 'stream' });
+          const chunks = []; for await (const chunk of response.data) chunks.push(Buffer.from(chunk));
+          const manifest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (manifest.format === 'bankroll-drive-layout-v2' && Array.isArray(manifest.databaseFiles) && Array.isArray(manifest.vaultFiles)) valid.push({ file, manifest });
+        } catch (error) { console.warn('Skipping unreadable Drive generation ' + file.name + ': ' + error.message); }
+      }
+      valid.sort((a, b) => new Date(b.manifest.createdAt || b.file.modifiedTime || 0) - new Date(a.manifest.createdAt || a.file.modifiedTime || 0));
+      if (!valid.length) return interaction.editReply('No valid Bankroll v2 recovery generations were found in BACKUPS.');
+      const output = valid.slice(0, 12).map(({ file, manifest }) =>
+        '**' + file.name + '**\\nID: ' + file.id + ' · ' + new Date(manifest.createdAt || file.modifiedTime).toISOString() + ' · ' +
+        (manifest.databaseFiles.length + manifest.vaultFiles.length) + ' files');
+      return interaction.editReply('**Verified Drive recovery generations** (newest first)\\n\\n' + output.join('\\n\\n').slice(0, 1850) +
+        '\\n\\nUse /drive rollback with the exact ID and confirmation ROLLBACK. A fresh safety backup is created first.');
+    } catch (error) { return interaction.editReply('Could not list Drive generations: ' + short(error.message, 800)); }
   }
   if (sub === 'backup') {
     await interaction.editReply('Starting an immediate Bankroll backup to Discord and Google Drive…'); const result = await backupData();
