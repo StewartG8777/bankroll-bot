@@ -139,7 +139,8 @@ async function main(){
   if(rebased){
     // Path normalization is itself a persistent change: commit its generation
     // before enabling Stripe, Monzo or any Discord command handlers.
-    await store.snapshot({allowInitialize:false});
+    const committed=await store.snapshot({allowInitialize:false});
+    result.generation=committed.generation;
     console.log('[PrimaryBoot] Rebased and committed',rebased,'verified stored file paths.');
   }
   console.log('[PrimaryBoot] Verified Drive generation',result.generation,'restored files:',result.restored,'isolated stale:',result.quarantined.length);

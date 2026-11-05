@@ -45,6 +45,8 @@ async function main() {
     return;
   }
   // Local lock prevents concurrent OFFLINE rollback tools; it cannot stop the live bot.
+  if(fs.existsSync(path.join(dataDir,'.drive-primary-writer.lock')))
+    throw Error('A primary writer lock exists. Stop all live Bankroll processes and verify they have exited before rollback.');
   const lockPath=path.join(dataDir,'.drive-maintenance.lock'),lock=fs.openSync(lockPath,'wx',0o600);
   try{
     const result=await verifiedOfflineRollback({

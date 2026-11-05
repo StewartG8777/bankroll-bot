@@ -30,7 +30,15 @@ function planPathRebase({dataDir,manifest}){
       if(!node||typeof node!=='object')return;
       if(seen.has(node))return;seen.add(node);
       if(typeof node.path==='string'&&!/^https?:\/\//i.test(node.path)){
-        const rel=relativeStoragePath(node.path,verified);
+        let rel;
+        try { rel=relativeStoragePath(node.path,verified); }
+        catch(error){
+          // Expired or already-used download links are history, not active
+          // deliverables. Their deleted local bytes need not block recovery.
+          if(name==='downloads.json' &&
+             (node.used===true || node.backupDownload===true && Number(node.expiresAt||0)<Date.now())) return;
+          throw error;
+        }
         const expected=path.join(root,...rel.split('/'));
         if(!fs.statSync(expected).isFile())throw Error('Expected verified local file missing: '+rel);
         if(path.resolve(node.path)!==path.resolve(expected)){

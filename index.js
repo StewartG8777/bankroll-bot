@@ -1423,7 +1423,7 @@ async function backupDataOnce() {
   // before attempting the optional Discord mirror so a missing channel cannot
   // prevent Google Drive recovery points from being created.
   if (googleDriveIsConnected()) {
-    const snapshotNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json', 'stripe_balance_history.json', 'stripe_balance_snapshots.json'];
+    const snapshotNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json', 'stripe_ledger.json', 'stripe_balance_history.json', 'stripe_balance_snapshots.json'];
     const snapshotFiles = [];
     for (const name of snapshotNames) {
       try {
@@ -1441,7 +1441,7 @@ async function backupDataOnce() {
   }
 
   try {
-    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json', 'stripe_balance_history.json', 'stripe_balance_snapshots.json'];
+    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json', 'stripe_ledger.json', 'stripe_balance_history.json', 'stripe_balance_snapshots.json'];
     const files = [];
     for (const name of jsonNames) {
       const fp = path.join(DATA_DIR, name);
