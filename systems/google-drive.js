@@ -1,5 +1,5 @@
 'use strict';
-// Extracted from the current main branch; preserves v2 encryption and legacy v1 recovery.
+// Split from current main; preserves v2 OAuth encryption and legacy v1 recovery.
 module.exports = function createGoogleDriveSystem(deps) {
 const { fs, path, crypto, Buffer, Readable, Transform, pipeline, fetch, DATA_DIR, DATA_DIR_STATUS, DELIVERIES_FILE, DOWNLOADS_FILE, DOWNLOAD_HISTORY_FILE, NOTIFICATIONS_FILE, PRESENCE_FILE, SEND_JOBS_FILE, VAULT_FILE, WIPED_CUSTOMERS_FILE, GOOGLE_AUTH_BACKUP_NAME, GOOGLE_OAUTH_FILE, GOOGLE_TOKEN_FILE, GOOGLE_DRIVE_CONTENT_FOLDER_NAMES, GOOGLE_DRIVE_FOLDER_NAMES, GOOGLE_DRIVE_ROOT_NAME, PUBLIC_URL, client, atomicWrite, resolveBackupChannel, relData, sha256FileCached, safeBackupRel, googleDriveFolderForDatabaseFile, isManagedContentAddressedBackup } = deps;
 function googleAuthBackupKey({ legacy = false } = {}) {
