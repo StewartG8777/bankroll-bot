@@ -22,6 +22,7 @@ const GOOGLE_DRIVE_CONTENT_FOLDER_NAMES = Object.freeze([
 const PAYMENT_RECORD_FILES = new Set([
   'monzo_payments.json',
   'monzo_review.json',
+  'stripe_ledger.json',
   'stripe_balance_history.json',
   'stripe_balance_snapshots.json',
   'webhook_events.json',
