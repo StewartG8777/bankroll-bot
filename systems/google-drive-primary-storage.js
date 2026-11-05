@@ -237,6 +237,46 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     }
     return rows.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
   }
+
+  // Verify the selected immutable manifest AND every referenced byte before any
+  // maintenance operation is allowed to promote it as the current generation.
+  async function verifyGeneration(generation) {
+    const matches = (await listGenerations()).filter(item => item.generation === String(generation));
+    if (matches.length !== 1) throw new Error(matches.length ? 'Ambiguous recovery generation.' : 'Recovery generation not found.');
+    const selected = matches[0];
+    const response = await drive.files.get({ fileId: selected.manifestId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' });
+    const chunks = [];
+    for await (const chunk of response.data) chunks.push(Buffer.from(chunk));
+    const bytes = Buffer.concat(chunks);
+    const manifest = JSON.parse(bytes.toString('utf8'));
+    if (manifest.format !== FORMAT || manifest.generation !== selected.generation || !Array.isArray(manifest.files) || manifest.files.length === 0) throw new Error('Recovery manifest is malformed.');
+    const seen = new Set();
+    const verifyDir = path.join(path.resolve(dataDir), '.drive-maintenance-' + crypto.randomUUID());
+    try {
+      for (const entry of manifest.files) {
+        if (!isAllowedRelativePath(entry.path) || seen.has(entry.path)) throw new Error('Unsafe or duplicate recovery path: ' + entry.path);
+        seen.add(entry.path);
+        await downloadObject(entry, path.join(verifyDir, entry.path));
+      }
+    } finally {
+      await fs.promises.rm(verifyDir, { recursive: true, force: true }).catch(() => {});
+    }
+    return { generation: manifest.generation, manifestId: selected.manifestId, createdAt: manifest.createdAt, files: manifest.files.length, sha256: sha256(bytes) };
+  }
+
+  // Pointer promotion is deliberately a separate, explicit step after a verified
+  // offline restore. A failure never silently changes which generation is current.
+  async function promoteGeneration(generation) {
+    return serial(async () => {
+      const verified = await verifyGeneration(generation);
+      const pointer = Buffer.from(JSON.stringify({
+        format: FORMAT, manifestId: verified.manifestId, generation: verified.generation,
+        createdAt: verified.createdAt, sha256: verified.sha256,
+      }, null, 2));
+      await publishCurrentPointer(pointer);
+      return verified;
+    });
+  }
   async function restoreGeneration(generation, { beforeApply = async () => {} } = {}) {
     return serial(async () => {
       const matches = (await listGenerations()).filter((item) => item.generation === String(generation));
@@ -246,15 +286,18 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
       const manifestChunks = [];
       for await (const chunk of manifestResponse.data) manifestChunks.push(Buffer.from(chunk));
       const manifest = JSON.parse(Buffer.concat(manifestChunks).toString('utf8'));
-      if (!manifest || manifest.format !== FORMAT || manifest.generation !== selected.generation || !Array.isArray(manifest.files)) {
+      if (!manifest || manifest.format !== FORMAT || manifest.generation !== selected.generation || !Array.isArray(manifest.files) || !manifest.files.length) {
         throw new Error('Selected rollback manifest is invalid.');
       }
       const root = path.resolve(dataDir);
       const staging = path.join(root, '.drive-rollback-' + crypto.randomUUID());
       const prepared = [];
+      const seen = new Set();
       try {
         for (const entry of manifest.files) {
           const relative = safeRelativePath(entry.path);
+          if (seen.has(relative)) throw new Error('Rollback manifest contains duplicate paths.');
+          seen.add(relative);
           const destination = relative && path.resolve(root, relative);
           if (!relative || !isAllowedRelativePath(relative) || !destination.startsWith(root + path.sep)) throw new Error('Rollback manifest contains an unsafe path.');
           const staged = path.join(staging, relative);
@@ -279,6 +322,6 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     const { pointer, manifest } = await readCurrentManifest();
     return { connected: true, generation: pointer.generation, createdAt: manifest.createdAt, files: manifest.files.length };
   }
-  return { snapshot: (options) => serial(() => snapshot(options)), restore, restoreGeneration, listGenerations, status };
+  return { snapshot: (options) => serial(() => snapshot(options)), restore, restoreGeneration, verifyGeneration, promoteGeneration, listGenerations, status };
 }
 module.exports = { FORMAT, createGoogleDrivePrimaryStorage, safeRelativePath, isAllowedRelativePath, walkFiles };
