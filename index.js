@@ -3068,6 +3068,12 @@ const onReady = async () => {
     }
   } catch (e) { console.error('Restart-loop check failed:', e.message); }
   await autoRestoreOnStartup();
+  try {
+    const hydrated = await hydrateNonPaymentCacheFromDrive();
+    console.log('Direct Drive cache hydration:', hydrated.restored, 'restored,', hydrated.skipped, 'skipped');
+  } catch (error) {
+    console.error('Direct Drive cache hydration failed; local and recovery copies were left intact:', error.message);
+  }
   // Always establish a fresh recovery point after startup restore. Previously a
   // quiet bot could restart and never create a new snapshot until another save.
   void backupData();
@@ -7446,6 +7452,41 @@ async function uploadNonPaymentFileToDrive(localPath) {
   const folders = await resolveGoogleDriveFolders(drive);
   const store = createDriveObjectStore({ drive, folders });
   return store.put(relative, fs.createReadStream(localPath));
+}
+
+// Restore missing non-payment cache objects from the direct Drive store.
+// This runs before the bot starts serving requests, and never modifies payments.
+async function hydrateNonPaymentCacheFromDrive() {
+  if (!googleDriveIsConnected()) return { restored: 0, skipped: 0 };
+  const { google } = require('googleapis');
+  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const folders = await resolveGoogleDriveFolders(drive);
+  const store = createDriveObjectStore({ drive, folders });
+  const candidates = new Set();
+  for (const entry of Object.values(vault || {})) if (entry?.path) candidates.add(entry.path);
+  for (const entry of [...Object.values(deliveries || {}), ...Object.values(downloads || {})]) {
+    if (entry?.path && !entry.backupDownload) candidates.add(entry.path);
+  }
+  let restored = 0, skipped = 0;
+  for (const filePath of candidates) {
+    const relative = relData(filePath);
+    if (!relative || !/^(vault|files|deliveries)\//.test(relative)) { skipped++; continue; }
+    if (fs.existsSync(filePath)) { skipped++; continue; }
+    const object = await store.get(relative);
+    if (!object) { skipped++; continue; }
+    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+    const temp = filePath + '.drive-cache-' + crypto.randomBytes(6).toString('hex');
+    try {
+      await pipeline(object.stream, fs.createWriteStream(temp, { flags: 'wx' }));
+      await fs.promises.rename(temp, filePath);
+      restored++;
+    } catch (error) {
+      await fs.promises.unlink(temp).catch(() => {});
+      throw error;
+    }
+  }
+  return { restored, skipped };
 }
 
 async function backupToGoogleDrive(databaseFiles, storedPaths) {
