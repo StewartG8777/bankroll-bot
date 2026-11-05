@@ -12,7 +12,11 @@ const { pipeline } = require('node:stream/promises');
 const { Transform, Readable } = require('node:stream');
 
 const FORMAT = 'bankroll-primary-snapshot-v1';
-const MAX_FILE_BYTES = 150 * 1024 * 1024;
+// Stream large vault and delivery files instead of buffering them into RAM.
+const MAX_FILE_BYTES = (() => {
+  const limit=Number(process.env.BANKROLL_PRIMARY_MAX_FILE_BYTES || 10 * 1024 ** 3);
+  return Number.isSafeInteger(limit)&&limit>0?limit:10*1024**3;
+})();
 const EXCLUDED_DIRS = new Set(['tmp', 'backups', 'node_modules']);
 const EXCLUDED_FILES = new Set(['google-oauth.json', 'google-drive-token.json', '.env']);
 
@@ -44,7 +48,7 @@ async function walkFiles(root, current = root, out = []) {
     if (entry.isDirectory()) await walkFiles(root, absolute, out);
     else if (entry.isFile()) {
       const stat = await fs.promises.stat(absolute);
-      if (stat.size > MAX_FILE_BYTES) throw new Error('File exceeds the 150 MiB Google Drive snapshot limit: ' + rel);
+      if (stat.size > MAX_FILE_BYTES) throw new Error('File exceeds the configured Google Drive primary snapshot size limit: ' + rel);
       out.push({ absolute, relative: rel, size: stat.size });
     }
   }
@@ -75,6 +79,32 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     if (!response.data?.id) throw new Error('Google Drive did not return an uploaded file ID for ' + name);
     return response.data.id;
   };
+  async function hashFile(filePath) {
+    const digest = crypto.createHash('sha256');
+    let bytes=0;
+    for await (const chunk of fs.createReadStream(filePath)) {
+      bytes+=chunk.length;digest.update(chunk);
+    }
+    return {sha256:digest.digest('hex'),size:bytes};
+  }
+  async function uploadVerifiedFile(folderId,name,localPath,expected) {
+    const digest=crypto.createHash('sha256');
+    let bytes=0;
+    const meter=new Transform({transform(chunk,enc,callback){
+      bytes+=chunk.length;digest.update(chunk);callback(null,chunk);
+    }});
+    const source=fs.createReadStream(localPath);
+    source.on('error',error=>meter.destroy(error));
+    const response=await drive.files.create({
+      requestBody:{name,parents:[folderId],
+        appProperties:{bankrollPrimary:'true',sha256:expected.sha256}},
+      media:{mimeType:'application/octet-stream',body:source.pipe(meter)},
+      fields:'id,name,size',supportsAllDrives:true
+    });
+    if(!response.data?.id || bytes!==expected.size || digest.digest('hex')!==expected.sha256)
+      throw new Error('Source file changed while streaming a Drive snapshot: '+localPath);
+    return response.data.id;
+  }
   const downloadObject = async (entry, stagingPath) => {
     if (!entry?.fileId || !/^[a-f0-9]{64}$/i.test(String(entry.sha256 || '')) ||
         !Number.isSafeInteger(Number(entry.size)) || Number(entry.size) < 0) {
@@ -113,16 +143,16 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     if (!files.length) throw new Error('Refusing to create an empty Bankroll snapshot.');
     const entries = [];
     for (const file of files) {
-      const buffer = await fs.promises.readFile(file.absolute);
-      const digest = sha256(buffer);
+      const stat=await hashFile(file.absolute);
+      if (stat.size!==file.size) throw new Error('Local file changed while preparing snapshot: '+file.relative);
       const targetFolder = file.relative.startsWith('vault/') ? 'VAULT' : file.relative.startsWith('files/') ? 'CUSTOMER DELIVERIES' : googleDriveFolderForDatabaseFile(path.basename(file.relative));
       const folderId = folderIds[targetFolder];
       if (!folderId) throw new Error('Missing existing BANKROLL/' + targetFolder + ' folder ID');
-      const objectName = digest + '_' + path.basename(file.relative).replace(/[^\w.-]/g, '_');
+      const objectName = stat.sha256 + '_' + path.basename(file.relative).replace(/[^\w.-]/g, '_');
       const old = previousFiles.get(file.relative);
-      const fileId = old && old.sha256 === digest && Number(old.size) === buffer.length
-        ? old.fileId : await uploadObject(folderId, objectName, buffer);
-      entries.push({ path: file.relative, fileId, size: buffer.length, sha256: digest });
+      const fileId = old && old.sha256 === stat.sha256 && Number(old.size) === stat.size
+        ? old.fileId : await uploadVerifiedFile(folderId, objectName, file.absolute, stat);
+      entries.push({ path: file.relative, fileId, size: stat.size, sha256: stat.sha256 });
     }
     const manifest = {
       format: FORMAT,
