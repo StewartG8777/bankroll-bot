@@ -30,7 +30,7 @@ function isAllowedRelativePath(rel) {
   const safe = safeRelativePath(rel);
   if (!safe) return false;
   const parts = safe.split('/');
-  if (parts.some((part) => EXCLUDED_DIRS.has(part.toLowerCase()) || /^\.drive-(?:restore|rollback|maintenance)/i.test(part))) return false;
+  if (parts.some((part) => EXCLUDED_DIRS.has(part.toLowerCase()) || /^\.drive-(?:restore|rollback|maintenance|cache-quarantine|primary-writer)/i.test(part))) return false;
   if (EXCLUDED_FILES.has(parts[parts.length - 1].toLowerCase())) return false;
   return true;
 }
