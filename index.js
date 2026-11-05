@@ -2278,6 +2278,7 @@ const driveCmd = common(new SlashCommandBuilder().setName('drive').setDescriptio
   .addSubcommand((sub) => sub.setName('connect').setDescription('Connect the Google account used for backups'))
   .addSubcommand((sub) => sub.setName('setup').setDescription('Create and verify the complete BANKROLL folder structure'))
   .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive connection and backup status'))
+  .addSubcommand((sub) => sub.setName('selftest').setDescription('Run safe Drive diagnostics and attach a TXT report'))
   .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate Discord and Google Drive backup'))
   .addSubcommand((sub) => sub.setName('snapshot').setDescription('Create a verified primary-storage generation (owner only)'))
   .addSubcommand((sub) => sub.setName('generations').setDescription('List verified Drive snapshot generations (owner only)'))
@@ -7701,6 +7702,27 @@ async function createDriveGenerationStore(drive) {
 async function cmdDrive(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage Google Drive backups.');
   const sub = interaction.options.getSubcommand();
+  if (sub === 'selftest') {
+    try {
+      if (!googleDriveIsConnected()) return interaction.editReply('Google Drive is not connected. Run /drive connect first.');
+      const { google } = require('googleapis');
+      const auth = makeGoogleOAuthClient();
+      const drive = google.drive({ version: 'v3', auth });
+      const folders = await resolveGoogleDriveFolders(drive);
+      const folderIds = Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map(name => [name, folders[name]?.id]));
+      const { runDriveSelftest } = require('./systems/drive-selftest');
+      const result = await runDriveSelftest({ drive, folderIds, primaryContext: PRIMARY_CONTEXT });
+      const passed = result.results.filter(item => item.status === 'PASS').length;
+      const failed = result.results.filter(item => item.status === 'FAIL').length;
+      const untested = result.results.filter(item => item.status === 'NOT RUN' || item.status === 'SKIP').length;
+      return interaction.editReply({content: 'BANKROLL Drive self-test: ' + passed + ' passed, ' + failed + ' failed, ' + untested + ' skipped/not run.\\n' +
+        (failed ? 'FAIL — inspect attached report.' : 'Diagnostics passed; production readiness NOT certified.') +
+        '\\nReal payment and restart integration tests were not run.', files: [result.attachment]});
+    } catch (error) {
+      console.error('[DriveSelftest] Diagnostic failed:', error);
+      return interaction.editReply('Drive self-test could not complete: ' + String(error.message || error).slice(0, 350));
+    }
+  }
   if (sub === 'connect') {
     const redirectUri = googleRedirectUri();
     const oauth = makeGoogleOAuthClient();
