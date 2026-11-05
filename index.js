@@ -9219,9 +9219,28 @@ app.get('/bankroll-log-copy/:token', (req, res) => {
   fs.createReadStream(c.path).on('error', () => res.destroy()).pipe(res);
 });
 
-app.get('/bankroll-backup-file/:token', (req, res) => {
+app.get('/bankroll-backup-file/:token', async (req, res) => {
   const fp = dataFilePaths().find((f) => backupToken(relData(f)) === req.params.token);
-  if (!fp || !fs.existsSync(fp)) return res.status(404).send('Not found');
+  if (!fp) return res.status(404).send('Not found');
+  if (!fs.existsSync(fp)) {
+    try {
+      const relative = relData(fp);
+      if (!relative || !googleDriveIsConnected()) return res.status(404).send('Not found');
+      const { google } = require('googleapis');
+      const { createDriveObjectStore } = require('./systems/drive-object-store');
+      const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+      const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+      const object = await store.get(relative);
+      if (!object) return res.status(404).send('Not found');
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(fp))}`);
+      object.stream.on('error', () => res.destroy()).pipe(res);
+      return;
+    } catch (error) {
+      console.error('Drive backup-file stream failed:', error.message);
+      return res.status(503).send('File temporarily unavailable');
+    }
+  }
   const ua = req.headers['user-agent'] || '';
   if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) return res.status(200).send('Backup file');
   res.setHeader('Content-Type', 'application/octet-stream');
