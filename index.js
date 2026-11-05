@@ -1453,6 +1453,22 @@ async function backupDataOnce() {
   if (!restoreDone) throw new Error('Startup recovery has not finished; backup will retry in 5 minutes.');
   flushSaves(); // make sure the files on disk are current before they are read below
   lastBackupRunAt = Date.now();
+  // Drive snapshots are independent of Discord channel availability. Commit them
+  // before attempting the optional Discord mirror so a missing channel cannot
+  // prevent Google Drive recovery points from being created.
+  if (googleDriveIsConnected()) {
+    const snapshotNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json', 'stripe_balance_history.json', 'stripe_balance_snapshots.json'];
+    const snapshotFiles = [];
+    for (const name of snapshotNames) {
+      try {
+        const buffer = fs.readFileSync(path.join(DATA_DIR, name));
+        if (buffer.length) snapshotFiles.push({ name, buffer });
+      } catch {}
+    }
+    if (!snapshotFiles.length) throw new Error('No database files available for Google Drive backup.');
+    const driveResult = await backupToGoogleDrive(snapshotFiles, dataFilePaths());
+    console.log('Independent Google Drive backup completed:', driveResult.uploaded, 'changed file(s).');
+  }
   const ch = await resolveBackupChannel();
   if (!ch) {
     throw new Error('Backup channel not found. Set BACKUP_CHANNEL_ID or create #bankroll-backup.');
@@ -1582,12 +1598,6 @@ async function backupDataOnce() {
       } catch (attachmentError) {
         throw new Error(`Discord attachment backup failed for ${rel}: ${attachmentError.message}`);
       }
-    }
-
-    // Mirror the database snapshot and stored vault/order files to Google Drive as an independent copy.
-    if (googleDriveIsConnected()) {
-      const driveResult = await backupToGoogleDrive(files, dataFilePaths());
-      console.log('Google Drive mirror checked; ' + driveResult.uploaded + ' changed file(s) uploaded.');
     }
 
     // A run is successful even when nothing changed and no new Discord message
