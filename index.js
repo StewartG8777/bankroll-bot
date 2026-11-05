@@ -2215,6 +2215,7 @@ const fileCmd = common(new SlashCommandBuilder().setName('file').setDescription(
 const backupCmd = common(new SlashCommandBuilder().setName('backup').setDescription('Run and inspect Bankroll backups (owner only)')
   .addSubcommand((sub) => sub.setName('run').setDescription('Run an immediate Discord and Google Drive backup'))
   .addSubcommand((sub) => sub.setName('status').setDescription('Inspect backup health, schedule and recovery sources')));
+const massBackupCmd = common(new SlashCommandBuilder().setName('massbackup').setDescription('Export all Bankroll data and stored files into a downloadable archive (owner only)'));
 const recoveryCmd = common(new SlashCommandBuilder().setName('recovery').setDescription('Inspect and restore missing Bankroll data from Google Drive (owner only)')
   .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive recovery point and connection'))
   .addSubcommand((sub) => sub.setName('restore').setDescription('Restore missing/empty database and vault files from Drive without overwriting existing files')));
@@ -2481,7 +2482,7 @@ function previousCommandSchemaMismatch(published, desired) {
   });
 }
 
-const commands = [logsCmd, settingsCmd, ordersCmd, fileCmd, backupCmd, recoveryCmd, systemCmd, performanceCmd, storageCmd, driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
+const commands = [logsCmd, settingsCmd, ordersCmd, fileCmd, backupCmd, massBackupCmd, recoveryCmd, systemCmd, performanceCmd, storageCmd, driveCmd, driveCredentialsCmd, sendCmd, spamCmd, stopSpamCmd, deleteBotMessageCmd, bankrollCmd, bankrollBalanceCmd, bankrollPayoutCmd, bankrollCashlogsCmd, bankrollRecoverCmd, monzoCmd, monzoReviewCmd, testCmd, vaultCmd, sendfileCmd, downloadsCmd, deliveryCmd, cancelCmd, remindCmd, unpaidCmd, statusCmd, restoreCmd, notificationsCmd, currencyCmd, paymentsCmd, totalCmd, customerCmd, historyCmd, refundCmd, setupCmd, previewCmd, exportCmd, botAdminCmd, wipeCmd];
 
 // Re-uses the result of an async lookup for a short time (and shares one in-flight request). Failed lookups
 // are never cached.
@@ -7693,6 +7694,45 @@ async function cmdBackupManagement(interaction) {
   return interaction.editReply('✅ Discord backup completed' + (googleDriveIsConnected() ? ' and Google Drive mirror completed.' : '. Google Drive is not connected, so only Discord has a recovery copy.'));
 }
 
+
+async function cmdMassBackup(interaction) {
+  if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can export a full data archive.');
+  if (!restoreDone) return interaction.editReply('Startup recovery is still running. Wait until /backup status reports recovery complete, then run /massbackup again.');
+  await interaction.editReply('Building a complete Bankroll data export. Credentials and secret keys are deliberately excluded.');
+  let archivePath = null;
+  try {
+    await flushSaves();
+    const zip = new AdmZip(), entries = [], skippedSecrets = [];
+    const secretName = /(^\.env|oauth|credential|secret|token|private[-_]?key|service[-_]?account)/i;
+    const excludedDirs = new Set(['node_modules','.git','tmp','temp']);
+    const root = path.resolve(DATA_DIR);
+    function walk(dir) {
+      for (const item of fs.readdirSync(dir,{withFileTypes:true})) {
+        const full=path.join(dir,item.name), rel=path.relative(root,full).split(path.sep).join('/');
+        if(item.isSymbolicLink())continue;
+        if(item.isDirectory()){if(!excludedDirs.has(item.name.toLowerCase()))walk(full);continue;}
+        if(!item.isFile())continue;
+        if(secretName.test(item.name)||/^bankroll-massbackup/i.test(item.name)){skippedSecrets.push(rel);continue;}
+        const bytes=fs.readFileSync(full);
+        entries.push({path:rel,size:bytes.length,sha256:crypto.createHash('sha256').update(bytes).digest('hex')});
+        zip.addFile('bankroll-data/'+rel,bytes);
+      }
+    }
+    walk(root);
+    if(!entries.length)throw new Error('The data directory contained no exportable files.');
+    const manifest={format:'bankroll-massbackup-v1',createdAt:new Date().toISOString(),dataDirectory:DATA_DIR_STATUS,fileCount:entries.length,totalBytes:entries.reduce((sum,x)=>sum+x.size,0),files:entries,excludedSecretFiles:skippedSecrets,note:'Credential and secret files are intentionally excluded. SHA-256 hashes allow every exported file to be verified.'};
+    zip.addFile('bankroll-massbackup-manifest.json',Buffer.from(JSON.stringify(manifest,null,2)));
+    archivePath=path.join(os.tmpdir(),'bankroll-massbackup-'+Date.now()+'.zip');zip.writeZip(archivePath);
+    const archive=fs.readFileSync(archivePath),partBytes=20*1024*1024,totalParts=Math.ceil(archive.length/partBytes),parts=[];
+    for(let offset=0;offset<archive.length;offset+=partBytes){const n=Math.floor(offset/partBytes)+1;parts.push(new AttachmentBuilder(archive.subarray(offset,Math.min(offset+partBytes,archive.length)),{name:totalParts===1?'bankroll-massbackup.zip':'bankroll-massbackup.zip.part'+String(n).padStart(3,'0')}));}
+    const summary='✅ Mass backup archive created. **'+entries.length+' files**, '+(manifest.totalBytes/1024/1024).toFixed(2)+' MiB of source data; ZIP size **'+(archive.length/1024/1024).toFixed(2)+' MiB**. Every included file has a SHA-256 entry in the manifest.'+(skippedSecrets.length?'\n🔒 Excluded '+skippedSecrets.length+' credential/secret file(s) for security.':'')+(totalParts>1?'\nThe ZIP is split into '+totalParts+' parts; download every part and concatenate in numeric order.':'')+'\nThis export does not delete or alter live data.';
+    await interaction.editReply({content:summary,files:parts.slice(0,10)});
+    for(let offset=10;offset<parts.length;offset+=10)await interaction.followUp({content:'Mass backup archive parts '+(offset+1)+'–'+Math.min(offset+10,totalParts)+' of '+totalParts+'.',files:parts.slice(offset,offset+10),ephemeral:true});
+    console.log('Mass backup export created: '+entries.length+' files, '+archive.length+' bytes.');
+  }catch(error){console.error('Mass backup export failed:',error.stack||error);await interaction.editReply('❌ Mass backup export failed: '+short(error.message||error,900)+'. No live data was deleted.');}
+  finally{if(archivePath)await fs.promises.unlink(archivePath).catch(()=>{});}
+}
+
 async function cmdRecovery(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can run recovery.');
   const sub = interaction.options.getSubcommand();
@@ -7900,6 +7940,9 @@ client.on('interactionCreate', async (interaction) => {
       case 'backup':
         await interaction.deferReply({ ephemeral: true });
         return await cmdBackupManagement(interaction);
+      case 'massbackup':
+        await interaction.deferReply({ ephemeral: true });
+        return await cmdMassBackup(interaction);
       case 'recovery':
         await interaction.deferReply({ ephemeral: true });
         return await cmdRecovery(interaction);
