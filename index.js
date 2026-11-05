@@ -7785,20 +7785,15 @@ async function cmdMassBackup(interaction) {
     const output = fs.createWriteStream(archivePath);
     let compressedBytes = 0;
     zip.outputStream.on('data', chunk => { compressedBytes += chunk.length; });
-    zip.outputStream.on('error', error => output.destroy(error));
-    output.on('error', error => console.error('Mass backup ZIP stream failed:', error));
-    zip.outputStream.pipe(output);
-    const writeFinished = new Promise((resolve, reject) => {
-      output.once('finish', resolve);
-      output.once('error', reject);
-    });
+    const writeFinished = pipeline(zip.outputStream, output);
     zip.end();
     setProgress(66, 'Compressing ZIP', 'Writing archive… ' + (compressedBytes / 1024 / 1024).toFixed(2) + ' MiB written.');
-    progressTimer && clearInterval(progressTimer);
+    if (progressTimer) clearInterval(progressTimer);
     progressTimer = setInterval(() => {
-      const estimatedTotal = Math.max(totalBytes * 1.05 + entries.length * 256, 1);
-      const compressionPct = Math.min(94, 66 + (compressedBytes / estimatedTotal) * 28);
-      setProgress(compressionPct, 'Compressing ZIP', (compressedBytes / 1024 / 1024).toFixed(2) + ' MiB written; ' + entries.length + ' files included.');
+      // ZIP compression is not linear. Show actual bytes and hold at 90% until stream completion.
+      const estimatedTotal = Math.max(totalBytes + entries.length * 256, 1);
+      const compressionPct = Math.min(90, 66 + (compressedBytes / estimatedTotal) * 24);
+      setProgress(compressionPct, 'Compressing ZIP', (compressedBytes / 1024 / 1024).toFixed(2) + ' MiB written; ' + entries.length + ' files included. The bar completes when the ZIP stream closes.');
       updateProgress().catch(() => {});
     }, 1800);
     await writeFinished;
