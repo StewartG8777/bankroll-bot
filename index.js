@@ -479,22 +479,27 @@ function atomicWrite(file, data) {
   // local atomic commit. Payment and credential files are deliberately excluded.
   queueNonPaymentDatabaseSync(file);
 }
-const pendingDriveDatabaseSyncs = new Map();
-const failedDriveDatabaseSyncs = new Map();
+const { createDriveCommitQueue } = require('./systems/drive-commit-queue');
+const driveDatabaseQueue = createDriveCommitQueue({
+  write: async (relative, snapshot) => {
+    if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected');
+    const { google } = require('googleapis');
+    const { createDriveObjectStore } = require('./systems/drive-object-store');
+    const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+    const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+    await store.put(relative, snapshot, { mimeType: 'application/json' });
+  },
+  onFailure: (relative, error) => console.error('Google Drive database commit failed:', relative, error.message),
+});
+const pendingDriveDatabaseSyncs = driveDatabaseQueue.pending;
+const failedDriveDatabaseSyncs = driveDatabaseQueue.failed;
 async function flushDriveDatabaseSyncs() {
   if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected; non-payment database commits cannot be verified.');
-  // Re-queue the latest local snapshot of any previously failed write.
   for (const relative of [...failedDriveDatabaseSyncs.keys()]) {
     const file = path.join(DATA_DIR, relative);
     if (fs.existsSync(file)) queueNonPaymentDatabaseSync(file);
   }
-  while (pendingDriveDatabaseSyncs.size) {
-    const batch = [...pendingDriveDatabaseSyncs.values()];
-    await Promise.all(batch);
-  }
-  if (failedDriveDatabaseSyncs.size) {
-    throw new Error('Google Drive has uncommitted database writes: ' + [...failedDriveDatabaseSyncs.keys()].join(', '));
-  }
+  await driveDatabaseQueue.flush();
 }
 const DRIVE_DATABASE_EXCLUSIONS = new Set([
   'monzo_payments.json', 'monzo_review.json',
@@ -504,65 +509,35 @@ const DRIVE_DATABASE_EXCLUSIONS = new Set([
 ]);
 // Await this for operations which must not acknowledge a database change
 // until Google Drive has committed it. Local files remain compatibility caches.
+function eligibleDriveDatabase(file) {
+  const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
+  return /^[a-z0-9_.-]+\\.json$/i.test(relative) && !DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase()) ? relative : null;
+}
 async function commitNonPaymentDatabaseToDrive(file, value) {
   if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected');
-  const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
-  if (!/^[a-z0-9_.-]+\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) {
-    throw new Error('This file is not an eligible non-payment database');
-  }
+  const relative = eligibleDriveDatabase(file);
+  if (!relative) throw new Error('This file is not an eligible non-payment database');
   const snapshot = Buffer.from(JSON.stringify(value));
-  const previous = pendingDriveDatabaseSyncs.get(relative) || Promise.resolve();
-  const next = previous.catch(() => {}).then(async () => {
-    const { google } = require('googleapis');
-    const { createDriveObjectStore } = require('./systems/drive-object-store');
-    const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
-    const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
-    await store.put(relative, snapshot);
-    failedDriveDatabaseSyncs.delete(relative);
-    // A concurrent local save may have produced a newer state while the Drive
-    // request was in flight. Do not overwrite that state with this older snapshot.
-    try {
-      const current = await fs.promises.readFile(file).catch(error => {
-        if (error.code === 'ENOENT') return null;
-        throw error;
-      });
-      if (current === null) {
-        require('./systems/atomic-storage').atomicWriteFile(file, snapshot);
-      }
-    } catch (error) {
-      console.error('Drive commit succeeded but local cache validation failed:', relative, error.message);
-    }
+  await driveDatabaseQueue.enqueue(relative, snapshot);
+  // Google Drive is committed before the local compatibility cache is updated.
+  // Never overwrite a newer local save with an older in-flight snapshot.
+  const current = await fs.promises.readFile(file).catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
   });
-  pendingDriveDatabaseSyncs.set(relative, next);
-  try { await next; } finally {
-    if (pendingDriveDatabaseSyncs.get(relative) === next) pendingDriveDatabaseSyncs.delete(relative);
-  }
+  if (current === null) require('./systems/atomic-storage').atomicWriteFile(file, snapshot);
 }
 function queueNonPaymentDatabaseSync(file) {
-  if (!restoreDone || !googleDriveIsConnected()) return;
-  const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
-  if (!/^[a-z0-9_.-]+\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) return;
+  if (!restoreDone) return;
+  const relative = eligibleDriveDatabase(file);
+  if (!relative) return;
   const snapshot = Buffer.from(fs.readFileSync(file));
-  const previous = pendingDriveDatabaseSyncs.get(relative) || Promise.resolve();
-  const next = previous.catch(() => {}).then(async () => {
-    const { google } = require('googleapis');
-    const { createDriveObjectStore } = require('./systems/drive-object-store');
-    const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
-    const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
-    await store.put(relative, snapshot, { mimeType: 'application/json' });
-    failedDriveDatabaseSyncs.delete(relative);
-  });
-  pendingDriveDatabaseSyncs.set(relative, next);
-  next.catch(error => {
-    failedDriveDatabaseSyncs.set(relative, error.message);
+  void driveDatabaseQueue.enqueue(relative, snapshot).catch(error => {
     console.error('Google Drive database sync failed for', relative, error.message);
-    // Keep the local cache and retry: never discard an unconfirmed write.
     const retry = setTimeout(() => {
       if (fs.existsSync(file) && googleDriveIsConnected()) queueNonPaymentDatabaseSync(file);
     }, 60 * 1000);
     retry.unref?.();
-  }).finally(() => {
-    if (pendingDriveDatabaseSyncs.get(relative) === next) pendingDriveDatabaseSyncs.delete(relative);
   });
 }
 
