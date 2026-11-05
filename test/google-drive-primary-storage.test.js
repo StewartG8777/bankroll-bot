@@ -42,3 +42,8 @@ test('walkFiles includes data files but excludes temporary and OAuth files', asy
     await fs.promises.rm(root, { recursive: true, force: true });
   }
 });
+
+test('snapshot excludes staging directories but permits business logs', () => {
+  assert.equal(isAllowedRelativePath('.drive-rollback-123/orders.json'),false);
+  assert.equal(isAllowedRelativePath('logs/metrics.json'),true);
+});

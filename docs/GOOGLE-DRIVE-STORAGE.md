@@ -1,45 +1,9 @@
-# Google Drive primary-storage migration
+# Google Drive primary-storage work (PR #6)
 
-## Safety checkpoint
+This branch is rebased onto the current bot without replacing live payment logic, changing `node index.js`, or altering the existing BANKROLL folder layout. The new snapshot engine is **not activated in production**.
 
-Before any rollout, keep the protected branch
-\`backup/bankroll-before-drive-storage-2026-11-04\` unchanged. The production
-branch and Render service must not be switched until the migration has passed
-staging verification.
+Folders remain: VAULT, CUSTOMER DELIVERIES, DATABASE, BACKUPS, PAYMENT RECORDS, LOGS, SYSTEM, TEMPORARY PROCESSING.
 
-## Storage engine foundation
+The new engine writes content-addressed data objects to the appropriate existing folder, then immutable manifests and one current pointer under BACKUPS. It performs SHA-256/size checks before restoration. Current Google Drive and Discord backup uploads continue unchanged.
 
-\`systems/google-drive-primary-storage.js\` implements immutable, content-addressed
-Drive snapshots, a single current-generation pointer, SHA-256/size verification,
-safe path validation, and staged restore (all files are downloaded and verified
-before local files are replaced). It excludes OAuth credentials, environment
-files, temporary uploads, logs, and dependency directories.
-
-## Required integration sequence
-
-1. At process bootstrap, establish Google OAuth and resolve the five Bankroll
-   Drive folders before loading any application JSON into memory.
-2. Restore the current Drive generation into a clean staging data directory.
-   Verify every object and the manifest before atomically promoting the staged
-   directory to \`DATA_DIR\`.
-3. Only then import/start the existing application module and enable payment
-   webhooks, Monzo polling, Stripe reconciliation, and Discord commands.
-4. Route every persistent mutation through a serialized durable commit queue.
-   A financial mutation must not be acknowledged until its Drive commit has
-   been confirmed. On Drive outage, fail closed for financial writes rather
-   than silently accepting local-only changes.
-5. Preserve Discord backups as an independent recovery channel. Never delete
-   or overwrite the existing Drive backup layout during migration.
-6. Add an owner-only rollback operation that pins a chosen immutable generation,
-   stages and verifies it, then restores it under a maintenance lock. Keep the
-   previous generation and Discord recovery point until a post-restore health
-   check succeeds.
-
-## Important rollout status
-
-This module is a storage-engine foundation, not yet the live primary-storage
-cutover. The existing \`index.js\` loads many JSON files at module evaluation
-time and performs direct synchronous writes. A correct cutover must move the
-application startup behind the bootstrap barrier and route all persistent
-writes through the durable commit queue. Do not set \`DATA_DIR\` or deploy this
-module alone expecting Drive to become primary.
+**Rollout blocker:** a reliable primary storage cutover requires restoring authoritative data before `index.js` loads it and routing every persistent mutation through a durable serialized queue. The user requested leaving current startup and payment behavior unchanged. Therefore this PR provides opt-in storage infrastructure and tests, **not an enabled primary cutover**. Never set a production primary toggle or assume local state is restart-safe until integration and staging drills pass.

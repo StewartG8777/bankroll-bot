@@ -7,12 +7,13 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { googleDriveFolderForDatabaseFile } = require('./drive-layout');
 const { pipeline } = require('node:stream/promises');
 const { Transform, Readable } = require('node:stream');
 
 const FORMAT = 'bankroll-primary-snapshot-v1';
 const MAX_FILE_BYTES = 150 * 1024 * 1024;
-const EXCLUDED_DIRS = new Set(['tmp', 'logs', 'backups', 'node_modules']);
+const EXCLUDED_DIRS = new Set(['tmp', 'backups', 'node_modules']);
 const EXCLUDED_FILES = new Set(['google-oauth.json', 'google-drive-token.json', '.env']);
 
 function sha256(buffer) {
@@ -29,7 +30,7 @@ function isAllowedRelativePath(rel) {
   const safe = safeRelativePath(rel);
   if (!safe) return false;
   const parts = safe.split('/');
-  if (parts.some((part) => EXCLUDED_DIRS.has(part.toLowerCase()))) return false;
+  if (parts.some((part) => EXCLUDED_DIRS.has(part.toLowerCase()) || /^\.drive-(?:restore|rollback|maintenance)/i.test(part))) return false;
   if (EXCLUDED_FILES.has(parts[parts.length - 1].toLowerCase())) return false;
   return true;
 }
@@ -50,7 +51,7 @@ async function walkFiles(root, current = root, out = []) {
   return out;
 }
 function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, logger = console }) {
-  if (!google || !auth || !dataDir || !folderIds?.DATABASE || !folderIds?.VAULT || !folderIds?.BACKUPS) {
+  if (!google || !auth || !dataDir || !folderIds?.DATABASE || !folderIds?.VAULT || !folderIds?.BACKUPS || !folderIds?.['CUSTOMER DELIVERIES'] || !folderIds?.['PAYMENT RECORDS'] || !folderIds?.LOGS) {
     throw new Error('Google Drive storage requires googleapis, OAuth auth, DATA_DIR, and DATABASE/VAULT/BACKUPS folder IDs.');
   }
   const drive = google.drive({ version: 'v3', auth });
@@ -105,8 +106,9 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     for (const file of files) {
       const buffer = await fs.promises.readFile(file.absolute);
       const digest = sha256(buffer);
-      const folderId = file.relative.startsWith('vault/') || file.relative.startsWith('files/')
-        ? folderIds.VAULT : folderIds.DATABASE;
+      const targetFolder = file.relative.startsWith('vault/') ? 'VAULT' : file.relative.startsWith('files/') ? 'CUSTOMER DELIVERIES' : googleDriveFolderForDatabaseFile(path.basename(file.relative));
+      const folderId = folderIds[targetFolder];
+      if (!folderId) throw new Error('Missing existing BANKROLL/' + targetFolder + ' folder ID');
       const objectName = digest + '_' + path.basename(file.relative).replace(/[^\w.-]/g, '_');
       const fileId = await uploadObject(folderId, objectName, buffer);
       entries.push({ path: file.relative, fileId, size: buffer.length, sha256: digest });
@@ -156,7 +158,7 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     const found = await drive.files.list({ q, pageSize: 10, fields: 'files(id)', supportsAllDrives: true, includeItemsFromAllDrives: true });
     const pointers = found.data.files || [];
     if (pointers.length !== 1) throw new Error(pointers.length ? 'Multiple current snapshot pointers exist.' : 'No current primary snapshot pointer exists.');
-    const pointerResponse = await drive.files.get({ fileId: pointers[0].id, alt: 'media', supportsAllDrives: true });
+    const pointerResponse = await drive.files.get({ fileId: pointers[0].id, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' });
     const pointerChunks = [];
     for await (const chunk of pointerResponse.data) pointerChunks.push(Buffer.from(chunk));
     const pointerBuffer = Buffer.concat(pointerChunks);
@@ -164,7 +166,7 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     if (pointer.format !== FORMAT || !pointer.manifestId || !/^[a-f0-9]{64}$/i.test(String(pointer.sha256 || ''))) {
       throw new Error('Current Drive snapshot pointer is invalid or unsupported.');
     }
-    const manifestResponse = await drive.files.get({ fileId: pointer.manifestId, alt: 'media', supportsAllDrives: true });
+    const manifestResponse = await drive.files.get({ fileId: pointer.manifestId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' });
     const manifestChunks = [];
     for await (const chunk of manifestResponse.data) manifestChunks.push(Buffer.from(chunk));
     const manifestBuffer = Buffer.concat(manifestChunks);
@@ -173,7 +175,10 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     if (manifest.format !== FORMAT || manifest.generation !== pointer.generation || !Array.isArray(manifest.files) || !manifest.files.length) {
       throw new Error('Current Drive snapshot manifest is malformed.');
     }
+    const seen = new Set();
     for (const entry of manifest.files) {
+      if (seen.has(entry.path)) throw new Error('Snapshot has duplicate paths: ' + entry.path);
+      seen.add(entry.path);
       if (!isAllowedRelativePath(entry.path) || !entry.fileId || !/^[a-f0-9]{64}$/i.test(String(entry.sha256 || '')) ||
           !Number.isSafeInteger(Number(entry.size)) || Number(entry.size) < 0) throw new Error('Current Drive snapshot contains an unsafe or invalid file entry.');
     }

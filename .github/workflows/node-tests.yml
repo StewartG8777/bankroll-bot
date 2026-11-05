@@ -1,0 +1,26 @@
+name: Bankroll Node tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      # The repository does not currently commit package-lock.json.
+      # npm ci and setup-node's npm cache both require a lockfile.
+      - name: Install dependencies without a lockfile
+        run: npm install --no-audit --no-fund
+      - name: Syntax check application and modules
+        run: |
+          node --check index.js
+          find systems test -type f -name '*.js' -print0 | xargs -0 -n 1 node --check
+      - name: Run all unit tests
+        run: npm test

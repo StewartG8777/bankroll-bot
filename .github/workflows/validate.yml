@@ -5,7 +5,6 @@ on:
     branches:
       - main
       - upgrade/storage-recovery-performance
-      - feature/google-drive-primary-storage
   pull_request:
     branches:
       - main
@@ -20,9 +19,7 @@ jobs:
           node-version: 22
       - name: Check JavaScript syntax
         run: |
-          node --check bootstrap.js
           node --check index.js
-          node --check systems/google-drive-primary-storage.js
           node --check systems/performance.js
           node --check systems/backup-retention.js
       - name: Run unit tests

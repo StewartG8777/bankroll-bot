@@ -1,0 +1,13 @@
+{
+  "Version": "15.0.0",
+  "Name": "Bankroll Screenshots",
+  "DestinationType": "ImageUploader",
+  "RequestMethod": "POST",
+  "RequestURL": "https://YOUR-BANKROLL-HOST/sharex/upload",
+  "Headers": {
+    "X-ShareX-Token": "YOUR_SHAREX_UPLOAD_TOKEN",
+    "Content-Type": "image/png"
+  },
+  "Body": "Binary",
+  "URL": "$json:url$"
+}
