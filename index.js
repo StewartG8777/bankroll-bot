@@ -7514,13 +7514,8 @@ async function recoverNonPaymentDatabaseFromDrive() {
   ];
   let restored = 0, skipped = 0;
   for (const [name, file, kind, apply] of entries) {
-    let local;
-    try { local = JSON.parse(await fs.promises.readFile(file, 'utf8')); } catch {}
-    if (local && typeof local === 'object' && Object.keys(local).length) {
-      apply(local);
-      skipped++;
-      continue;
-    }
+    // Drive wins on restart, even if an old local cache contains valid JSON.
+    // If Drive has no object, retain the local cache for legacy migration.
     const remote = await store.get(name);
     if (!remote) { skipped++; continue; }
     const chunks = [];
