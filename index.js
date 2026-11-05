@@ -490,7 +490,7 @@ const DRIVE_DATABASE_EXCLUSIONS = new Set([
 function queueNonPaymentDatabaseSync(file) {
   if (!restoreDone || !googleDriveIsConnected()) return;
   const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
-  if (!/^[a-z0-9_.-]+\\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) return;
+  if (!/^[a-z0-9_.-]+\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) return;
   const previous = pendingDriveDatabaseSyncs.get(relative) || Promise.resolve();
   const next = previous.catch(() => {}).then(async () => {
     const { google } = require('googleapis');
