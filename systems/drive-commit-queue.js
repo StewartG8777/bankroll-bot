@@ -12,9 +12,15 @@ function createDriveCommitQueue({ write, onFailure = () => {} }) {
     const previous = pending.get(key) || Promise.resolve();
     const next = previous.catch(() => {}).then(() => write(key, snapshot));
     pending.set(key, next);
-    next.then(() => failed.delete(key), error => {
-      failed.set(key, error);
-      onFailure(key, error);
+    // Only the newest queued operation may update the key's durable status.
+    // An earlier failure must not mark a later successful write as failed.
+    void next.then(() => {
+      if (pending.get(key) === next) failed.delete(key);
+    }, error => {
+      if (pending.get(key) === next) {
+        failed.set(key, error);
+        onFailure(key, error);
+      }
     }).finally(() => {
       if (pending.get(key) === next) pending.delete(key);
     });
