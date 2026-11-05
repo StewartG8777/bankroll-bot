@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - upgrade/storage-recovery-performance
+      - feature/google-drive-primary-storage
   pull_request:
     branches:
       - main
@@ -20,8 +21,13 @@ jobs:
       - name: Check JavaScript syntax
         run: |
           node --check index.js
+          node --check systems/google-drive-primary-storage.js
+          node --check systems/serialized-storage-queue.js
+          node --check systems/verified-drive-rollback.js
           node --check systems/performance.js
           node --check systems/backup-retention.js
+      - name: Install test dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund --package-lock=false
       - name: Run unit tests
         run: node --test
       - name: Check package metadata
