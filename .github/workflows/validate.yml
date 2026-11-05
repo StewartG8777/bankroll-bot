@@ -6,6 +6,7 @@ on:
       - main
       - upgrade/storage-recovery-performance
       - feature/google-drive-primary-storage
+      - feature/drive-authoritative-primary-staging
   pull_request:
     branches:
       - main
@@ -21,6 +22,11 @@ jobs:
       - name: Check JavaScript syntax
         run: |
           node --check index.js
+          node --check primary-bootstrap.js
+          node --check systems/primary-startup.js
+          node --check systems/primary-commit-manager.js
+          node --check systems/primary-storage-context.js
+          node --check systems/primary-ack-guards.js
           node --check systems/google-drive-primary-storage.js
           node --check systems/serialized-storage-queue.js
           node --check systems/verified-drive-rollback.js
