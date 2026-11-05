@@ -14,6 +14,42 @@ const { monitorEventLoopDelay } = require('perf_hooks');
 const os = require('os');
 const { getPerformanceSnapshot } = require('./systems/performance');
 const createGoogleDriveSystem = require('./systems/google-drive');
+const {requirePrimaryContext} = require('./systems/primary-storage-context');
+const {isAllowedRelativePath} = require('./systems/google-drive-primary-storage');
+const PRIMARY_MODE = process.env.BANKROLL_DRIVE_PRIMARY === '1';
+const PRIMARY_CONTEXT = PRIMARY_MODE ? requirePrimaryContext() : null;
+const PRIMARY_MANAGER = PRIMARY_CONTEXT?.manager || null;
+if (PRIMARY_MODE && process.env.BANKROLL_PRIMARY_BOOTSTRAPPED !== '1') {
+  throw new Error('Google Drive primary mode must start through primary-bootstrap.js.');
+}
+function primaryDirty(file) {
+  if (!PRIMARY_MODE) return;
+  const relative = path.relative(PRIMARY_CONTEXT.dir, file).split(path.sep).join('/');
+  if (isAllowedRelativePath(relative)) PRIMARY_MANAGER.markDirty();
+}
+async function primaryDurableBarrier() {
+  if (PRIMARY_MODE) await PRIMARY_MANAGER.flush();
+}
+function protectPrimaryInteraction(interaction) {
+  if (!PRIMARY_MODE) return;
+  for (const method of ['reply', 'editReply', 'followUp', 'update']) {
+    if (typeof interaction[method] !== 'function') continue;
+    const original = interaction[method].bind(interaction);
+    interaction[method] = async (...args) => {
+      try { await primaryDurableBarrier(); }
+      catch (error) {
+        console.error('[PrimaryDrive] Refused Discord success acknowledgment:', error.message);
+        return original({
+          content: 'Storage confirmation failed. This operation is NOT confirmed as durably saved. Contact the bot owner before retrying.',
+          embeds: [], components: [], files: [],
+          ...(method === 'reply' || method === 'followUp' ? { ephemeral: true } : {})
+        });
+      }
+      return original(...args);
+    };
+  }
+}
+
 const { whereFrom } = require('./systems/interaction-location');
 const { createDataPathHelpers } = require('./systems/data-paths');
 const { zipSpawnCodes } = require('./systems/spawn-code-parser');
@@ -425,6 +461,7 @@ function restorePendingDeliveryRetries() {
 function atomicWrite(file, data) {
   // Unique temporary names avoid collisions between independent writers.
   require('./systems/atomic-storage').atomicWriteFile(file, data);
+  primaryDirty(file);
   // Non-payment JSON is asynchronously mirrored to Drive after a successful
   // local atomic commit. Payment and credential files are deliberately excluded.
   queueNonPaymentDatabaseSync(file);
@@ -468,6 +505,12 @@ async function commitNonPaymentDatabaseToDrive(file, value) {
   const relative = eligibleDriveDatabase(file);
   if (!relative) throw new Error('This file is not an eligible non-payment database');
   const snapshot = Buffer.from(JSON.stringify(value));
+  if (PRIMARY_MODE) {
+    require('./systems/atomic-storage').atomicWriteFile(file, snapshot);
+    primaryDirty(file);
+    await primaryDurableBarrier();
+    return;
+  }
   await driveDatabaseQueue.enqueue(relative, snapshot);
   // Google Drive is committed before the local compatibility cache is updated.
   // Never overwrite a newer local save with an older in-flight snapshot.
@@ -546,6 +589,9 @@ let lastBackupRunAt = 0;
 let backupUrgentPending = false;
 function scheduleBackup(urgent = false) {
   if (!restoreDone) return;
+  // Binary vault and customer-delivery operations also schedule a backup.
+  // Queue an authoritative generation for those bytes, not just JSON writes.
+  if (PRIMARY_MODE) PRIMARY_MANAGER.markDirty();
   if (urgent) backupUrgentPending = true;
   else if (backupUrgentPending) return; // an urgent backup is already queued; don't push it back
   clearTimeout(backupTimer);
@@ -570,6 +616,7 @@ function runPendingSave(label) {
   try { entry.writeFn(); } catch (e) { console.error(`Could not save ${label}:`, e.message); }
 }
 function flushSaves() { for (const label of [...pendingSaves.keys()]) runPendingSave(label); }
+if (PRIMARY_MODE) PRIMARY_MANAGER.setFlushLocal(flushSaves);
 
 // SHA-256 of a stored file, recomputed only when its size or modified time changed.
 const fileHashCache = new Map();
@@ -3088,6 +3135,21 @@ const onReady = async () => {
       await alertOwner('Restart loop warning', new Error('The bot has started ' + starts.length + ' times in the last 10 minutes. Check the Render logs for a crash or a failing deploy.'));
     }
   } catch (e) { console.error('Restart-loop check failed:', e.message); }
+  if (PRIMARY_MODE) {
+    // The bootstrap restored and verified the authoritative generation BEFORE
+    // loading index.js. Legacy backup recovery is deliberately disabled here:
+    // it could overwrite valid primary data with an older independent backup.
+    restoreDone = true;
+    recoveryNote = ' Google Drive primary generation verified at bootstrap: ' + PRIMARY_CONTEXT.generation;
+    PRIMARY_MANAGER.activate();
+    try { await primaryDurableBarrier(); }
+    catch (error) {
+      console.error('[PrimaryDrive] Initial durable commit failed; shutting down instead of accepting payments:', error);
+      await client.destroy().catch(() => {});
+      process.exitCode = 1;
+      return;
+    }
+  } else {
   await autoRestoreOnStartup();
   try {
     const recovered = await recoverNonPaymentDatabaseFromDrive();
@@ -3100,6 +3162,7 @@ const onReady = async () => {
     console.log('Direct Drive cache hydration:', hydrated.restored, 'restored,', hydrated.skipped, 'skipped');
   } catch (error) {
     console.error('Direct Drive cache hydration failed; local and recovery copies were left intact:', error.message);
+  }
   }
   // Always establish a fresh recovery point after startup restore. Previously a
   // quiet bot could restart and never create a new snapshot until another save.
@@ -7769,6 +7832,14 @@ async function cmdDriveCredentials(interaction) {
 // ---------- Interaction router ----------
 client.on('interactionCreate', async (interaction) => {
   try {
+    if (PRIMARY_MODE && !PRIMARY_MANAGER.status().active) {
+      if (interaction.isRepliable?.()) await interaction.reply({
+        content: 'Bankroll primary storage is still being verified. Please retry shortly.',
+        ephemeral: true
+      });
+      return;
+    }
+    protectPrimaryInteraction(interaction);
     if (interaction.isMessageContextMenuCommand()) {
       if (!allowed.has(interaction.user.id) || interaction.user.id !== OWNER_ID) {
         return interaction.reply({ content: 'Only the bot owner can delete Bankroll messages.', ephemeral: true });
@@ -8231,6 +8302,38 @@ async function monitorRenderDeployments() {
 }
 // ---------- Render deployment webhook ----------
 const app = express();
+
+// Gate live financial webhooks until Drive startup completes, and delay any 2xx
+// acknowledgment until the latest queued storage generation is confirmed.
+// Stripe and Monzo transaction/business logic remains unchanged.
+app.use((req, res, next) => {
+  if (!PRIMARY_MODE) return next();
+  if (req.method !== 'POST' || !['/webhook', '/monzo-webhook'].includes(req.path)) return next();
+  if (!PRIMARY_MANAGER.status().active) return res.status(503).send('Primary storage not ready; retry webhook.');
+  const originalSend = res.send.bind(res);
+  let responding = false;
+  res.send = (...args) => {
+    if (responding || res.statusCode < 200 || res.statusCode >= 300) return originalSend(...args);
+    responding = true;
+    void primaryDurableBarrier().then(
+      () => originalSend(...args),
+      error => {
+        console.error('[PrimaryDrive] Refused successful payment webhook acknowledgment:', error.message);
+        if (!res.headersSent) {
+          res.status(503);
+          res.removeHeader('Content-Length');
+          res.removeHeader('Content-Type');
+          originalSend('Primary storage unavailable; retry webhook.');
+        } else {
+          res.destroy(error);
+        }
+      }
+    );
+    return res;
+  };
+  next();
+});
+
 
 // ShareX uploads are authenticated with a dedicated secret. ShareX sends the
 // captured image as the raw request body (Content-Type: image/png/jpeg/webp).
