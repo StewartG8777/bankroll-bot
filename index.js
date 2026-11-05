@@ -480,6 +480,22 @@ function atomicWrite(file, data) {
   queueNonPaymentDatabaseSync(file);
 }
 const pendingDriveDatabaseSyncs = new Map();
+const failedDriveDatabaseSyncs = new Map();
+async function flushDriveDatabaseSyncs() {
+  if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected; non-payment database commits cannot be verified.');
+  // Re-queue the latest local snapshot of any previously failed write.
+  for (const relative of [...failedDriveDatabaseSyncs.keys()]) {
+    const file = path.join(DATA_DIR, relative);
+    if (fs.existsSync(file)) queueNonPaymentDatabaseSync(file);
+  }
+  while (pendingDriveDatabaseSyncs.size) {
+    const batch = [...pendingDriveDatabaseSyncs.values()];
+    await Promise.all(batch);
+  }
+  if (failedDriveDatabaseSyncs.size) {
+    throw new Error('Google Drive has uncommitted database writes: ' + [...failedDriveDatabaseSyncs.keys()].join(', '));
+  }
+}
 const DRIVE_DATABASE_EXCLUSIONS = new Set([
   'monzo_payments.json', 'monzo_review.json',
   'stripe_balance_history.json', 'stripe_balance_snapshots.json',
@@ -502,6 +518,7 @@ async function commitNonPaymentDatabaseToDrive(file, value) {
     const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
     const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
     await store.put(relative, snapshot);
+    failedDriveDatabaseSyncs.delete(relative);
     const tmp = file + '.cache-' + crypto.randomBytes(5).toString('hex');
     try {
       await fs.promises.writeFile(tmp, snapshot, { flag: 'wx' });
@@ -528,9 +545,11 @@ function queueNonPaymentDatabaseSync(file) {
     const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
     const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
     await store.put(relative, snapshot, { mimeType: 'application/json' });
+    failedDriveDatabaseSyncs.delete(relative);
   });
   pendingDriveDatabaseSyncs.set(relative, next);
   next.catch(error => {
+    failedDriveDatabaseSyncs.set(relative, error.message);
     console.error('Google Drive database sync failed for', relative, error.message);
     // Keep the local cache and retry: never discard an unconfirmed write.
     const retry = setTimeout(() => {
@@ -1452,6 +1471,7 @@ function safeBackupRel(rel) {
 async function backupDataOnce() {
   if (!restoreDone) throw new Error('Startup recovery has not finished; backup will retry in 5 minutes.');
   flushSaves(); // make sure the files on disk are current before they are read below
+  if (googleDriveIsConnected()) await flushDriveDatabaseSyncs();
   lastBackupRunAt = Date.now();
   // Drive snapshots are independent of Discord channel availability. Commit them
   // before attempting the optional Discord mirror so a missing channel cannot
