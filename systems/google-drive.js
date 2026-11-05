@@ -22,10 +22,22 @@ function decryptGoogleAuthBundle(buffer) {
   if (![1, 2].includes(envelope.version)) throw new Error('Unsupported encrypted Google credential backup version.');
   // Version 1 used the Discord token as a fallback. Keep compatibility while
   // that token remains unchanged; all new bundles use the dedicated stable key.
-  const key = googleAuthBackupKey({ legacy: envelope.version === 1 });
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
-  decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
-  return JSON.parse(Buffer.concat([decipher.update(Buffer.from(envelope.data, 'base64')), decipher.final()]).toString('utf8'));
+  const keys = [googleAuthBackupKey({ legacy: envelope.version === 1 })];
+  // A v1 backup made before BANKROLL_BACKUP_ENCRYPTION_KEY existed may have
+  // used DISCORD_TOKEN. New stable-key config must not make it unreadable.
+  if (envelope.version === 1 && process.env.DISCORD_TOKEN) {
+    const oldKey = crypto.createHash('sha256').update(String(process.env.DISCORD_TOKEN)).digest();
+    if (!keys.some(candidate => candidate.equals(oldKey))) keys.push(oldKey);
+  }
+  let lastError;
+  for (const key of keys) {
+    try {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
+      decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
+      return JSON.parse(Buffer.concat([decipher.update(Buffer.from(envelope.data, 'base64')), decipher.final()]).toString('utf8'));
+    } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error('Could not decrypt Google credentials');
 }
 async function persistGoogleAuthBundle() {
   if (!fs.existsSync(GOOGLE_OAUTH_FILE)) return;

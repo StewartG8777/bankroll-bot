@@ -44,3 +44,24 @@ test('legacy version 1 bundles remain recoverable while original token exists', 
     if(prevDiscord===undefined)delete process.env.DISCORD_TOKEN;else process.env.DISCORD_TOKEN=prevDiscord;
   }
 });
+
+test('legacy version 1 recovery tries the original Discord token even after a stable key is installed', () => {
+  const prevKey=process.env.BANKROLL_BACKUP_ENCRYPTION_KEY;
+  const prevToken=process.env.DISCORD_TOKEN;
+  process.env.BANKROLL_BACKUP_ENCRYPTION_KEY='current-new-stable-key';
+  process.env.DISCORD_TOKEN='historical-valid-discord-token';
+  try {
+    const iv=crypto.randomBytes(12);
+    const oldKey=crypto.createHash('sha256').update(process.env.DISCORD_TOKEN).digest();
+    const cipher=crypto.createCipheriv('aes-256-gcm',oldKey,iv);
+    const bundle={client:{client_id:'historical'},token:{refresh_token:'r'}};
+    const bytes=Buffer.concat([cipher.update(JSON.stringify(bundle)),cipher.final()]);
+    const envelope=Buffer.from(JSON.stringify({version:1,iv:iv.toString('base64'),tag:cipher.getAuthTag().toString('base64'),data:bytes.toString('base64')}));
+    assert.deepEqual(system.decryptGoogleAuthBundle(envelope),bundle);
+  } finally {
+    if(prevKey===undefined)delete process.env.BANKROLL_BACKUP_ENCRYPTION_KEY;
+    else process.env.BANKROLL_BACKUP_ENCRYPTION_KEY=prevKey;
+    if(prevToken===undefined)delete process.env.DISCORD_TOKEN;
+    else process.env.DISCORD_TOKEN=prevToken;
+  }
+});

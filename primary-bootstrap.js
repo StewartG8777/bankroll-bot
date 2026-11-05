@@ -9,7 +9,7 @@ const crypto=require('node:crypto');
 const {Client,GatewayIntentBits}=require('discord.js');
 const {google}=require('googleapis');
 const {atomicWriteFile}=require('./systems/atomic-storage');
-const {createGoogleDriveSystem}=(()=>({createGoogleDriveSystem:require('./systems/google-drive')}))();
+const createGoogleDriveSystem=require('./systems/google-drive');
 const {GOOGLE_DRIVE_ROOT_NAME,GOOGLE_DRIVE_FOLDER_NAMES}=require('./systems/drive-layout');
 const {createGoogleDrivePrimaryStorage}=require('./systems/google-drive-primary-storage');
 const {createPrimaryCommitManager}=require('./systems/primary-commit-manager');
@@ -93,8 +93,9 @@ function oauth(dir) {
   const auth=new google.auth.OAuth2(cfg.client_id,cfg.client_secret,base+'/google/oauth/callback');
   auth.setCredentials(token);
   auth.on('tokens',fresh=>{
-    const merged={...token,...fresh};
-    if(token.refresh_token&&!merged.refresh_token)merged.refresh_token=token.refresh_token;
+    const previous=(()=>{try{return JSON.parse(fs.readFileSync(tokenFile,'utf8'));}catch{return token;}})();
+    const merged={...previous,...fresh};
+    if(previous.refresh_token&&!merged.refresh_token)merged.refresh_token=previous.refresh_token;
     atomicWriteFile(tokenFile,JSON.stringify(merged,null,2));
   });
   return auth;
