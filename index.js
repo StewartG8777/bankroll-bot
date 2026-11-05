@@ -1270,7 +1270,13 @@ async function makeDownloadLink(d, paymentIntentId) {
     multiUse: !!d.multiUse,
     testMode: !!d.testMode,
   };
-  saveDownloads();
+  try {
+    await commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads);
+  } catch (error) {
+    delete downloads[token];
+    await fs.promises.unlink(downloadPath).catch(() => {});
+    throw new Error('Customer download record was not committed to Google Drive: ' + error.message);
+  }
   recordDownloadEvent('link_created', { file: safeName, customerId: d.customerId || OWNER_ID, agentId: d.agentId || OWNER_ID, token, detail: d.multiUse ? 'Public multi-use vault export link; no time expiry.' : 'One-time download link; no time expiry. Link is invalidated after a successful download.' });
   const slug = (d.description || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '') || 'order';
   return `${BASE_URL}/bankroll-${slug}-download/${token}`;
