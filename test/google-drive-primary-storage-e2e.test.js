@@ -127,3 +127,55 @@ test('rollback refuses a corrupt generation without changing current pointer or 
   assert.equal((await store.status()).generation,second.generation);
   assert.equal(JSON.parse(await fs.readFile(path.join(root,'orders.json'),'utf8')).orders,2);
 });
+
+const { preparePrimaryData } = require('../systems/primary-startup');
+const { createPrimaryCommitManager } = require('../systems/primary-commit-manager');
+
+test('cold Render restart restores the confirmed generation before data becomes readable',async(t)=>{
+  const {root,store,drive,items}=await setup(t);
+  const first=await store.snapshot();
+  await fs.rm(path.join(root,'vault','car.bin'));
+  await fs.rm(path.join(root,'orders.json'));
+  const restartedStore=createGoogleDrivePrimaryStorage({
+    google:{drive:()=>drive},auth:{},dataDir:root,folderIds:folders,logger:{info(){},warn(){}}
+  });
+  const restored=await preparePrimaryData({store:restartedStore,dataDir:root,logger:{warn(){}}});
+  assert.equal(restored.generation,first.generation);
+  assert.equal(await fs.readFile(path.join(root,'vault','car.bin'),'utf8'),'original car');
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(root,'orders.json'),'utf8')),{orders:1});
+  assert.ok(items.size>0);
+});
+test('changed data produces new generation while unchanged file blobs are reused',async(t)=>{
+  const {root,store,items}=await setup(t);
+  const first=await store.snapshot();
+  const before=[...items.values()].filter(x=>x.folder!==folders.BACKUPS).length;
+  await fs.writeFile(path.join(root,'orders.json'),JSON.stringify({orders:7}));
+  const second=await store.snapshot({allowInitialize:false});
+  const after=[...items.values()].filter(x=>x.folder!==folders.BACKUPS).length;
+  assert.notEqual(first.generation,second.generation);
+  assert.equal(after-before,1,'only changed orders.json object should upload again');
+});
+test('cold primary recovery fails closed when a referenced Drive file is missing',async(t)=>{
+  const {root,store,items}=await setup(t);
+  await store.snapshot();
+  const lost=[...items.values()].find(x=>x.name.endsWith('_car.bin'));
+  items.delete(lost.id);
+  await fs.writeFile(path.join(root,'orders.json'),'{"orders":999}');
+  await assert.rejects(preparePrimaryData({store,dataDir:root}),/Drive file not found/);
+  assert.equal(await fs.readFile(path.join(root,'orders.json'),'utf8'),'{"orders":999}');
+});
+test('commit manager and recovery together preserve last confirmed JSON state',async(t)=>{
+  const {root,store,drive}=await setup(t);
+  await store.snapshot();
+  const manager=createPrimaryCommitManager({store,onError:()=>{}});
+  manager.activate();
+  await fs.writeFile(path.join(root,'orders.json'),JSON.stringify({orders:12}));
+  manager.markDirty();
+  await manager.flush();
+  await fs.writeFile(path.join(root,'orders.json'),JSON.stringify({orders:999}));
+  const restartedStore=createGoogleDrivePrimaryStorage({
+    google:{drive:()=>drive},auth:{},dataDir:root,folderIds:folders,logger:{info(){},warn(){}}
+  });
+  await preparePrimaryData({store:restartedStore,dataDir:root,logger:{warn(){}}});
+  assert.equal(JSON.parse(await fs.readFile(path.join(root,'orders.json'),'utf8')).orders,12);
+});

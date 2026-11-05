@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const { googleDriveFolderForDatabaseFile } = require('./drive-layout');
 
 const PAYMENT_FILES = new Set([
-  'monzo_payments.json', 'monzo_review.json', 'stripe_balance_history.json',
+  'monzo_payments.json', 'monzo_review.json', 'stripe_ledger.json', 'stripe_balance_history.json',
   'stripe_balance_snapshots.json', 'webhook_events.json',
 ]);
 function destinationFor(relativePath) {

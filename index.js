@@ -14,6 +14,23 @@ const { monitorEventLoopDelay } = require('perf_hooks');
 const os = require('os');
 const { getPerformanceSnapshot } = require('./systems/performance');
 const createGoogleDriveSystem = require('./systems/google-drive');
+const {requirePrimaryContext} = require('./systems/primary-storage-context');
+const {protectInteractionDurability,primaryWebhookGate}=require('./systems/primary-ack-guards');
+const {isAllowedRelativePath} = require('./systems/google-drive-primary-storage');
+const PRIMARY_MODE = process.env.BANKROLL_DRIVE_PRIMARY === '1';
+const PRIMARY_CONTEXT = PRIMARY_MODE ? requirePrimaryContext() : null;
+const PRIMARY_MANAGER = PRIMARY_CONTEXT?.manager || null;
+if (PRIMARY_MODE && process.env.BANKROLL_PRIMARY_BOOTSTRAPPED !== '1') {
+  throw new Error('Google Drive primary mode must start through primary-bootstrap.js.');
+}
+function primaryDirty(file) {
+  if (!PRIMARY_MODE) return;
+  const relative = path.relative(PRIMARY_CONTEXT.dir, file).split(path.sep).join('/');
+  if (isAllowedRelativePath(relative)) PRIMARY_MANAGER.markDirty();
+}
+async function primaryDurableBarrier() {
+  if (PRIMARY_MODE) await PRIMARY_MANAGER.flush();
+}
 const { whereFrom } = require('./systems/interaction-location');
 const { createDataPathHelpers } = require('./systems/data-paths');
 const { zipSpawnCodes } = require('./systems/spawn-code-parser');
@@ -425,6 +442,7 @@ function restorePendingDeliveryRetries() {
 function atomicWrite(file, data) {
   // Unique temporary names avoid collisions between independent writers.
   require('./systems/atomic-storage').atomicWriteFile(file, data);
+  primaryDirty(file);
   // Non-payment JSON is asynchronously mirrored to Drive after a successful
   // local atomic commit. Payment and credential files are deliberately excluded.
   queueNonPaymentDatabaseSync(file);
@@ -468,6 +486,12 @@ async function commitNonPaymentDatabaseToDrive(file, value) {
   const relative = eligibleDriveDatabase(file);
   if (!relative) throw new Error('This file is not an eligible non-payment database');
   const snapshot = Buffer.from(JSON.stringify(value));
+  if (PRIMARY_MODE) {
+    require('./systems/atomic-storage').atomicWriteFile(file, snapshot);
+    primaryDirty(file);
+    await primaryDurableBarrier();
+    return;
+  }
   await driveDatabaseQueue.enqueue(relative, snapshot);
   // Google Drive is committed before the local compatibility cache is updated.
   // Never overwrite a newer local save with an older in-flight snapshot.
@@ -546,6 +570,9 @@ let lastBackupRunAt = 0;
 let backupUrgentPending = false;
 function scheduleBackup(urgent = false) {
   if (!restoreDone) return;
+  // Binary vault and customer-delivery operations also schedule a backup.
+  // Queue an authoritative generation for those bytes, not just JSON writes.
+  if (PRIMARY_MODE) PRIMARY_MANAGER.markDirty();
   if (urgent) backupUrgentPending = true;
   else if (backupUrgentPending) return; // an urgent backup is already queued; don't push it back
   clearTimeout(backupTimer);
@@ -570,6 +597,7 @@ function runPendingSave(label) {
   try { entry.writeFn(); } catch (e) { console.error(`Could not save ${label}:`, e.message); }
 }
 function flushSaves() { for (const label of [...pendingSaves.keys()]) runPendingSave(label); }
+if (PRIMARY_MODE) PRIMARY_MANAGER.setFlushLocal(flushSaves);
 
 // SHA-256 of a stored file, recomputed only when its size or modified time changed.
 const fileHashCache = new Map();
@@ -1395,7 +1423,7 @@ async function backupDataOnce() {
   // before attempting the optional Discord mirror so a missing channel cannot
   // prevent Google Drive recovery points from being created.
   if (googleDriveIsConnected()) {
-    const snapshotNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json', 'stripe_balance_history.json', 'stripe_balance_snapshots.json'];
+    const snapshotNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json', 'stripe_ledger.json', 'stripe_balance_history.json', 'stripe_balance_snapshots.json'];
     const snapshotFiles = [];
     for (const name of snapshotNames) {
       try {
@@ -1413,7 +1441,7 @@ async function backupDataOnce() {
   }
 
   try {
-    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json', 'stripe_balance_history.json', 'stripe_balance_snapshots.json'];
+    const jsonNames = ['deliveries.json', 'downloads.json', 'download_history.json', 'vault.json', 'monzo_payments.json', 'monzo_review.json', 'notifications.json', 'scheduled_sends.json', 'webhook_events.json', 'presence.json', 'wiped_customers.json', 'stripe_ledger.json', 'stripe_balance_history.json', 'stripe_balance_snapshots.json'];
     const files = [];
     for (const name of jsonNames) {
       const fp = path.join(DATA_DIR, name);
@@ -2250,6 +2278,7 @@ const driveCmd = common(new SlashCommandBuilder().setName('drive').setDescriptio
   .addSubcommand((sub) => sub.setName('connect').setDescription('Connect the Google account used for backups'))
   .addSubcommand((sub) => sub.setName('setup').setDescription('Create and verify the complete BANKROLL folder structure'))
   .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive connection and backup status'))
+  .addSubcommand((sub) => sub.setName('selftest').setDescription('Run safe Drive diagnostics and attach a TXT report'))
   .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate Discord and Google Drive backup'))
   .addSubcommand((sub) => sub.setName('snapshot').setDescription('Create a verified primary-storage generation (owner only)'))
   .addSubcommand((sub) => sub.setName('generations').setDescription('List verified Drive snapshot generations (owner only)'))
@@ -3088,6 +3117,21 @@ const onReady = async () => {
       await alertOwner('Restart loop warning', new Error('The bot has started ' + starts.length + ' times in the last 10 minutes. Check the Render logs for a crash or a failing deploy.'));
     }
   } catch (e) { console.error('Restart-loop check failed:', e.message); }
+  if (PRIMARY_MODE) {
+    // The bootstrap restored and verified the authoritative generation BEFORE
+    // loading index.js. Legacy backup recovery is deliberately disabled here:
+    // it could overwrite valid primary data with an older independent backup.
+    restoreDone = true;
+    recoveryNote = ' Google Drive primary generation verified at bootstrap: ' + PRIMARY_CONTEXT.generation;
+    PRIMARY_MANAGER.activate();
+    try { await primaryDurableBarrier(); }
+    catch (error) {
+      console.error('[PrimaryDrive] Initial durable commit failed; shutting down instead of accepting payments:', error);
+      await client.destroy().catch(() => {});
+      process.exitCode = 1;
+      return;
+    }
+  } else {
   await autoRestoreOnStartup();
   try {
     const recovered = await recoverNonPaymentDatabaseFromDrive();
@@ -3100,6 +3144,7 @@ const onReady = async () => {
     console.log('Direct Drive cache hydration:', hydrated.restored, 'restored,', hydrated.skipped, 'skipped');
   } catch (error) {
     console.error('Direct Drive cache hydration failed; local and recovery copies were left intact:', error.message);
+  }
   }
   // Always establish a fresh recovery point after startup restore. Previously a
   // quiet bot could restart and never create a new snapshot until another save.
@@ -7657,6 +7702,27 @@ async function createDriveGenerationStore(drive) {
 async function cmdDrive(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage Google Drive backups.');
   const sub = interaction.options.getSubcommand();
+  if (sub === 'selftest') {
+    try {
+      if (!googleDriveIsConnected()) return interaction.editReply('Google Drive is not connected. Run /drive connect first.');
+      const { google } = require('googleapis');
+      const auth = makeGoogleOAuthClient();
+      const drive = google.drive({ version: 'v3', auth });
+      const folders = await resolveGoogleDriveFolders(drive);
+      const folderIds = Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map(name => [name, folders[name]?.id]));
+      const { runDriveSelftest } = require('./systems/drive-selftest');
+      const result = await runDriveSelftest({ drive, folderIds, primaryContext: PRIMARY_CONTEXT });
+      const passed = result.results.filter(item => item.status === 'PASS').length;
+      const failed = result.results.filter(item => item.status === 'FAIL').length;
+      const untested = result.results.filter(item => item.status === 'NOT RUN' || item.status === 'SKIP').length;
+      return interaction.editReply({content: 'BANKROLL Drive self-test: ' + passed + ' passed, ' + failed + ' failed, ' + untested + ' skipped/not run.\\n' +
+        (failed ? 'FAIL — inspect attached report.' : 'Diagnostics passed; production readiness NOT certified.') +
+        '\\nReal payment and restart integration tests were not run.', files: [result.attachment]});
+    } catch (error) {
+      console.error('[DriveSelftest] Diagnostic failed:', error);
+      return interaction.editReply('Drive self-test could not complete: ' + String(error.message || error).slice(0, 350));
+    }
+  }
   if (sub === 'connect') {
     const redirectUri = googleRedirectUri();
     const oauth = makeGoogleOAuthClient();
@@ -7769,6 +7835,14 @@ async function cmdDriveCredentials(interaction) {
 // ---------- Interaction router ----------
 client.on('interactionCreate', async (interaction) => {
   try {
+    if (PRIMARY_MODE && !PRIMARY_MANAGER.status().active) {
+      if (interaction.isRepliable?.()) await interaction.reply({
+        content: 'Bankroll primary storage is still being verified. Please retry shortly.',
+        ephemeral: true
+      });
+      return;
+    }
+    if (PRIMARY_MODE) protectInteractionDurability(interaction,PRIMARY_MANAGER);
     if (interaction.isMessageContextMenuCommand()) {
       if (!allowed.has(interaction.user.id) || interaction.user.id !== OWNER_ID) {
         return interaction.reply({ content: 'Only the bot owner can delete Bankroll messages.', ephemeral: true });
@@ -8231,6 +8305,9 @@ async function monitorRenderDeployments() {
 }
 // ---------- Render deployment webhook ----------
 const app = express();
+
+// Do not acknowledge payments before the authoritative generation is saved.
+if (PRIMARY_MODE) app.use(primaryWebhookGate(PRIMARY_MANAGER));
 
 // ShareX uploads are authenticated with a dedicated secret. ShareX sends the
 // captured image as the raw request body (Content-Type: image/png/jpeg/webp).
