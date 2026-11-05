@@ -63,3 +63,8 @@ multi-instance deployment must remain prohibited.
 
 Do NOT copy this staging startup command or set primary mode on the live
 Render service until all of these conditions are validated.
+
+During verified Drive-first startup, stored vault/download/delivery path references
+are rebased from an old Render DATA_DIR only if their relative file paths are
+present in the verified primary manifest. Unknown paths block startup. Any
+successful rebase is committed as a new Drive generation before handlers load.
