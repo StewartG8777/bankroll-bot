@@ -7805,8 +7805,26 @@ async function cmdMassBackup(interaction) {
     const uploadLimit = interaction.guild?.maximumUploadLimit || 25 * 1024 * 1024;
     if (archiveBytes > uploadLimit) {
       const size = (archiveBytes / 1024 / 1024).toFixed(2), limit = (uploadLimit / 1024 / 1024).toFixed(2);
+      if (!googleDriveIsConnected()) {
+        await stopProgress();
+        return await interaction.editReply('❌ The ZIP is ' + size + ' MiB, but this server allows uploads up to ' + limit + ' MiB. Google Drive is not connected, so Bankroll cannot create a download link. Connect Drive, then run /massbackup again.');
+      }
+      setProgress(96, 'Uploading ZIP to Google Drive', size + ' MiB; saving a private copy in the BACKUPS folder…');
+      await updateProgress();
+      const { google } = require('googleapis');
+      const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+      const folders = await resolveGoogleDriveFolders(drive);
+      const driveUpload = await drive.files.create({
+        requestBody: { name: 'bankroll-massbackup-' + new Date().toISOString().replace(/[:.]/g, '-') + '.zip', parents: [folders.BACKUPS.id], description: 'Bankroll mass backup ZIP with SHA-256 manifest. Uploaded by the owner-only /massbackup command.' },
+        media: { mimeType: 'application/zip', body: fs.createReadStream(archivePath) },
+        fields: 'id,name,webViewLink,size',
+        supportsAllDrives: true
+      });
+      const driveFile = driveUpload.data;
+      if (!driveFile?.id) throw new Error('Google Drive accepted no file ID for the mass backup upload.');
+      const driveLink = driveFile.webViewLink || ('https://drive.google.com/file/d/' + driveFile.id + '/view');
       await stopProgress();
-      return await interaction.editReply('❌ The ZIP is ' + size + ' MiB, but this server allows uploads up to ' + limit + ' MiB. No split files were created, so the export was not posted. Increase the server upload limit or reduce the export size, then try again.');
+      return await interaction.editReply('✅ **Mass backup uploaded to Google Drive** — ' + entries.length + ' files, ' + size + ' MiB ZIP.\n**Download / open:** ' + driveLink + '\nSaved privately in your **BACKUPS** folder. Only people already authorised to your Google Drive can access it; no public sharing permission was enabled.');
     }
     // Stream the ZIP from disk into Discord instead of loading the whole archive into RAM.
     const attachment = new AttachmentBuilder(fs.createReadStream(archivePath), { name: 'bankroll-massbackup.zip' });
