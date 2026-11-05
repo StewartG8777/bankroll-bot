@@ -7368,21 +7368,28 @@ async function handleBankrollPayoutButton(interaction) {
 const GOOGLE_OAUTH_FILE = path.join(DATA_DIR, 'google-oauth.json');
 const GOOGLE_TOKEN_FILE = path.join(DATA_DIR, 'google-drive-token.json');
 const GOOGLE_AUTH_BACKUP_NAME = 'google-drive-auth.enc';
-function googleAuthBackupKey() {
-  const secret = process.env.BANKROLL_BACKUP_ENCRYPTION_KEY || process.env.DISCORD_TOKEN;
-  if (!secret) throw new Error('Set BANKROLL_BACKUP_ENCRYPTION_KEY in Render to enable encrypted Google credential recovery.');
+function googleAuthBackupKey({ legacy = false } = {}) {
+  // Discord tokens rotate. They must never be the long-term encryption key for
+  // credentials that are expected to survive a bot-token rotation.
+  const secret = legacy
+    ? (process.env.BANKROLL_BACKUP_ENCRYPTION_KEY || process.env.DISCORD_TOKEN)
+    : process.env.BANKROLL_BACKUP_ENCRYPTION_KEY;
+  if (!secret) throw new Error('Set a stable BANKROLL_BACKUP_ENCRYPTION_KEY in Render before saving Google credentials. Do not use DISCORD_TOKEN: it changes when the bot token is rotated.');
   return crypto.createHash('sha256').update(String(secret)).digest();
 }
 function encryptGoogleAuthBundle(bundle) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', googleAuthBackupKey(), iv);
   const encrypted = Buffer.concat([cipher.update(JSON.stringify(bundle), 'utf8'), cipher.final()]);
-  return Buffer.from(JSON.stringify({ version: 1, iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), data: encrypted.toString('base64') }), 'utf8');
+  return Buffer.from(JSON.stringify({ version: 2, iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), data: encrypted.toString('base64') }), 'utf8');
 }
 function decryptGoogleAuthBundle(buffer) {
   const envelope = JSON.parse(buffer.toString('utf8'));
-  if (envelope.version !== 1) throw new Error('Unsupported encrypted Google credential backup version.');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', googleAuthBackupKey(), Buffer.from(envelope.iv, 'base64'));
+  if (![1, 2].includes(envelope.version)) throw new Error('Unsupported encrypted Google credential backup version.');
+  // Version 1 used the Discord token as a fallback. Keep compatibility while
+  // that token remains unchanged; all new bundles use the dedicated stable key.
+  const key = googleAuthBackupKey({ legacy: envelope.version === 1 });
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
   decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
   return JSON.parse(Buffer.concat([decipher.update(Buffer.from(envelope.data, 'base64')), decipher.final()]).toString('utf8'));
 }
@@ -8440,6 +8447,9 @@ async function cmdDriveCredentials(interaction) {
       redirect_uris: [callback]
     } };
   }
+  // Validate the stable recovery key before writing anything. Discord tokens rotate and
+  // cannot safely protect long-lived OAuth credentials.
+  googleAuthBackupKey();
   // Never trust the uploaded filename: Bankroll always stores it under the fixed standard name.
   const destination = path.join(DATA_DIR, 'google-oauth.json');
   atomicWrite(destination, JSON.stringify(parsed, null, 2));
