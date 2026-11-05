@@ -7,7 +7,7 @@ function createIntegrityMeter({ maxBytes = Number.MAX_SAFE_INTEGER } = {}) {
   const meter = new Transform({
     transform(chunk, _encoding, callback) {
       bytes += chunk.length;
-      if (bytes > maxBytes) return callback(new Error('STREAM_SIZE_LIMIT'));
+      if (bytes > maxBytes) return callback(new Error('TOO_BIG'));
       hash.update(chunk);
       callback(null, chunk);
     }
