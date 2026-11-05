@@ -473,9 +473,8 @@ function restorePendingDeliveryRetries() {
 
 // Write to a temp file then rename, so a crash mid-write can never leave a half-written data file.
 function atomicWrite(file, data) {
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, file);
+  // Unique temporary names avoid collisions between independent writers.
+  require('./systems/atomic-storage').atomicWriteFile(file, data);
   // Non-payment JSON is asynchronously mirrored to Drive after a successful
   // local atomic commit. Payment and credential files are deliberately excluded.
   queueNonPaymentDatabaseSync(file);
