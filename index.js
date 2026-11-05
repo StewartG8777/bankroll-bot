@@ -15,6 +15,12 @@ const os = require('os');
 const { getPerformanceSnapshot } = require('./systems/performance');
 const { isManagedContentAddressedBackup } = require('./systems/backup-retention');
 const {
+  GOOGLE_DRIVE_ROOT_NAME,
+  GOOGLE_DRIVE_FOLDER_NAMES,
+  GOOGLE_DRIVE_CONTENT_FOLDER_NAMES,
+  googleDriveFolderForDatabaseFile,
+} = require('./systems/drive-layout');
+const {
   Client,
   GatewayIntentBits,
   Partials,
@@ -2225,6 +2231,7 @@ const storageCmd = common(new SlashCommandBuilder().setName('storage').setDescri
 
 const driveCmd = common(new SlashCommandBuilder().setName('drive').setDescription('Connect and manage Google Drive backups (owner only)')
   .addSubcommand((sub) => sub.setName('connect').setDescription('Connect the Google account used for backups'))
+  .addSubcommand((sub) => sub.setName('setup').setDescription('Create and verify the complete BANKROLL folder structure'))
   .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive connection and backup status'))
   .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate Discord and Google Drive backup')));
 
@@ -7249,7 +7256,6 @@ async function handleBankrollPayoutButton(interaction) {
 // ---------- Google Drive OAuth + durable backup mirror ----------
 const GOOGLE_OAUTH_FILE = path.join(DATA_DIR, 'google-oauth.json');
 const GOOGLE_TOKEN_FILE = path.join(DATA_DIR, 'google-drive-token.json');
-const GOOGLE_DRIVE_FOLDER_NAMES = ['BACKUPS', 'DATABASE', 'LOGS', 'SYSTEM', 'VAULT'];
 const GOOGLE_AUTH_BACKUP_NAME = 'google-drive-auth.enc';
 function googleAuthBackupKey() {
   const secret = process.env.BANKROLL_BACKUP_ENCRYPTION_KEY || process.env.DISCORD_TOKEN;
@@ -7320,24 +7326,101 @@ function makeGoogleOAuthClient() {
 }
 function googleDriveIsConnected() { try { const t = JSON.parse(fs.readFileSync(GOOGLE_TOKEN_FILE, 'utf8')); return !!(t.refresh_token || t.access_token); } catch { return false; } }
 
-// Resolve the five existing folders by name; never write to a stale hard-coded folder ID.
-async function resolveGoogleDriveFolders(drive) {
-  const folders = {};
-  for (const name of GOOGLE_DRIVE_FOLDER_NAMES) {
-    const response = await drive.files.list({
-      q: "name = '" + name + "' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-      pageSize: 100, fields: 'files(id,name,mimeType,capabilities(canAddChildren,canEdit))',
+// Resolve the BANKROLL root and its eight direct child folders. Legacy top-level
+// folders are moved into BANKROLL only when they are unique and on the same Drive.
+async function listGoogleDriveFolders(drive, name, parentId = null) {
+  const escaped = String(name).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  let q = "name = '" + escaped + "' and mimeType = 'application/vnd.google-apps.folder' and trashed = false";
+  if (parentId) q = "'" + parentId + "' in parents and " + q;
+  const matches = []; let pageToken;
+  do {
+    const page = await drive.files.list({
+      q, pageSize: 1000, pageToken,
+      fields: 'nextPageToken,files(id,name,mimeType,parents,driveId,capabilities(canAddChildren,canEdit))',
       supportsAllDrives: true, includeItemsFromAllDrives: true,
     });
-    const matches = response.data.files || [];
-    if (!matches.length) throw new Error('Google Drive folder "' + name + '" was not found. Make sure it exists and is shared with the connected Google account.');
-    if (matches.length > 1) throw new Error('More than one Google Drive folder is named "' + name + '". Rename duplicates so Bankroll can safely select the correct folder.');
-    const folder = matches[0];
-    if (folder.capabilities?.canAddChildren === false) throw new Error('The connected Google account cannot add files to "' + name + '". Share that folder with the OAuth account as Editor.');
+    matches.push(...(page.data.files || []));
+    pageToken = page.data.nextPageToken;
+  } while (pageToken);
+  return matches;
+}
+
+async function resolveGoogleDriveFolders(drive) {
+  const rootMatches = await listGoogleDriveFolders(drive, GOOGLE_DRIVE_ROOT_NAME);
+  if (rootMatches.length > 1) {
+    throw new Error('More than one BANKROLL root folder is visible to the connected Google account. Keep one BANKROLL folder or remove the duplicate from this account before continuing; Bankroll will not guess which one is correct.');
+  }
+  let root = rootMatches[0] || null;
+  if (!root) {
+    const created = await drive.files.create({
+      requestBody: { name: GOOGLE_DRIVE_ROOT_NAME, mimeType: 'application/vnd.google-apps.folder' },
+      fields: 'id,name,mimeType,parents,driveId,capabilities(canAddChildren,canEdit)',
+      supportsAllDrives: true,
+    });
+    root = created.data;
+    console.log('Created Google Drive root folder: BANKROLL');
+  }
+  if (!root?.id) throw new Error('Google Drive did not return an ID for the BANKROLL root folder.');
+  if (root.capabilities?.canAddChildren === false) {
+    throw new Error('The connected Google account cannot add folders or files inside BANKROLL. Give the OAuth account Editor access to the BANKROLL folder.');
+  }
+
+  let myDriveRootId = null;
+  try {
+    const rootInfo = await drive.files.get({ fileId: 'root', fields: 'id,driveId' });
+    myDriveRootId = rootInfo.data?.id || null;
+  } catch (error) {
+    console.warn('Could not inspect the My Drive root for legacy folder migration:', error.message);
+  }
+
+  const folders = { ROOT: root };
+  for (const name of GOOGLE_DRIVE_FOLDER_NAMES) {
+    const directMatches = await listGoogleDriveFolders(drive, name, root.id);
+    if (directMatches.length > 1) {
+      throw new Error('BANKROLL contains more than one "' + name + '" folder. Rename or remove the duplicate inside BANKROLL; no data has been moved.');
+    }
+    let folder = directMatches[0] || null;
+
+    // Adopt an old top-level Bankroll folder where it is unambiguous. This keeps
+    // existing files and Drive IDs intact while placing the folder under BANKROLL.
+    if (!folder && myDriveRootId) {
+      const legacyMatches = await listGoogleDriveFolders(drive, name, myDriveRootId);
+      if (legacyMatches.length > 1) {
+        throw new Error('More than one top-level "' + name + '" folder exists. Bankroll cannot safely choose which one to move into BANKROLL.');
+      }
+      const legacy = legacyMatches[0] || null;
+      const sameDrive = legacy && (legacy.driveId || null) === (root.driveId || null);
+      if (legacy && sameDrive) {
+        const moved = await drive.files.update({
+          fileId: legacy.id,
+          addParents: root.id,
+          removeParents: myDriveRootId,
+          fields: 'id,name,mimeType,parents,driveId,capabilities(canAddChildren,canEdit)',
+          supportsAllDrives: true,
+        });
+        folder = moved.data;
+        console.log('Moved legacy Google Drive folder into BANKROLL: ' + name);
+      }
+    }
+
+    if (!folder) {
+      const created = await drive.files.create({
+        requestBody: { name, mimeType: 'application/vnd.google-apps.folder', parents: [root.id] },
+        fields: 'id,name,mimeType,parents,driveId,capabilities(canAddChildren,canEdit)',
+        supportsAllDrives: true,
+      });
+      folder = created.data;
+      console.log('Created BANKROLL/' + name);
+    }
+    if (!folder?.id) throw new Error('Google Drive did not return an ID for BANKROLL/' + name + '.');
+    if (folder.capabilities?.canAddChildren === false) {
+      throw new Error('The connected Google account cannot add files to BANKROLL/' + name + '. Give the OAuth account Editor access to that folder.');
+    }
     folders[name] = folder;
   }
   return folders;
 }
+
 async function backupToGoogleDrive(databaseFiles, storedPaths) {
   if (!googleDriveIsConnected()) return { connected: false, uploaded: 0, skipped: true };
   const { google } = require('googleapis');
@@ -7347,76 +7430,157 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
   for (const name of GOOGLE_DRIVE_FOLDER_NAMES) {
     const existing = new Map(); let pageToken;
     do {
-      const page = await drive.files.list({ q: "'" + folders[name].id + "' in parents and trashed = false", pageSize: 1000, pageToken, fields: 'nextPageToken,files(id,name,appProperties)', supportsAllDrives: true, includeItemsFromAllDrives: true });
-      for (const f of (page.data.files || [])) existing.set(f.name, f);
+      const page = await drive.files.list({
+        q: "'" + folders[name].id + "' in parents and trashed = false",
+        pageSize: 1000, pageToken,
+        fields: 'nextPageToken,files(id,name,appProperties)',
+        supportsAllDrives: true, includeItemsFromAllDrives: true,
+      });
+      for (const file of (page.data.files || [])) existing.set(file.name, file);
       pageToken = page.data.nextPageToken;
     } while (pageToken);
     existingByFolder.set(name, existing);
   }
+
   let uploaded = 0;
   const uploadOne = async (folderName, name, signature, body, mimeType) => {
     const existing = existingByFolder.get(folderName);
+    if (!existing) throw new Error('Unknown Bankroll Drive folder: ' + folderName);
     const old = existing.get(name);
     if (old?.appProperties?.bankrollSignature === signature) return old.id || null;
     const requestBody = { name, appProperties: { bankrollSignature: signature, bankrollBackup: 'true' } };
     const media = { mimeType: mimeType || 'application/octet-stream', body };
     try {
-      if (old?.id) await drive.files.update({ fileId: old.id, requestBody, media, fields: 'id,name' });
-      else { const created = await drive.files.create({ requestBody: { ...requestBody, parents: [folders[folderName].id] }, media, fields: 'id,name' }); existing.set(name, created.data); }
-    } catch (e) {
-      if (/insufficient permissions|not have permission|forbidden/i.test(String(e.message || e))) throw new Error('Google Drive cannot write to "' + folderName + '". Share that folder with the connected Google account as Editor. Google said: ' + String(e.message || e));
-      throw e;
+      if (old?.id) {
+        const updated = await drive.files.update({
+          fileId: old.id, requestBody, media, fields: 'id,name,appProperties',
+          supportsAllDrives: true,
+        });
+        existing.set(name, updated.data || { ...old, appProperties: requestBody.appProperties });
+      } else {
+        const created = await drive.files.create({
+          requestBody: { ...requestBody, parents: [folders[folderName].id] },
+          media, fields: 'id,name,appProperties', supportsAllDrives: true,
+        });
+        existing.set(name, created.data);
+      }
+    } catch (error) {
+      if (/insufficient permissions|not have permission|forbidden/i.test(String(error.message || error))) {
+        throw new Error('Google Drive cannot write to BANKROLL/' + folderName + '. Give the connected Google account Editor access. Google said: ' + String(error.message || error));
+      }
+      throw error;
     }
     uploaded++;
-    const saved = existing.get(name);
-    console.log('Google Drive backup uploaded to ' + folderName + ': ' + name);
-    return saved?.id || null;
+    console.log('Google Drive backup uploaded to BANKROLL/' + folderName + ': ' + name);
+    return existing.get(name)?.id || null;
   };
+
   const databaseEntries = [];
   for (const file of databaseFiles || []) {
-    const sig = crypto.createHash('sha256').update(file.buffer).digest('hex');
-    const driveName = crypto.createHash('sha256').update(file.name + ':' + sig).digest('hex').slice(0, 24) + '_' + file.name;
-    const fileId = await uploadOne('DATABASE', driveName, sig, Readable.from([file.buffer]), 'application/json');
-    const current = existingByFolder.get('DATABASE').get(driveName);
-    databaseEntries.push({ name: file.name, driveName, fileId: fileId || current?.id, size: file.buffer.length, sha256: sig });
+    const signature = crypto.createHash('sha256').update(file.buffer).digest('hex');
+    const folderName = googleDriveFolderForDatabaseFile(file.name);
+    const driveName = crypto.createHash('sha256').update(file.name + ':' + signature).digest('hex').slice(0, 24) + '_' + file.name;
+    const fileId = await uploadOne(folderName, driveName, signature, Readable.from([file.buffer]), 'application/json');
+    const current = existingByFolder.get(folderName).get(driveName);
+    databaseEntries.push({
+      name: file.name, driveName, folderName, fileId: fileId || current?.id,
+      size: file.buffer.length, sha256: signature,
+    });
   }
+
+  // Delivery files that are not linked to a vault entry live in CUSTOMER DELIVERIES.
+  // Vault-linked deliveries stay in VAULT and are backed up only once.
+  const deliveryPaths = new Set();
+  const addDeliveryRecord = (record) => {
+    if (!record || record.backupDownload || record.vaultKey || !record.path) return;
+    deliveryPaths.add(path.resolve(String(record.path)));
+  };
+  for (const record of Object.values(deliveries || {})) {
+    if (Array.isArray(record?.files)) for (const file of record.files) addDeliveryRecord(file);
+    else addDeliveryRecord(record);
+  }
+  for (const record of Object.values(downloads || {})) addDeliveryRecord(record);
+  const vaultPaths = new Set(Object.values(vault || {}).filter((item) => item?.path).map((item) => path.resolve(String(item.path))));
+
   let vaultFileCount = 0;
   const vaultEntries = [];
+  const customerDeliveryEntries = [];
   for (const fp of storedPaths || []) {
     if (!fp || !fs.existsSync(fp)) continue;
-    const rel = relData(fp); if (!rel) continue;
-    const st = await fs.promises.stat(fp); if (!st.isFile() || !st.size) continue;
-    if (st.size > 150 * 1024 * 1024) throw new Error('Google Drive backup file exceeds 150 MiB: ' + rel);
-    const sig = await sha256FileCached(fp, st);
+    const rel = relData(fp);
+    if (!rel) continue;
+    const stat = await fs.promises.stat(fp);
+    if (!stat.isFile() || !stat.size) continue;
+    if (stat.size > 150 * 1024 * 1024) throw new Error('Google Drive backup file exceeds 150 MiB: ' + rel);
+    const signature = await sha256FileCached(fp, stat);
     const key = crypto.createHash('sha256').update(rel).digest('hex').slice(0, 16);
-    const name = key + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
-    const driveName = key + '_' + sig.slice(0, 24) + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
-    const fileId = await uploadOne('VAULT', driveName, st.size + ':' + sig, fs.createReadStream(fp));
-    const current = existingByFolder.get('VAULT').get(driveName);
-    vaultEntries.push({ path: rel, name, driveName, fileId: fileId || current?.id, size: st.size, sha256: sig });
-    vaultFileCount++;
+    const driveName = key + '_' + signature.slice(0, 24) + '_' + path.basename(rel).replace(/[^\w.\-]/g, '_');
+    const isCustomerDelivery = deliveryPaths.has(path.resolve(fp)) && !vaultPaths.has(path.resolve(fp));
+    const folderName = isCustomerDelivery ? 'CUSTOMER DELIVERIES' : 'VAULT';
+    const fileId = await uploadOne(folderName, driveName, stat.size + ':' + signature, fs.createReadStream(fp));
+    const entry = { path: rel, driveName, folderName, fileId: fileId || existingByFolder.get(folderName).get(driveName)?.id, size: stat.size, sha256: signature };
+    if (isCustomerDelivery) customerDeliveryEntries.push(entry);
+    else { vaultEntries.push(entry); vaultFileCount++; }
   }
-  const manifest = { format: 'bankroll-drive-layout-v2', createdAt: new Date().toISOString(), databaseFiles: databaseEntries, vaultFiles: vaultEntries, vaultFileCount, folders: Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map((name) => [name, folders[name].id])) };
+
+  // A non-secret operational snapshot makes SYSTEM useful without copying .env,
+  // OAuth client secrets, access tokens, or other credentials into Drive.
+  const systemSnapshot = {
+    format: 'bankroll-system-snapshot-v1',
+    generatedAt: new Date().toISOString(),
+    runtime: { node: process.version, platform: process.platform, dataDirectory: DATA_DIR_STATUS },
+    records: {
+      vault: Object.keys(vault || {}).length,
+      deliveries: Object.keys(deliveries || {}).length,
+      downloads: Object.keys(downloads || {}).length,
+    },
+    drive: { root: GOOGLE_DRIVE_ROOT_NAME, folders: [...GOOGLE_DRIVE_FOLDER_NAMES] },
+  };
+  const systemBuffer = Buffer.from(JSON.stringify(systemSnapshot, null, 2));
+  const systemSignature = crypto.createHash('sha256').update(systemBuffer).digest('hex');
+  const systemName = crypto.createHash('sha256').update('bankroll-system-state.json:' + systemSignature).digest('hex').slice(0, 24) + '_bankroll-system-state.json';
+  const systemId = await uploadOne('SYSTEM', systemName, systemSignature, Readable.from([systemBuffer]), 'application/json');
+  const systemEntries = [{
+    name: 'bankroll-system-state.json', driveName: systemName,
+    fileId: systemId || existingByFolder.get('SYSTEM').get(systemName)?.id,
+    size: systemBuffer.length, sha256: systemSignature,
+  }];
+
+  const folderIds = Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map((name) => [name, folders[name].id]));
+  folderIds.ROOT = folders.ROOT.id;
+  const manifest = {
+    format: 'bankroll-drive-layout-v3',
+    createdAt: new Date().toISOString(),
+    databaseFiles: databaseEntries,
+    vaultFiles: vaultEntries,
+    customerDeliveryFiles: customerDeliveryEntries,
+    systemFiles: systemEntries,
+    vaultFileCount,
+    customerDeliveryFileCount: customerDeliveryEntries.length,
+    folders: folderIds,
+  };
   const manifestBuffer = Buffer.from(JSON.stringify(manifest, null, 2));
-  const manifestSig = crypto.createHash('sha256').update(manifestBuffer).digest('hex');
+  const manifestSignature = crypto.createHash('sha256').update(manifestBuffer).digest('hex');
   const pointName = 'bankroll-recovery-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
-  await uploadOne('BACKUPS', pointName, manifestSig, Readable.from([manifestBuffer]), 'application/json');
-  // Keep a compatibility pointer for existing status/restore code; versioned points
-  // remain immutable and can be used for dated recovery once retention is enabled.
-  await uploadOne('BACKUPS', 'bankroll-drive-manifest.json', manifestSig, Readable.from([manifestBuffer]), 'application/json');
+  await uploadOne('BACKUPS', pointName, manifestSignature, Readable.from([manifestBuffer]), 'application/json');
+  await uploadOne('BACKUPS', 'bankroll-drive-manifest.json', manifestSignature, Readable.from([manifestBuffer]), 'application/json');
+
   let retention = null;
-  try { retention = await applyGoogleDriveRetention(drive, folders); console.log('Google Drive retention completed:', retention); }
-  catch (retentionError) { console.error('Google Drive retention safely skipped; no incomplete cleanup was applied:', retentionError.message); }
-  console.log('Google Drive backup complete: ' + uploaded + ' changed file(s) uploaded across the Bankroll folders.');
-  return { connected: true, uploaded, folders, retention };
+  try {
+    retention = await applyGoogleDriveRetention(drive, folders);
+    console.log('Google Drive retention completed:', retention);
+  } catch (retentionError) {
+    console.error('Google Drive retention safely skipped; no incomplete cleanup was applied:', retentionError.message);
+  }
+  console.log('Google Drive BANKROLL backup complete: ' + uploaded + ' changed file(s) uploaded.');
+  return { connected: true, uploaded, folders, retention, vaultFileCount, customerDeliveryFileCount: customerDeliveryEntries.length };
 }
 
 /**
  * Safe Drive recovery-point retention.
  * Keep the newest point for each of the 7 latest UTC days, 4 latest UTC weeks
- * and 3 latest UTC months. Delete only content-addressed objects proven unused
- * by every retained, successfully parsed v2 manifest. Any uncertainty aborts
- * the entire cleanup before the first delete.
+ * and 3 latest UTC months. Delete only managed content-addressed objects that
+ * are not referenced by any retained, fully validated recovery point.
  */
 async function applyGoogleDriveRetention(drive, folders) {
   const listAll = async (folderId) => {
@@ -7434,7 +7598,7 @@ async function applyGoogleDriveRetention(drive, folders) {
     return all;
   };
   const backupFiles = await listAll(folders.BACKUPS.id);
-  const points = backupFiles.filter((f) => /^bankroll-recovery-.*\.json$/i.test(f.name || ''))
+  const points = backupFiles.filter((file) => /^bankroll-recovery-.*\.json$/i.test(file.name || ''))
     .sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0));
   if (!points.length) return { kept: 0, deletedManifests: 0, deletedObjects: 0, skipped: 'No versioned recovery points' };
 
@@ -7444,33 +7608,46 @@ async function applyGoogleDriveRetention(drive, folders) {
     const chunks = [];
     for await (const chunk of response.data) chunks.push(Buffer.from(chunk));
     const manifest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (manifest.format !== 'bankroll-drive-layout-v2' ||
+    if (!['bankroll-drive-layout-v2', 'bankroll-drive-layout-v3'].includes(manifest.format) ||
         !Array.isArray(manifest.databaseFiles) || !Array.isArray(manifest.vaultFiles)) {
       throw new Error('Retention halted: recovery manifest "' + file.name + '" is malformed or unsupported. No Drive files were deleted.');
     }
-    for (const entry of [...manifest.databaseFiles, ...manifest.vaultFiles]) {
+    const entries = [
+      ...manifest.databaseFiles,
+      ...manifest.vaultFiles,
+      ...(Array.isArray(manifest.customerDeliveryFiles) ? manifest.customerDeliveryFiles : []),
+      ...(Array.isArray(manifest.systemFiles) ? manifest.systemFiles : []),
+    ];
+    for (const entry of entries) {
       if (!entry?.fileId || !/^[a-f0-9]{64}$/i.test(String(entry.sha256 || '')) ||
           !Number.isSafeInteger(Number(entry.size)) || Number(entry.size) < 0) {
         throw new Error('Retention halted: invalid object reference in "' + file.name + '". No Drive files were deleted.');
       }
+      if (entry.folderName && !GOOGLE_DRIVE_CONTENT_FOLDER_NAMES.includes(entry.folderName)) {
+        throw new Error('Retention halted: unknown content folder in "' + file.name + '". No Drive files were deleted.');
+      }
     }
-    parsed.push({ file, manifest, time: new Date(manifest.createdAt || file.modifiedTime || 0) });
+    parsed.push({ file, entries, time: new Date(manifest.createdAt || file.modifiedTime || 0) });
   }
-  const dayKey = (d) => d.toISOString().slice(0, 10);
-  const weekKey = (d) => {
-    const x = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-    x.setUTCDate(x.getUTCDate() + 4 - (x.getUTCDay() || 7));
-    const yearStart = new Date(Date.UTC(x.getUTCFullYear(), 0, 1));
-    return x.getUTCFullYear() + '-W' + String(Math.ceil((((x - yearStart) / 86400000) + 1) / 7)).padStart(2, '0');
+
+  const dayKey = (date) => date.toISOString().slice(0, 10);
+  const weekKey = (date) => {
+    const value = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+    value.setUTCDate(value.getUTCDate() + 4 - (value.getUTCDay() || 7));
+    const yearStart = new Date(Date.UTC(value.getUTCFullYear(), 0, 1));
+    return value.getUTCFullYear() + '-W' + String(Math.ceil((((value - yearStart) / 86400000) + 1) / 7)).padStart(2, '0');
   };
-  const monthKey = (d) => d.toISOString().slice(0, 7);
+  const monthKey = (date) => date.toISOString().slice(0, 7);
   const keep = new Set();
   const takeLatestBuckets = (keyFn, count) => {
     const buckets = new Set();
     for (const item of parsed) {
       if (!Number.isFinite(item.time.getTime())) throw new Error('Retention halted: invalid recovery timestamp. No Drive files were deleted.');
       const key = keyFn(item.time);
-      if (!buckets.has(key) && buckets.size < count) { buckets.add(key); keep.add(item.file.id); }
+      if (!buckets.has(key) && buckets.size < count) {
+        buckets.add(key);
+        keep.add(item.file.id);
+      }
     }
   };
   takeLatestBuckets(dayKey, 7);
@@ -7480,25 +7657,27 @@ async function applyGoogleDriveRetention(drive, folders) {
 
   const referenced = new Set();
   for (const item of parsed) if (keep.has(item.file.id)) {
-    for (const entry of [...item.manifest.databaseFiles, ...item.manifest.vaultFiles]) referenced.add(entry.fileId);
-  }
-  // Validate every retained reference still exists before allowing any deletion.
-  const dbFiles = await listAll(folders.DATABASE.id);
-  const vaultFiles = await listAll(folders.VAULT.id);
-  const objects = [...dbFiles, ...vaultFiles];
-  const objectIds = new Set(objects.map((f) => f.id));
-  for (const id of referenced) if (!objectIds.has(id)) {
-    throw new Error('Retention halted: a retained recovery point references a missing Drive object. No Drive files were deleted.');
+    for (const entry of item.entries) referenced.add(entry.fileId);
   }
 
-  // Plan all deletes before executing. Only our clearly content-addressed objects
-  // are eligible; legacy names and unknown files are always preserved.
-  const objectDeletes = objects.filter((f) =>
-    f.appProperties?.bankrollBackup === 'true' &&
-    isManagedContentAddressedBackup(f.name || '') &&
-    !referenced.has(f.id));
-  const manifestDeletes = points.filter((f) => !keep.has(f.id));
-  let deletedObjects = 0, deletedManifests = 0;
+  const objects = [];
+  for (const folderName of GOOGLE_DRIVE_CONTENT_FOLDER_NAMES) {
+    objects.push(...await listAll(folders[folderName].id));
+  }
+  const objectIds = new Set(objects.map((file) => file.id));
+  for (const id of referenced) {
+    if (!objectIds.has(id)) {
+      throw new Error('Retention halted: a retained recovery point references a missing Drive object. No Drive files were deleted.');
+    }
+  }
+
+  const objectDeletes = objects.filter((file) =>
+    file.appProperties?.bankrollBackup === 'true' &&
+    isManagedContentAddressedBackup(file.name || '') &&
+    !referenced.has(file.id));
+  const manifestDeletes = points.filter((file) => !keep.has(file.id));
+  let deletedObjects = 0;
+  let deletedManifests = 0;
   for (const file of objectDeletes) {
     await drive.files.delete({ fileId: file.id, supportsAllDrives: true });
     deletedObjects++;
@@ -7510,7 +7689,7 @@ async function applyGoogleDriveRetention(drive, folders) {
   return { kept: keep.size, deletedManifests, deletedObjects };
 }
 
-async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = true } = {}) {
+async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = true, restoreCustomerDeliveries = true } = {}) {
   if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected; connect it with /drive connect first.');
   const { google } = require('googleapis');
   const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
@@ -7527,57 +7706,86 @@ async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = t
     manifestPageToken = page.data.nextPageToken;
   } while (manifestPageToken);
   manifests.sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0));
-  if (!manifests.length) throw new Error('No Bankroll recovery manifest was found in Google Drive BACKUPS.');
+  if (!manifests.length) throw new Error('No Bankroll recovery manifest was found in Google Drive BANKROLL/BACKUPS.');
   const manifestResponse = await drive.files.get({ fileId: manifests[0].id, alt: 'media' }, { responseType: 'stream' });
   const manifestChunks = [];
   for await (const chunk of manifestResponse.data) manifestChunks.push(Buffer.from(chunk));
   const manifest = JSON.parse(Buffer.concat(manifestChunks).toString('utf8'));
-  if (manifest.format !== 'bankroll-drive-layout-v2') throw new Error('This Google Drive recovery point uses the legacy manifest format. Run /drive backup once to create a verified v2 recovery manifest.');
-  let restoredDatabase = 0, restoredVault = 0, skipped = 0;
+  if (!['bankroll-drive-layout-v2', 'bankroll-drive-layout-v3'].includes(manifest.format)) {
+    throw new Error('This Google Drive recovery point uses an unsupported manifest format. Run /drive backup once to create a current verified recovery point.');
+  }
+  let restoredDatabase = 0;
+  let restoredVault = 0;
+  let restoredCustomerDeliveries = 0;
+  let skipped = 0;
+
   const downloadVerified = async (entry, destination) => {
-    if (!entry?.fileId || !/^[a-f0-9]{64}$/i.test(String(entry.sha256 || '')) || !Number.isSafeInteger(Number(entry.size)) || Number(entry.size) < 0) throw new Error('Recovery manifest contains an invalid file entry.');
+    if (!entry?.fileId || !/^[a-f0-9]{64}$/i.test(String(entry.sha256 || '')) ||
+        !Number.isSafeInteger(Number(entry.size)) || Number(entry.size) < 0) {
+      throw new Error('Recovery manifest contains an invalid file entry.');
+    }
     const temp = destination + '.drive-restore-' + crypto.randomBytes(6).toString('hex');
     await fs.promises.mkdir(path.dirname(destination), { recursive: true });
     try {
       const response = await drive.files.get({ fileId: entry.fileId, alt: 'media' }, { responseType: 'stream' });
       const hash = crypto.createHash('sha256');
       let size = 0;
-      const meter = new Transform({ transform(chunk, enc, callback) { size += chunk.length; hash.update(chunk); callback(null, chunk); } });
+      const meter = new Transform({
+        transform(chunk, enc, callback) {
+          size += chunk.length;
+          hash.update(chunk);
+          callback(null, chunk);
+        },
+      });
       await pipeline(response.data, meter, fs.createWriteStream(temp, { flags: 'wx' }));
-      const actual = hash.digest('hex');
-      if (size !== Number(entry.size) || actual !== entry.sha256) throw new Error('SHA-256/size verification failed for ' + (entry.name || entry.path || 'recovery file'));
+      if (size !== Number(entry.size) || hash.digest('hex') !== entry.sha256) {
+        throw new Error('SHA-256/size verification failed for ' + (entry.name || entry.path || 'recovery file'));
+      }
       await fs.promises.rename(temp, destination);
     } catch (error) {
       await fs.promises.unlink(temp).catch(() => {});
       throw error;
     }
   };
+
   if (restoreDatabase && Array.isArray(manifest.databaseFiles)) {
     for (const entry of manifest.databaseFiles) {
       const name = String(entry.name || '');
       if (!/^[a-z0-9_.-]+\.json$/i.test(name)) { skipped++; continue; }
       const destination = path.join(DATA_DIR, name);
       let needsRestore = false;
-      try { const st = await fs.promises.stat(destination); needsRestore = !st.isFile() || st.size === 0; }
-      catch { needsRestore = true; }
+      try {
+        const stat = await fs.promises.stat(destination);
+        needsRestore = !stat.isFile() || stat.size === 0;
+      } catch { needsRestore = true; }
       if (!needsRestore) { skipped++; continue; }
       await downloadVerified(entry, destination);
       restoredDatabase++;
     }
   }
-  if (restoreVault && Array.isArray(manifest.vaultFiles)) {
-    for (const entry of manifest.vaultFiles) {
+
+  const restoreStoredEntries = async (entries, counter) => {
+    for (const entry of entries || []) {
       const rel = safeBackupRel(entry.path);
-      if (!rel || !(rel.startsWith('vault/') || rel.startsWith('files/'))) { skipped++; continue; }
+      if (!rel || !(rel.startsWith('vault/') || rel.startsWith('files/') || rel.startsWith('deliveries/'))) {
+        skipped++;
+        continue;
+      }
       const destination = path.resolve(DATA_DIR, rel);
       let exists = false;
       try { exists = (await fs.promises.stat(destination)).isFile(); } catch {}
       if (exists) { skipped++; continue; }
       await downloadVerified(entry, destination);
-      restoredVault++;
+      if (counter === 'vault') restoredVault++;
+      else restoredCustomerDeliveries++;
     }
-  }
-  return { restoredDatabase, restoredVault, skipped, manifestCreatedAt: manifest.createdAt || null };
+  };
+  if (restoreVault) await restoreStoredEntries(manifest.vaultFiles, 'vault');
+  if (restoreCustomerDeliveries) await restoreStoredEntries(manifest.customerDeliveryFiles, 'delivery');
+  return {
+    restoredDatabase, restoredVault, restoredCustomerDeliveries, skipped,
+    manifestCreatedAt: manifest.createdAt || null,
+  };
 }
 
 function formatBytes(bytes) {
@@ -7926,27 +8134,39 @@ async function cmdDrive(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage Google Drive backups.');
   const sub = interaction.options.getSubcommand();
   if (sub === 'connect') {
-    const redirectUri = googleRedirectUri(); const oauth = makeGoogleOAuthClient();
-    const state = crypto.randomBytes(24).toString('hex'); GOOGLE_OAUTH_STATES.set(state, { userId: interaction.user.id, expiresAt: Date.now() + 10 * 60 * 1000 });
+    const redirectUri = googleRedirectUri();
+    const oauth = makeGoogleOAuthClient();
+    const state = crypto.randomBytes(24).toString('hex');
+    GOOGLE_OAUTH_STATES.set(state, { userId: interaction.user.id, expiresAt: Date.now() + 10 * 60 * 1000 });
     for (const [key, value] of GOOGLE_OAUTH_STATES) if (Date.now() > value.expiresAt) GOOGLE_OAUTH_STATES.delete(key);
     const url = oauth.generateAuthUrl({ access_type: 'offline', prompt: 'consent', state, scope: ['https://www.googleapis.com/auth/drive'] });
-    return interaction.editReply('**Connect Google Drive**\n1. Open the authorisation link below.\n2. Sign into the Google account that owns the backup folder and approve access.\n3. Google will return to Bankroll automatically.\n\n**Required authorised redirect URI in Google Cloud:**\n`' + redirectUri + '`\n\n' + url + '\n\nThis link expires in 10 minutes.');
+    return interaction.editReply('Connect Google Drive\n1. Open the authorisation link below.\n2. Sign into the Google account that owns the Bankroll folder and approve access.\n3. Google will return to Bankroll automatically.\n\nRequired authorised redirect URI in Google Cloud:\n' + redirectUri + '\n\n' + url + '\n\nThis link expires in 10 minutes.');
   }
-  if (sub === 'status') {
-    if (!googleDriveIsConnected()) return interaction.editReply('❌ Google Drive is not connected yet. Run `/drive connect`.');
-    try {
-      const { google } = require('googleapis');
-      const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  if (!googleDriveIsConnected()) {
+    return interaction.editReply('Google Drive is not connected yet. Run /drive connect first, then run /drive setup.');
+  }
+  try {
+    const { google } = require('googleapis');
+    const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+    if (sub === 'setup') {
       const folders = await resolveGoogleDriveFolders(drive);
-      const lines = GOOGLE_DRIVE_FOLDER_NAMES.map((name) => '• **' + name + '**');
-      return interaction.editReply('✅ Google Drive is connected; all five Bankroll folders were found.\\n' + lines.join('\\n') + '\\n**Automatic backup:** enabled alongside Discord backup.\\n**Storage:** ' + DATA_DIR_STATUS);
-    } catch (e) { return interaction.editReply('⚠️ Google Drive folder check failed: ' + short(e.message, 900)); }
-  }
-  if (sub === 'backup') {
-    await interaction.editReply('Starting an immediate Bankroll backup to Discord and Google Drive…'); const result = await backupData();
-    if (!result || !result.ok) return interaction.editReply('❌ Backup failed: ' + short(result && result.error || 'Unknown backup error', 800));
-    if (!googleDriveIsConnected()) return interaction.editReply('⚠️ The existing Discord backup completed, but Google Drive is not connected. Run `/drive connect` first.');
-    return interaction.editReply('✅ Backup completed. Database files are in **DATABASE**, vault/order files are in **VAULT**, and the backup manifest is in **BACKUPS**. **LOGS** and **SYSTEM** are recognised for their respective exports.');
+      const lines = GOOGLE_DRIVE_FOLDER_NAMES.map((name) => '• BANKROLL/' + name);
+      return interaction.editReply('Google Drive structure created and verified.\nRoot: BANKROLL\n' + lines.join('\n') + '\n\nLegacy top-level folders were moved into BANKROLL only when their identity was unambiguous. Existing files and Drive IDs were preserved.');
+    }
+    if (sub === 'status') {
+      await resolveGoogleDriveFolders(drive);
+      const lines = GOOGLE_DRIVE_FOLDER_NAMES.map((name) => '• ' + name + ' — ready');
+      return interaction.editReply('Google Drive is connected.\nRoot: BANKROLL — ready\n' + lines.join('\n') + '\n\nAutomatic backup: enabled. Database records, payment records, logs, system snapshot, vault files and customer delivery files are separated into their matching folders.\nTemporary processing: created; transient job files are not retained as backups.\nStorage: ' + DATA_DIR_STATUS);
+    }
+    if (sub === 'backup') {
+      await interaction.editReply('Starting an immediate Bankroll backup to Discord and Google Drive…');
+      const result = await backupData();
+      if (!result || !result.ok) return interaction.editReply('Backup failed: ' + short(result && result.error || 'Unknown backup error', 800));
+      if (!googleDriveIsConnected()) return interaction.editReply('The Discord backup completed, but Google Drive is not connected. Run /drive connect first.');
+      return interaction.editReply('Backup completed. Bankroll data is organised under BANKROLL: DATABASE, PAYMENT RECORDS, LOGS, SYSTEM, VAULT, CUSTOMER DELIVERIES and the recovery point in BACKUPS. TEMPORARY PROCESSING is reserved for transient work and is excluded from retention.');
+    }
+  } catch (error) {
+    return interaction.editReply('Google Drive operation failed: ' + short(error.message, 900));
   }
 }
 
