@@ -1099,7 +1099,8 @@ function cleanDownloads() {
   const now = Date.now(); let removed = 0;
   for (const [token, dl] of Object.entries(downloads)) {
     const expired = !dl || (dl.expiresAt != null && Number.isFinite(Number(dl.expiresAt)) && now > Number(dl.expiresAt));
-    const missing = !dl?.path || !fs.existsSync(dl.path);
+    // Missing local cache is normal with Drive-primary hosting; do not invalidate its link.
+    const missing = !dl?.path;
     if ((expired || missing || (dl.used && (!dl.multiUse || !!dl.vaultKey))) && !activeDownloadTokens.has(token)) {
       if (dl?.path) { try { fs.unlinkSync(dl.path); } catch {} }
       delete downloads[token]; removed++;
