@@ -4201,12 +4201,13 @@ async function cmdVault(interaction) {
     };
     try {
       await uploadNonPaymentFileToDrive(filePath);
+      await commitNonPaymentDatabaseToDrive(VAULT_FILE, vault);
     } catch (driveError) {
+      delete vault[key];
       try { fs.unlinkSync(filePath); } catch {}
       return interaction.editReply('Vault file was not added because Google Drive could not confirm permanent storage: ' + short(driveError.message, 350));
     }
     delete blobBackedUp[relData(filePath)];
-    saveVault();
     recordNotification('vault.add', 'Vault file added', `${key}: ${att.name}`, 'success');
 
     let codeNote = '';
@@ -4261,14 +4262,21 @@ async function cmdVault(interaction) {
       return interaction.editReply('Vault replacement cancelled: Google Drive did not confirm permanent storage: ' + short(driveError.message, 350));
     }
     const previousPath = item.path;
+    const previousRecord = { ...item };
     item.path = replacementPath;
     item.originalName = newName;
     item.size = info.size;
     item.sha256 = info.sha256;
     item.addedAt = Date.now();
     item.replacedAt = Date.now();
+    try {
+      await commitNonPaymentDatabaseToDrive(VAULT_FILE, vault);
+    } catch (driveError) {
+      Object.assign(item, previousRecord);
+      try { fs.unlinkSync(replacementPath); } catch {}
+      return interaction.editReply('Vault replacement cancelled: Drive database commit failed: ' + short(driveError.message, 350));
+    }
     delete blobBackedUp[relData(replacementPath)];
-    saveVault();
 
     // Refresh copies attached to invoices that are still awaiting payment.
     // Paid/delivered orders are deliberately left unchanged.
