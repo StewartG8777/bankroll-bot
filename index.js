@@ -7703,7 +7703,7 @@ async function cmdMassBackup(interaction) {
   try {
     await flushSaves();
     const zip = new AdmZip(), entries = [], skippedSecrets = [];
-    const secretName = /(^\\.env|oauth|credential|secret|token|private[-_]?key|service[-_]?account)/i;
+    const secretName = /(^\.env|oauth|credential|secret|token|private[-_]?key|service[-_]?account)/i;
     const excludedDirs = new Set(['node_modules','.git','tmp','temp']);
     const root = path.resolve(DATA_DIR);
     function walk(dir) {
@@ -7731,7 +7731,7 @@ async function cmdMassBackup(interaction) {
       return await interaction.editReply('❌ The ZIP is '+size+' MiB, but this server allows uploads up to '+limit+' MiB. No split files were created, so the export was not posted. Increase the server upload limit or reduce the export size, then try again.');
     }
     const attachment=new AttachmentBuilder(archive,{name:'bankroll-massbackup.zip'});
-    const summary='✅ **Bankroll mass backup** — '+entries.length+' files, '+(manifest.totalBytes/1024/1024).toFixed(2)+' MiB of source data; ZIP size **'+(archive.length/1024/1024).toFixed(2)+' MiB**. The archive includes a SHA-256 verification manifest.'+(skippedSecrets.length?'\\n🔒 Excluded '+skippedSecrets.length+' credential/secret file(s) for security.':'')+'\\n⚠️ This ZIP is visible and downloadable by everyone who can view this channel. It contains Bankroll data; share it only in a channel where that is appropriate.'+'\\nThis export does not delete or alter live data.';
+    const summary='✅ **Bankroll mass backup** — '+entries.length+' files, '+(manifest.totalBytes/1024/1024).toFixed(2)+' MiB of source data; ZIP size **'+(archive.length/1024/1024).toFixed(2)+' MiB**. The archive includes a SHA-256 verification manifest.'+(skippedSecrets.length?'\n🔒 Excluded '+skippedSecrets.length+' credential/secret file(s) for security.':'')+'\n⚠️ This ZIP is visible and downloadable by everyone who can view this channel. It contains Bankroll data; share it only in a channel where that is appropriate.'+'\nThis export does not delete or alter live data.';
     await interaction.editReply({content:summary,files:[attachment]});
     console.log('Mass backup export created: '+entries.length+' files, '+archive.length+' bytes. Posted publicly in channel '+interaction.channelId+'.');
   }catch(error){console.error('Mass backup export failed:',error.stack||error);await interaction.editReply('❌ Mass backup export failed: '+short(error.message||error,900)+'. No live data was deleted.');}
