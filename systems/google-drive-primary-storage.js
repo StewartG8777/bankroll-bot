@@ -226,6 +226,16 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     return { pointer, manifest };
   }
   async function currentManifest() { return readCurrentManifest(); }
+  async function rejectSymlinkTarget(root, relative) {
+    let cursor=root;
+    for (const part of relative.split('/')) {
+      cursor=path.join(cursor,part);
+      try {
+        const stat=await fs.promises.lstat(cursor);
+        if (stat.isSymbolicLink()) throw new Error('Refusing symbolic link in recovery destination: '+relative);
+      } catch (error) { if(error.code!=='ENOENT')throw error; }
+    }
+  }
   async function restore({ beforeApply = async () => {} } = {}) {
     return serial(async () => {
       const { pointer, manifest } = await readCurrentManifest();
@@ -238,6 +248,7 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
           const relative = safeRelativePath(entry.path);
           const destination = path.resolve(root, relative);
           if (!destination.startsWith(root + path.sep)) throw new Error('Snapshot path escapes DATA_DIR.');
+          await rejectSymlinkTarget(root,relative);
           const staged = path.join(staging, relative);
           await downloadObject(entry, staged);
           prepared.push({ staged, destination });
@@ -342,6 +353,7 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
           seen.add(relative);
           const destination = relative && path.resolve(root, relative);
           if (!relative || !isAllowedRelativePath(relative) || !destination.startsWith(root + path.sep)) throw new Error('Rollback manifest contains an unsafe path.');
+          await rejectSymlinkTarget(root,relative);
           const staged = path.join(staging, relative);
           await downloadObject(entry, staged);
           prepared.push({ staged, destination });
