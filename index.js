@@ -476,6 +476,31 @@ function atomicWrite(file, data) {
   const tmp = `${file}.tmp`;
   fs.writeFileSync(tmp, data);
   fs.renameSync(tmp, file);
+  // Non-payment JSON is asynchronously mirrored to Drive after a successful
+  // local atomic commit. Payment and credential files are deliberately excluded.
+  queueNonPaymentDatabaseSync(file);
+}
+const pendingDriveDatabaseSyncs = new Map();
+const DRIVE_DATABASE_EXCLUSIONS = new Set([
+  'monzo_payments.json', 'monzo_review.json',
+  'stripe_balance_history.json', 'stripe_balance_snapshots.json',
+  'webhook_events.json', 'google-drive-token.json',
+]);
+function queueNonPaymentDatabaseSync(file) {
+  if (!restoreDone || !googleDriveIsConnected()) return;
+  const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
+  if (!/^[a-z0-9_.-]+\\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) return;
+  const previous = pendingDriveDatabaseSyncs.get(relative) || Promise.resolve();
+  const next = previous.catch(() => {}).then(async () => {
+    const { google } = require('googleapis');
+    const { createDriveObjectStore } = require('./systems/drive-object-store');
+    const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+    const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+    await store.put(relative, Buffer.from(await fs.promises.readFile(file)), { mimeType: 'application/json' });
+  });
+  pendingDriveDatabaseSyncs.set(relative, next);
+  next.catch(error => console.error('Google Drive database sync failed for', relative, error.message))
+    .finally(() => { if (pendingDriveDatabaseSyncs.get(relative) === next) pendingDriveDatabaseSyncs.delete(relative); });
 }
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
