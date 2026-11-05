@@ -492,7 +492,7 @@ const DRIVE_DATABASE_EXCLUSIONS = new Set([
 async function commitNonPaymentDatabaseToDrive(file, value) {
   if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected');
   const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
-  if (!/^[a-z0-9_.-]+\\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) {
+  if (!/^[a-z0-9_.-]+\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) {
     throw new Error('This file is not an eligible non-payment database');
   }
   const snapshot = Buffer.from(JSON.stringify(value));
