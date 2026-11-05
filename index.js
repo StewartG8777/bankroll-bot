@@ -1211,6 +1211,13 @@ async function makeDownloadLink(d, paymentIntentId) {
   // A hard link is instant and uses no extra disk; fall back to a copy if links are not possible.
   try { await fs.promises.link(d.path, downloadPath); }
   catch { await fs.promises.copyFile(d.path, downloadPath); }
+  // Do not issue a customer link until its exact download object is durable in Drive.
+  try {
+    await uploadNonPaymentFileToDrive(downloadPath);
+  } catch (error) {
+    await fs.promises.unlink(downloadPath).catch(() => {});
+    throw new Error('Customer delivery could not be saved to Google Drive: ' + error.message);
+  }
   downloads[token] = {
     path: downloadPath,
     name: safeName,
