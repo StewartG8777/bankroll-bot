@@ -7555,6 +7555,8 @@ async function recoverNonPaymentDatabaseFromDrive() {
     ['scheduled_sends.json', SEND_JOBS_FILE, 'object', value => { sendJobs = value; }],
     ['download_history.json', DOWNLOAD_HISTORY_FILE, 'array', value => { downloadHistory = value.slice(-500); }],
     ['presence.json', PRESENCE_FILE, 'object', value => { savedPresence = value; }],
+    ['notifications.json', NOTIFICATIONS_FILE, 'array', value => { notificationHistory = value.slice(-100); }],
+    ['wiped_customers.json', WIPED_CUSTOMERS_FILE, 'array', value => { wipedCustomers = new Set(value.map(String)); }],
   ];
   let restored = 0, skipped = 0;
   for (const [name, file, kind, apply] of entries) {
