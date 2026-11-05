@@ -519,13 +519,18 @@ async function commitNonPaymentDatabaseToDrive(file, value) {
     const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
     await store.put(relative, snapshot);
     failedDriveDatabaseSyncs.delete(relative);
-    const tmp = file + '.cache-' + crypto.randomBytes(5).toString('hex');
+    // A concurrent local save may have produced a newer state while the Drive
+    // request was in flight. Do not overwrite that state with this older snapshot.
     try {
-      await fs.promises.writeFile(tmp, snapshot, { flag: 'wx' });
-      await fs.promises.rename(tmp, file);
+      const current = await fs.promises.readFile(file).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (current === null) {
+        require('./systems/atomic-storage').atomicWriteFile(file, snapshot);
+      }
     } catch (error) {
-      await fs.promises.unlink(tmp).catch(() => {});
-      console.error('Drive commit succeeded but local cache update failed:', relative, error.message);
+      console.error('Drive commit succeeded but local cache validation failed:', relative, error.message);
     }
   });
   pendingDriveDatabaseSyncs.set(relative, next);
