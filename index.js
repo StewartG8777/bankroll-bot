@@ -9422,10 +9422,30 @@ app.all('/:name/:token', async (req, res) => {
   if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) return res.status(200).send('Download link');
   if (req.method === 'GET') { res.setHeader('Cache-Control', 'no-store'); return res.status(200).type('html').send('<form method="post"><p>Press below to use this one-time download link.</p><button>Confirm download</button></form>'); }
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
-  if (shouldConsumeDownload(t)) t.used = true; activeDownloadTokens.add(token); saveDownloads();
+  const { createDownloadLifecycle } = require('./systems/download-lifecycle');
+  const lifecycle = createDownloadLifecycle({
+    record: t,
+    shouldConsume: shouldConsumeDownload,
+    persist: () => commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads),
+    onCompleted: async () => {},
+    onInterrupted: async () => {},
+  });
+  activeDownloadTokens.add(token);
+  try {
+    await lifecycle.reserve();
+  } catch (error) {
+    activeDownloadTokens.delete(token);
+    console.error('Could not reserve download token on Drive:', error.message);
+    return res.status(503).send('Download temporarily unavailable; please retry.');
+  }
   const downloadStartedAt = Date.now();
   const remoteSource = await resolveCustomerDownloadStream(t.path).catch(() => null);
-  if (!remoteSource) { t.used = false; activeDownloadTokens.delete(token); saveDownloads(); return res.status(503).send('Download temporarily unavailable'); }
+  if (!remoteSource) {
+    await lifecycle.interrupted();
+    activeDownloadTokens.delete(token);
+    await commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads).catch(error => console.error('Download release sync failed:', error.message));
+    return res.status(503).send('Download temporarily unavailable');
+  }
   const expectedBytes = remoteSource.size;
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Length', String(expectedBytes));
@@ -9433,6 +9453,7 @@ app.all('/:name/:token', async (req, res) => {
   let finished = false;
   res.on('finish', () => {
     finished = true;
+    void lifecycle.completed().catch(error => console.error('Download completion state failed:', error.message));
     const downloadedAt = Date.now();
     const elapsedMs = downloadedAt - downloadStartedAt;
     if (shouldConsumeDownload(t)) {
@@ -9459,7 +9480,13 @@ app.all('/:name/:token', async (req, res) => {
       downloaded_bytes: String(expectedBytes)
     });
   });
-  res.on('close', () => { if(!finished){t.used=false;activeDownloadTokens.delete(token);saveDownloads();recordDownloadEvent('download_interrupted',{file:t.name,customerId:t.customerId,token,detail:'Connection closed before the file finished; link re-enabled.'});} });
+  res.on('close', () => { if (!finished) {
+    void lifecycle.interrupted().then(async () => {
+      activeDownloadTokens.delete(token);
+      await commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads);
+      recordDownloadEvent('download_interrupted', { file:t.name, customerId:t.customerId, token, detail:'Connection closed before the file finished; link re-enabled.' });
+    }).catch(error => console.error('Interrupted download token release failed:', error.message));
+  } });
   const stream = remoteSource.stream;
   stream.on('error', (e) => { t.used=false;activeDownloadTokens.delete(token);saveDownloads();recordDownloadEvent('download_failed',{file:t.name,customerId:t.customerId,token,detail:short(e.message,180)});res.destroy(); });
   stream.pipe(res);
