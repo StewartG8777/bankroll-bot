@@ -925,18 +925,9 @@ async function streamToFile(url, dest, limitBytes) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(5 * 60 * 1000) });
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-      const hash = crypto.createHash('sha256');
-      let size = 0;
-      const meter = new Transform({
-        transform(chunk, _enc, cb) {
-          size += chunk.length;
-          if (size > limitBytes) return cb(new Error('TOO_BIG'));
-          hash.update(chunk);
-          cb(null, chunk);
-        },
-      });
+      const meter = require('./systems/stream-integrity').createIntegrityMeter({ maxBytes: limitBytes });
       await pipeline(Readable.fromWeb(res.body), meter, fs.createWriteStream(dest));
-      return { size, sha256: hash.digest('hex') };
+      return meter.result();
     } catch (e) {
       lastErr = e;
       try {
