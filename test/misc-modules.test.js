@@ -1,0 +1,4 @@
+'use strict';
+const test=require('node:test');const assert=require('node:assert/strict');const path=require('path');const {whereFrom}=require('../systems/interaction-location');const {createDataPathHelpers}=require('../systems/data-paths');
+test('guild and DM location',()=>{assert.deepEqual(whereFrom({guild:{name:'Test'},channel:{name:'sales'}},{username:'buyer'}),{guild:'Test',channel:'#sales'});assert.deepEqual(whereFrom({guild:null},{username:'buyer'}),{guild:'Direct Message',channel:'DM with buyer'});});
+test('relative data paths reject paths outside data root',()=>{const root=path.join(process.cwd(),'data');const {relData}=createDataPathHelpers(root);assert.equal(relData(path.join(root,'orders.json')),'orders.json');assert.equal(relData(path.resolve(root,'..','outside.txt')),null);});

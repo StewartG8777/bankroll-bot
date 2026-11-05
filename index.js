@@ -13,6 +13,8 @@ const { Readable, Transform } = require('stream');
 const { monitorEventLoopDelay } = require('perf_hooks');
 const os = require('os');
 const { getPerformanceSnapshot } = require('./systems/performance');
+const { whereFrom } = require('./systems/interaction-location');
+const { createDataPathHelpers } = require('./systems/data-paths');
 const { zipSpawnCodes } = require('./systems/spawn-code-parser');
 const { sha256File } = require('./systems/file-hash');
 const { randomSearchGb } = require('./systems/send-progress');
@@ -318,15 +320,11 @@ process.on('uncaughtException', (e) => {
 
 // ---------- Helpers ----------
 
-function whereFrom(interaction, customer) {
-  return interaction.guild
-    ? { guild: interaction.guild.name, channel: `#${interaction.channel?.name ?? 'unknown'}` }
-    : { guild: 'Direct Message', channel: `DM with ${customer.username}` };
-}
-
+// whereFrom moved to systems/interaction-location.js.
 // London reporting date helpers live in systems/london-time.js.
 
 // ---------- File / link delivery & Vault ----------
+const { relData } = createDataPathHelpers(DATA_DIR);
 const FILES_DIR = path.join(DATA_DIR, 'files');
 const DELIVERIES_FILE = path.join(DATA_DIR, 'deliveries.json');
 const MONZO_FILE = path.join(DATA_DIR, 'monzo_payments.json');
@@ -1311,11 +1309,7 @@ async function logInvoiceWithFile(embed, fileData, filePath) {
 }
 const blobBackedUp = {}; // relative path -> size already in the backup channel
 const blobBackupMsgIds = {}; // relative path -> message ids of the parts this process uploaded last
-function relData(p) {
-  if (!p) return null;
-  const rel = path.relative(DATA_DIR, path.resolve(String(p)));
-  return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel.split(path.sep).join('/') : null;
-}
+// relData moved to systems/data-paths.js.
 // A fixed (not secret-guessable) link to one stored file, used when a backup is too big for Discord.
 function backupToken(rel) {
   return crypto.createHash('sha256').update(`${DISCORD_TOKEN}|backup|${rel}`).digest('hex').slice(0, 40);
