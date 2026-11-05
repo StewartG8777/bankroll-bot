@@ -25,3 +25,17 @@ test('new successful commit supersedes earlier failed state', async () => {
   await queue.enqueue('vault','new');
   await queue.flush();
 });
+
+test('older failure does not overwrite the status of a newer successful commit', async () => {
+  let attempts = 0;
+  const queue = createDriveCommitQueue({ write: async () => {
+    if (++attempts === 1) throw new Error('temporary outage');
+  } });
+  const first = queue.enqueue('deliveries', 'old');
+  const second = queue.enqueue('deliveries', 'new');
+  const settled = await Promise.allSettled([first, second]);
+  assert.equal(settled[0].status, 'rejected');
+  assert.equal(settled[1].status, 'fulfilled');
+  await queue.flush();
+  assert.equal(queue.failed.size, 0);
+});
