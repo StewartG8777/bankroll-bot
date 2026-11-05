@@ -7282,7 +7282,16 @@ async function handleBankrollPayoutButton(interaction) {
 const GOOGLE_OAUTH_FILE = path.join(DATA_DIR, 'google-oauth.json');
 const GOOGLE_TOKEN_FILE = path.join(DATA_DIR, 'google-drive-token.json');
 const GOOGLE_AUTH_BACKUP_NAME = 'google-drive-auth.enc';
-const { googleAuthBackupKey, encryptGoogleAuthBundle, decryptGoogleAuthBundle, persistGoogleAuthBundle, restoreGoogleAuthBundleFromMessages, googleRedirectUri, readGoogleClientConfig, makeGoogleOAuthClient, googleDriveIsConnected, listGoogleDriveFolders, resolveGoogleDriveFolders, uploadNonPaymentFileToDrive, recoverNonPaymentDatabaseFromDrive, hydrateNonPaymentCacheFromDrive, backupToGoogleDrive, applyGoogleDriveRetention, restoreFromGoogleDrive, GOOGLE_OAUTH_STATES } = createGoogleDriveSystem({ fs, path, crypto, Buffer, Readable, Transform, pipeline, fetch, DATA_DIR, DATA_DIR_STATUS, DELIVERIES_FILE, DOWNLOADS_FILE, DOWNLOAD_HISTORY_FILE, NOTIFICATIONS_FILE, PRESENCE_FILE, SEND_JOBS_FILE, VAULT_FILE, WIPED_CUSTOMERS_FILE, GOOGLE_AUTH_BACKUP_NAME, GOOGLE_OAUTH_FILE, GOOGLE_TOKEN_FILE, GOOGLE_DRIVE_CONTENT_FOLDER_NAMES, GOOGLE_DRIVE_FOLDER_NAMES, GOOGLE_DRIVE_ROOT_NAME, PUBLIC_URL, client, atomicWrite, resolveBackupChannel, relData, sha256FileCached, safeBackupRel, googleDriveFolderForDatabaseFile, isManagedContentAddressedBackup });
+const { googleAuthBackupKey, encryptGoogleAuthBundle, decryptGoogleAuthBundle, persistGoogleAuthBundle, restoreGoogleAuthBundleFromMessages, googleRedirectUri, readGoogleClientConfig, makeGoogleOAuthClient, googleDriveIsConnected, listGoogleDriveFolders, resolveGoogleDriveFolders, uploadNonPaymentFileToDrive, recoverNonPaymentDatabaseFromDrive, hydrateNonPaymentCacheFromDrive, backupToGoogleDrive, applyGoogleDriveRetention, restoreFromGoogleDrive, GOOGLE_OAUTH_STATES } = createGoogleDriveSystem({ state: {
+  get vault() { return vault; }, set vault(value) { vault = value; },
+  get deliveries() { return deliveries; }, set deliveries(value) { deliveries = value; },
+  get downloads() { return downloads; }, set downloads(value) { downloads = value; },
+  get sendJobs() { return sendJobs; }, set sendJobs(value) { sendJobs = value; },
+  get downloadHistory() { return downloadHistory; }, set downloadHistory(value) { downloadHistory = value; },
+  get savedPresence() { return savedPresence; }, set savedPresence(value) { savedPresence = value; },
+  get notificationHistory() { return notificationHistory; }, set notificationHistory(value) { notificationHistory = value; },
+  get wipedCustomers() { return wipedCustomers; }, set wipedCustomers(value) { wipedCustomers = value; }
+}, fs, path, crypto, Buffer, Readable, Transform, pipeline, fetch, DATA_DIR, DATA_DIR_STATUS, DELIVERIES_FILE, DOWNLOADS_FILE, DOWNLOAD_HISTORY_FILE, NOTIFICATIONS_FILE, PRESENCE_FILE, SEND_JOBS_FILE, VAULT_FILE, WIPED_CUSTOMERS_FILE, GOOGLE_AUTH_BACKUP_NAME, GOOGLE_OAUTH_FILE, GOOGLE_TOKEN_FILE, GOOGLE_DRIVE_CONTENT_FOLDER_NAMES, GOOGLE_DRIVE_FOLDER_NAMES, GOOGLE_DRIVE_ROOT_NAME, PUBLIC_URL, client, atomicWrite, resolveBackupChannel, relData, sha256FileCached, safeBackupRel, googleDriveFolderForDatabaseFile, isManagedContentAddressedBackup });
 
 function formatBytes(bytes) {
   const value = Number(bytes || 0);

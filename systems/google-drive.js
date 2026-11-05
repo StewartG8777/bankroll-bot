@@ -1,7 +1,7 @@
 'use strict';
 // Split from current main; preserves v2 OAuth encryption and legacy v1 recovery.
 module.exports = function createGoogleDriveSystem(deps) {
-const { fs, path, crypto, Buffer, Readable, Transform, pipeline, fetch, DATA_DIR, DATA_DIR_STATUS, DELIVERIES_FILE, DOWNLOADS_FILE, DOWNLOAD_HISTORY_FILE, NOTIFICATIONS_FILE, PRESENCE_FILE, SEND_JOBS_FILE, VAULT_FILE, WIPED_CUSTOMERS_FILE, GOOGLE_AUTH_BACKUP_NAME, GOOGLE_OAUTH_FILE, GOOGLE_TOKEN_FILE, GOOGLE_DRIVE_CONTENT_FOLDER_NAMES, GOOGLE_DRIVE_FOLDER_NAMES, GOOGLE_DRIVE_ROOT_NAME, PUBLIC_URL, client, atomicWrite, resolveBackupChannel, relData, sha256FileCached, safeBackupRel, googleDriveFolderForDatabaseFile, isManagedContentAddressedBackup } = deps;
+const { state, fs, path, crypto, Buffer, Readable, Transform, pipeline, fetch, DATA_DIR, DATA_DIR_STATUS, DELIVERIES_FILE, DOWNLOADS_FILE, DOWNLOAD_HISTORY_FILE, NOTIFICATIONS_FILE, PRESENCE_FILE, SEND_JOBS_FILE, VAULT_FILE, WIPED_CUSTOMERS_FILE, GOOGLE_AUTH_BACKUP_NAME, GOOGLE_OAUTH_FILE, GOOGLE_TOKEN_FILE, GOOGLE_DRIVE_CONTENT_FOLDER_NAMES, GOOGLE_DRIVE_FOLDER_NAMES, GOOGLE_DRIVE_ROOT_NAME, PUBLIC_URL, client, atomicWrite, resolveBackupChannel, relData, sha256FileCached, safeBackupRel, googleDriveFolderForDatabaseFile, isManagedContentAddressedBackup } = deps;
 function googleAuthBackupKey({ legacy = false } = {}) {
   // Discord tokens rotate. They must never be the long-term encryption key for
   // credentials that are expected to survive a bot-token rotation.
@@ -181,7 +181,7 @@ async function uploadNonPaymentFileToDrive(localPath) {
   if (!relative) throw new Error('File is outside the Bankroll data directory');
   if (!googleDriveIsConnected()) throw new Error('Google Drive must be connected before adding a vault file');
   const { google } = require('googleapis');
-  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const { createDriveObjectStore } = require('./drive-object-store');
   const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
   const folders = await resolveGoogleDriveFolders(drive);
   const store = createDriveObjectStore({ drive, folders });
@@ -196,18 +196,18 @@ async function uploadNonPaymentFileToDrive(localPath) {
 async function recoverNonPaymentDatabaseFromDrive() {
   if (!googleDriveIsConnected()) return { restored: 0, skipped: 0 };
   const { google } = require('googleapis');
-  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const { createDriveObjectStore } = require('./drive-object-store');
   const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
   const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
   const entries = [
-    ['vault.json', VAULT_FILE, 'object', value => { vault = value; }],
-    ['deliveries.json', DELIVERIES_FILE, 'object', value => { deliveries = value; }],
-    ['downloads.json', DOWNLOADS_FILE, 'object', value => { downloads = value; }],
-    ['scheduled_sends.json', SEND_JOBS_FILE, 'object', value => { sendJobs = value; }],
-    ['download_history.json', DOWNLOAD_HISTORY_FILE, 'array', value => { downloadHistory = value.slice(-500); }],
-    ['presence.json', PRESENCE_FILE, 'object', value => { savedPresence = value; }],
-    ['notifications.json', NOTIFICATIONS_FILE, 'array', value => { notificationHistory = value.slice(-100); }],
-    ['wiped_customers.json', WIPED_CUSTOMERS_FILE, 'array', value => { wipedCustomers = new Set(value.map(String)); }],
+    ['vault.json', VAULT_FILE, 'object', value => { state.vault = value; }],
+    ['deliveries.json', DELIVERIES_FILE, 'object', value => { state.deliveries = value; }],
+    ['downloads.json', DOWNLOADS_FILE, 'object', value => { state.downloads = value; }],
+    ['scheduled_sends.json', SEND_JOBS_FILE, 'object', value => { state.sendJobs = value; }],
+    ['download_history.json', DOWNLOAD_HISTORY_FILE, 'array', value => { state.downloadHistory = value.slice(-500); }],
+    ['presence.json', PRESENCE_FILE, 'object', value => { state.savedPresence = value; }],
+    ['notifications.json', NOTIFICATIONS_FILE, 'array', value => { state.notificationHistory = value.slice(-100); }],
+    ['wiped_customers.json', WIPED_CUSTOMERS_FILE, 'array', value => { state.wipedCustomers = new Set(value.map(String)); }],
   ];
   let restored = 0, skipped = 0;
   for (const [name, file, kind, apply] of entries) {
@@ -244,13 +244,13 @@ async function recoverNonPaymentDatabaseFromDrive() {
 async function hydrateNonPaymentCacheFromDrive() {
   if (!googleDriveIsConnected()) return { restored: 0, skipped: 0 };
   const { google } = require('googleapis');
-  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const { createDriveObjectStore } = require('./drive-object-store');
   const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
   const folders = await resolveGoogleDriveFolders(drive);
   const store = createDriveObjectStore({ drive, folders });
   const candidates = new Set();
-  for (const entry of Object.values(vault || {})) if (entry?.path) candidates.add(entry.path);
-  for (const entry of [...Object.values(deliveries || {}), ...Object.values(downloads || {})]) {
+  for (const entry of Object.values(state.vault || {})) if (entry?.path) candidates.add(entry.path);
+  for (const entry of [...Object.values(state.deliveries || {}), ...Object.values(state.downloads || {})]) {
     if (entry?.path && !entry.backupDownload) candidates.add(entry.path);
   }
   let restored = 0, skipped = 0;
@@ -348,12 +348,12 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
     if (!record || record.backupDownload || record.vaultKey || !record.path) return;
     deliveryPaths.add(path.resolve(String(record.path)));
   };
-  for (const record of Object.values(deliveries || {})) {
+  for (const record of Object.values(state.deliveries || {})) {
     if (Array.isArray(record?.files)) for (const file of record.files) addDeliveryRecord(file);
     else addDeliveryRecord(record);
   }
-  for (const record of Object.values(downloads || {})) addDeliveryRecord(record);
-  const vaultPaths = new Set(Object.values(vault || {}).filter((item) => item?.path).map((item) => path.resolve(String(item.path))));
+  for (const record of Object.values(state.downloads || {})) addDeliveryRecord(record);
+  const vaultPaths = new Set(Object.values(state.vault || {}).filter((item) => item?.path).map((item) => path.resolve(String(item.path))));
 
   let vaultFileCount = 0;
   const vaultEntries = [];
@@ -383,9 +383,9 @@ async function backupToGoogleDrive(databaseFiles, storedPaths) {
     generatedAt: new Date().toISOString(),
     runtime: { node: process.version, platform: process.platform, dataDirectory: DATA_DIR_STATUS },
     records: {
-      vault: Object.keys(vault || {}).length,
-      deliveries: Object.keys(deliveries || {}).length,
-      downloads: Object.keys(downloads || {}).length,
+      vault: Object.keys(state.vault || {}).length,
+      deliveries: Object.keys(state.deliveries || {}).length,
+      downloads: Object.keys(state.downloads || {}).length,
     },
     drive: { root: GOOGLE_DRIVE_ROOT_NAME, folders: [...GOOGLE_DRIVE_FOLDER_NAMES] },
   };
@@ -560,7 +560,7 @@ async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = t
   } while (manifestPageToken);
   manifests.sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0));
   if (!manifests.length) throw new Error('No Bankroll recovery manifest was found in Google Drive BANKROLL/BACKUPS.');
-  const { selectRecoveryPoint } = require('./systems/recovery-selection');
+  const { selectRecoveryPoint } = require('./recovery-selection');
   const selectedPoint = selectRecoveryPoint(
     manifests.map(item => ({ id: item.id, createdAt: item.modifiedTime })),
     { id: recoveryPointId, ...(recoveryAt ? { at: recoveryAt } : {}) }
@@ -575,7 +575,7 @@ async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = t
   }
   // Never restore from an unverified or internally inconsistent recovery point.
   // Check the entire snapshot before changing any local files.
-  const { auditRecoveryManifest } = require('./systems/drive-integrity');
+  const { auditRecoveryManifest } = require('./drive-integrity');
   const audit = await auditRecoveryManifest(drive, manifest);
   if (!audit.ok) {
     throw new Error('Recovery point failed integrity verification (' + audit.issues.length +
