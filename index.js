@@ -7724,7 +7724,7 @@ async function cmdMassBackup(interaction) {
     const zip = new AdmZip();
     const entries = [];
     const skippedSecrets = [];
-    const secretName = /(^\\.env|oauth|credential|secret|token|private[-_]?key|service[-_]?account)/i;
+    const secretName = /(^\.env|oauth|credential|secret|token|private[-_]?key|service[-_]?account)/i;
     const excludedDirs = new Set(['node_modules', '.git', 'tmp', 'temp']);
     const root = path.resolve(DATA_DIR);
     function walk(dir) {
