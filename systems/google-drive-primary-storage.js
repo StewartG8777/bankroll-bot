@@ -97,8 +97,17 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
       throw new Error('Snapshot checksum or size verification failed for ' + entry.path);
     }
   };
-  async function snapshot({ flush = async () => {} } = {}) {
+  async function snapshot({ flush = async () => {}, allowInitialize = true } = {}) {
     await flush();
+    // Reuse an uploaded immutable object for unchanged file bytes; never reuse an
+    // old pointer without first verifying its manifest checksum and structure.
+    let previous = null;
+    try {
+      previous = (await readCurrentManifest()).manifest;
+    } catch (error) {
+      if (!allowInitialize || !/No current primary snapshot pointer exists/.test(String(error.message))) throw error;
+    }
+    const previousFiles = new Map((previous?.files || []).map(entry => [entry.path, entry]));
     const root = path.resolve(dataDir);
     const files = await walkFiles(root);
     if (!files.length) throw new Error('Refusing to create an empty Bankroll snapshot.');
@@ -110,7 +119,9 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
       const folderId = folderIds[targetFolder];
       if (!folderId) throw new Error('Missing existing BANKROLL/' + targetFolder + ' folder ID');
       const objectName = digest + '_' + path.basename(file.relative).replace(/[^\w.-]/g, '_');
-      const fileId = await uploadObject(folderId, objectName, buffer);
+      const old = previousFiles.get(file.relative);
+      const fileId = old && old.sha256 === digest && Number(old.size) === buffer.length
+        ? old.fileId : await uploadObject(folderId, objectName, buffer);
       entries.push({ path: file.relative, fileId, size: buffer.length, sha256: digest });
     }
     const manifest = {
@@ -184,6 +195,7 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     }
     return { pointer, manifest };
   }
+  async function currentManifest() { return readCurrentManifest(); }
   async function restore({ beforeApply = async () => {} } = {}) {
     return serial(async () => {
       const { pointer, manifest } = await readCurrentManifest();
@@ -322,6 +334,6 @@ function createGoogleDrivePrimaryStorage({ google, auth, dataDir, folderIds, log
     const { pointer, manifest } = await readCurrentManifest();
     return { connected: true, generation: pointer.generation, createdAt: manifest.createdAt, files: manifest.files.length };
   }
-  return { snapshot: (options) => serial(() => snapshot(options)), restore, restoreGeneration, verifyGeneration, promoteGeneration, listGenerations, status };
+  return { snapshot: (options) => serial(() => snapshot(options)), restore, restoreGeneration, verifyGeneration, promoteGeneration, listGenerations, status, currentManifest };
 }
 module.exports = { FORMAT, createGoogleDrivePrimaryStorage, safeRelativePath, isAllowedRelativePath, walkFiles };
