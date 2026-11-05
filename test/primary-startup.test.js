@@ -40,13 +40,24 @@ test('integrity failure prevents startup and does not quarantine data',async(t)=
   assert.equal(await fs.readFile(path.join(dataDir,'vault.json'),'utf8'),'current');
 });
 test('one-time seed requires existing ledger and ends in verified restore',async(t)=>{
-  const dataDir=await dir(t);await fs.writeFile(path.join(dataDir,'vault.json'),'{"vault":1}');
+  const dataDir=await dir(t);
+  for(const name of ['vault.json','deliveries.json','downloads.json','monzo_payments.json','stripe_ledger.json','webhook_events.json']) {
+    await fs.writeFile(path.join(dataDir,name),'{}');
+  }
   let ready=false,committed=false;
   const store={
-    currentManifest:async()=>{if(!ready)throw Error('No current primary snapshot pointer exists');return {manifest:{files:[{path:'vault.json'}]}};},
+    currentManifest:async()=>{if(!ready)throw Error('No current primary snapshot pointer exists');return {manifest:{files:['vault.json','deliveries.json','downloads.json','monzo_payments.json','stripe_ledger.json','webhook_events.json'].map(path=>({path}))}};},
     snapshot:async()=>{ready=true;committed=true;},
     restore:async()=>{assert.ok(committed);return {generation:'seed',files:1};}
   };
   const result=await preparePrimaryData({store,dataDir,allowSeed:true});
   assert.equal(result.seeded,true);assert.equal(result.generation,'seed');
+});
+
+test('migration refuses missing or invalid payment history even if some files exist',async(t)=>{
+  const dataDir=await dir(t);await fs.writeFile(path.join(dataDir,'vault.json'),'{}');
+  let seeded=false;
+  const store={currentManifest:async()=>{throw Error('No current primary snapshot pointer exists');},snapshot:async()=>{seeded=true;}};
+  await assert.rejects(preparePrimaryData({store,dataDir,allowSeed:true}),/incomplete financial migration/);
+  assert.equal(seeded,false);
 });
