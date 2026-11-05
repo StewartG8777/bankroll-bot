@@ -13,6 +13,9 @@ const { Readable, Transform } = require('stream');
 const { monitorEventLoopDelay } = require('perf_hooks');
 const os = require('os');
 const { getPerformanceSnapshot } = require('./systems/performance');
+const { zipSpawnCodes } = require('./systems/spawn-code-parser');
+const { sha256File } = require('./systems/file-hash');
+const { randomSearchGb } = require('./systems/send-progress');
 const { londonParts, londonOffset, londonMidnightUnix, periodBounds } = require('./systems/london-time');
 const { parseExpiresToMinutes } = require('./systems/invoice-time');
 const { isManagedContentAddressedBackup } = require('./systems/backup-retention');
@@ -886,15 +889,7 @@ async function streamToFile(url, dest, limitBytes) {
   throw lastErr;
 }
 
-function sha256File(fp) {
-  return new Promise((resolve, reject) => {
-    const h = crypto.createHash('sha256');
-    fs.createReadStream(fp)
-      .on('data', (c) => h.update(c))
-      .on('end', () => resolve(h.digest('hex')))
-      .on('error', reject);
-  });
-}
+// sha256File extracted into systems/file-hash.js.
 
 async function downloadAttachment(att, hosted) {
   const limitMb = hosted ? 100 : 10;
@@ -3808,23 +3803,7 @@ const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const BAD_PATH = (p) => p.split('/').includes('..');
 
 // Spawn codes found in a vehicle resource: <modelName> in vehicles*.meta, else the .yft file names.
-function zipSpawnCodes(zip) {
-  const entries = zip.getEntries().filter((e) => !e.isDirectory);
-  const found = new Set();
-  for (const e of entries) {
-    const base = path.posix.basename(e.entryName.replace(/\\/g, '/')).toLowerCase();
-    if (!/^vehicles.*\.meta$/.test(base)) continue;
-    const text = e.getData().toString('utf8');
-    for (const m of text.matchAll(/<modelName>\s*([^<\s]+)\s*<\/modelName>/gi)) found.add(m[1].toLowerCase());
-  }
-  if (!found.size) {
-    for (const e of entries) {
-      const m = path.posix.basename(e.entryName.replace(/\\/g, '/')).toLowerCase().match(/^([a-z0-9_]+?)(?:_hi)?\.yft$/);
-      if (m) found.add(m[1]);
-    }
-  }
-  return [...found];
-}
+// zipSpawnCodes extracted into systems/spawn-code-parser.js.
 
 // Same result as zipSpawnCodes(), but reads the archive from disk with the streaming ZIP reader: only the small
 // vehicles*.meta files are inflated and the archive is never loaded into memory or processed synchronously.
@@ -6625,11 +6604,8 @@ async function onGetFile(interaction) {
   }, { notificationType: 'delivery.sent', notificationStatus: 'success' });
 }
 
-function randomSearchGb(durationMinutes) {
-  const center = Math.max(2, 2 + ((durationMinutes - 2) * 198) / 118);
-  const jitter = 0.82 + Math.random() * 0.36;
-  return Math.max(2, Math.round(center * jitter));
-}
+// randomSearchGb extracted into systems/send-progress.js.
+
 function sendfileProgress(job, now = Date.now()) {
   const total = Math.max(1, job.dueAt - job.createdAt);
   const pct = Math.max(0, Math.min(100, Math.floor(((now - job.createdAt) / total) * 100)));
