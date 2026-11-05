@@ -7918,6 +7918,14 @@ async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = t
   if (!['bankroll-drive-layout-v2', 'bankroll-drive-layout-v3'].includes(manifest.format)) {
     throw new Error('This Google Drive recovery point uses an unsupported manifest format. Run /drive backup once to create a current verified recovery point.');
   }
+  // Never restore from an unverified or internally inconsistent recovery point.
+  // Check the entire snapshot before changing any local files.
+  const { auditRecoveryManifest } = require('./systems/drive-integrity');
+  const audit = await auditRecoveryManifest(drive, manifest);
+  if (!audit.ok) {
+    throw new Error('Recovery point failed integrity verification (' + audit.issues.length +
+      ' issue(s)): ' + audit.issues.slice(0, 3).map(issue => issue.path + ': ' + issue.reason).join(', '));
+  }
   let restoredDatabase = 0;
   let restoredVault = 0;
   let restoredCustomerDeliveries = 0;
