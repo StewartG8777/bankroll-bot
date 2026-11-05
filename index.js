@@ -9352,6 +9352,7 @@ async function resolveCustomerDownloadStream(filePath) {
   const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
   return store.get(relative);
 }
+const { validateDownload, shouldConsumeDownload } = require('./systems/download-policy');
 const downloadAttempts = new Map();
 app.all('/:name/:token', async (req, res) => {
   if (!req.params.name.startsWith('bankroll-')) return res.status(404).send('Not found');
@@ -9359,15 +9360,15 @@ app.all('/:name/:token', async (req, res) => {
   const attempt=downloadAttempts.get(remote)||{count:0,resetAt:Date.now()+60000}; if(Date.now()>attempt.resetAt){attempt.count=0;attempt.resetAt=Date.now()+60000;} attempt.count++;downloadAttempts.set(remote,attempt);
   if(attempt.count>40)return res.status(429).send('Too many download attempts. Try again in a minute.');
   if(downloadAttempts.size>5000){for(const [ip,value] of downloadAttempts)if(Date.now()>value.resetAt)downloadAttempts.delete(ip);}
-  if(!/^[a-f0-9]{48,64}$/i.test(token)){recordDownloadEvent('access_denied',{detail:'Malformed download token.'});return res.status(404).send('Not found');}
+  if (validateDownload({ record: downloads[token], token, active: activeDownloadTokens.has(token), safePath: true }) === 'malformed'){recordDownloadEvent('access_denied',{detail:'Malformed download token.'});return res.status(404).send('Not found');}
   const t=downloads[token]; const filesRoot=path.resolve(FILES_DIR)+path.sep; const safePath=t?.path&&path.resolve(String(t.path)).startsWith(filesRoot);
-  if(!t||(t.used&&(!t.multiUse||!!t.vaultKey))||activeDownloadTokens.has(token)||(t.expiresAt != null && Date.now()>Number(t.expiresAt))||!safePath){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
+  if(validateDownload({ record: t, token, active: activeDownloadTokens.has(token), safePath })){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
 
   const ua = req.headers['user-agent'] || '';
   if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) return res.status(200).send('Download link');
   if (req.method === 'GET') { res.setHeader('Cache-Control', 'no-store'); return res.status(200).type('html').send('<form method="post"><p>Press below to use this one-time download link.</p><button>Confirm download</button></form>'); }
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
-  if (!t.multiUse || t.vaultKey) t.used = true; activeDownloadTokens.add(token); saveDownloads();
+  if (shouldConsumeDownload(t)) t.used = true; activeDownloadTokens.add(token); saveDownloads();
   const downloadStartedAt = Date.now();
   const remoteSource = await resolveCustomerDownloadStream(t.path).catch(() => null);
   if (!remoteSource) { t.used = false; activeDownloadTokens.delete(token); saveDownloads(); return res.status(503).send('Download temporarily unavailable'); }
@@ -9380,7 +9381,7 @@ app.all('/:name/:token', async (req, res) => {
     finished = true;
     const downloadedAt = Date.now();
     const elapsedMs = downloadedAt - downloadStartedAt;
-    if (!t.multiUse || t.vaultKey) {
+    if (shouldConsumeDownload(t)) {
       try { fs.unlinkSync(t.path); } catch {}
       delete downloads[token];
     }
