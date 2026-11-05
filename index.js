@@ -7706,6 +7706,11 @@ async function cmdMassBackup(interaction) {
     return '📦 **Bankroll mass backup in progress**\n`[' + '█'.repeat(filled) + '░'.repeat(20-filled) + ']` **' + pct + '%**\n' + progress.label + '\n' + progress.detail + '\n\nThe final result will be one ZIP posted publicly in this channel.';
   };
   const setProgress = (percent, label, detail) => { progress = { percent, label, detail }; };
+  const stopProgress = async () => {
+    if (progressTimer) clearInterval(progressTimer);
+    progressTimer = null;
+    while (progressBusy) await new Promise(resolve => setTimeout(resolve, 50));
+  };
   const updateProgress = async () => {
     if (progressBusy) return;
     progressBusy = true;
@@ -7804,16 +7809,17 @@ async function cmdMassBackup(interaction) {
     const uploadLimit = interaction.guild?.maximumUploadLimit || 25 * 1024 * 1024;
     if (archive.length > uploadLimit) {
       const size = (archive.length / 1024 / 1024).toFixed(2), limit = (uploadLimit / 1024 / 1024).toFixed(2);
+      await stopProgress();
       return await interaction.editReply('❌ The ZIP is ' + size + ' MiB, but this server allows uploads up to ' + limit + ' MiB. No split files were created, so the export was not posted. Increase the server upload limit or reduce the export size, then try again.');
     }
     const attachment = new AttachmentBuilder(archive, { name: 'bankroll-massbackup.zip' });
     const summary = '✅ **Bankroll mass backup** — ' + entries.length + ' files, ' + (totalBytes / 1024 / 1024).toFixed(2) + ' MiB of source data; ZIP size **' + (archive.length / 1024 / 1024).toFixed(2) + ' MiB**. The archive includes a SHA-256 verification manifest.' + (skippedSecrets.length ? '\n🔒 Excluded ' + skippedSecrets.length + ' credential/secret file(s) for security.' : '') + '\n⚠️ This ZIP is visible and downloadable by everyone who can view this channel. It contains Bankroll data; share it only in a channel where that is appropriate.' + '\nThis export does not delete or alter live data.';
-    if (progressTimer) clearInterval(progressTimer);
-    progressTimer = null;
+    await stopProgress();
     await interaction.editReply({ content: summary, files: [attachment] });
     console.log('Mass backup export created: ' + entries.length + ' files, ' + archive.length + ' bytes. Posted publicly in channel ' + interaction.channelId + '.');
   } catch (error) {
     console.error('Mass backup export failed:', error.stack || error);
+    await stopProgress();
     await interaction.editReply('❌ Mass backup export failed: ' + short(error.message || error, 900) + '. No live data was deleted.');
   } finally {
     if (progressTimer) clearInterval(progressTimer);
