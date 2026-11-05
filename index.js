@@ -487,17 +487,48 @@ const DRIVE_DATABASE_EXCLUSIONS = new Set([
   'webhook_events.json', 'stripe_ledger.json',
   'google-drive-token.json', 'google-oauth.json',
 ]);
-function queueNonPaymentDatabaseSync(file) {
-  if (!restoreDone || !googleDriveIsConnected()) return;
+// Await this for operations which must not acknowledge a database change
+// until Google Drive has committed it. Local files remain compatibility caches.
+async function commitNonPaymentDatabaseToDrive(file, value) {
+  if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected');
   const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
-  if (!/^[a-z0-9_.-]+\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) return;
+  if (!/^[a-z0-9_.-]+\\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) {
+    throw new Error('This file is not an eligible non-payment database');
+  }
+  const snapshot = Buffer.from(JSON.stringify(value));
   const previous = pendingDriveDatabaseSyncs.get(relative) || Promise.resolve();
   const next = previous.catch(() => {}).then(async () => {
     const { google } = require('googleapis');
     const { createDriveObjectStore } = require('./systems/drive-object-store');
     const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
     const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
-    await store.put(relative, Buffer.from(await fs.promises.readFile(file)), { mimeType: 'application/json' });
+    await store.put(relative, snapshot);
+    const tmp = file + '.cache-' + crypto.randomBytes(5).toString('hex');
+    try {
+      await fs.promises.writeFile(tmp, snapshot, { flag: 'wx' });
+      await fs.promises.rename(tmp, file);
+    } catch (error) {
+      await fs.promises.unlink(tmp).catch(() => {});
+      console.error('Drive commit succeeded but local cache update failed:', relative, error.message);
+    }
+  });
+  pendingDriveDatabaseSyncs.set(relative, next);
+  try { await next; } finally {
+    if (pendingDriveDatabaseSyncs.get(relative) === next) pendingDriveDatabaseSyncs.delete(relative);
+  }
+}
+function queueNonPaymentDatabaseSync(file) {
+  if (!restoreDone || !googleDriveIsConnected()) return;
+  const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
+  if (!/^[a-z0-9_.-]+\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) return;
+  const snapshot = Buffer.from(fs.readFileSync(file));
+  const previous = pendingDriveDatabaseSyncs.get(relative) || Promise.resolve();
+  const next = previous.catch(() => {}).then(async () => {
+    const { google } = require('googleapis');
+    const { createDriveObjectStore } = require('./systems/drive-object-store');
+    const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+    const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+    await store.put(relative, snapshot, { mimeType: 'application/json' });
   });
   pendingDriveDatabaseSyncs.set(relative, next);
   next.catch(error => {
