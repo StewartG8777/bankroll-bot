@@ -9248,8 +9248,19 @@ app.get('/bankroll-backup-file/:token', async (req, res) => {
   fs.createReadStream(fp).on('error', () => res.destroy()).pipe(res);
 });
 
+async function resolveCustomerDownloadStream(filePath) {
+  if (fs.existsSync(filePath)) return { stream: fs.createReadStream(filePath), size: fs.statSync(filePath).size };
+  if (!googleDriveIsConnected()) return null;
+  const relative = relData(filePath);
+  if (!relative) return null;
+  const { google } = require('googleapis');
+  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+  return store.get(relative);
+}
 const downloadAttempts = new Map();
-app.all('/:name/:token', (req, res) => {
+app.all('/:name/:token', async (req, res) => {
   if (!req.params.name.startsWith('bankroll-')) return res.status(404).send('Not found');
   const token = req.params.token; const remote=String(req.ip||req.socket?.remoteAddress||'unknown');
   const attempt=downloadAttempts.get(remote)||{count:0,resetAt:Date.now()+60000}; if(Date.now()>attempt.resetAt){attempt.count=0;attempt.resetAt=Date.now()+60000;} attempt.count++;downloadAttempts.set(remote,attempt);
@@ -9257,7 +9268,7 @@ app.all('/:name/:token', (req, res) => {
   if(downloadAttempts.size>5000){for(const [ip,value] of downloadAttempts)if(Date.now()>value.resetAt)downloadAttempts.delete(ip);}
   if(!/^[a-f0-9]{48,64}$/i.test(token)){recordDownloadEvent('access_denied',{detail:'Malformed download token.'});return res.status(404).send('Not found');}
   const t=downloads[token]; const filesRoot=path.resolve(FILES_DIR)+path.sep; const safePath=t?.path&&path.resolve(String(t.path)).startsWith(filesRoot);
-  if(!t||(t.used&&(!t.multiUse||!!t.vaultKey))||activeDownloadTokens.has(token)||(t.expiresAt != null && Date.now()>Number(t.expiresAt))||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
+  if(!t||(t.used&&(!t.multiUse||!!t.vaultKey))||activeDownloadTokens.has(token)||(t.expiresAt != null && Date.now()>Number(t.expiresAt))||!safePath){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
 
   const ua = req.headers['user-agent'] || '';
   if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) return res.status(200).send('Download link');
@@ -9265,7 +9276,9 @@ app.all('/:name/:token', (req, res) => {
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
   if (!t.multiUse || t.vaultKey) t.used = true; activeDownloadTokens.add(token); saveDownloads();
   const downloadStartedAt = Date.now();
-  const expectedBytes = fs.statSync(t.path).size;
+  const remoteSource = await resolveCustomerDownloadStream(t.path).catch(() => null);
+  if (!remoteSource) { t.used = false; activeDownloadTokens.delete(token); saveDownloads(); return res.status(503).send('Download temporarily unavailable'); }
+  const expectedBytes = remoteSource.size;
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Length', String(expectedBytes));
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(t.name)}`);
@@ -9299,7 +9312,7 @@ app.all('/:name/:token', (req, res) => {
     });
   });
   res.on('close', () => { if(!finished){t.used=false;activeDownloadTokens.delete(token);saveDownloads();recordDownloadEvent('download_interrupted',{file:t.name,customerId:t.customerId,token,detail:'Connection closed before the file finished; link re-enabled.'});} });
-  const stream = fs.createReadStream(t.path);
+  const stream = remoteSource.stream;
   stream.on('error', (e) => { t.used=false;activeDownloadTokens.delete(token);saveDownloads();recordDownloadEvent('download_failed',{file:t.name,customerId:t.customerId,token,detail:short(e.message,180)});res.destroy(); });
   stream.pipe(res);
 });
