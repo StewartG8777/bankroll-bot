@@ -8291,6 +8291,10 @@ async function cmdRecovery(interaction) {
 async function cmdSystemDiagnostics(interaction, mode) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can view system diagnostics.');
   const p = getPerformanceSnapshot();
+  const cpu = process.cpuUsage();
+  const elapsedCpuSeconds = (cpu.user + cpu.system) / 1e6;
+  const cpuPerUptime = process.uptime() > 0 ? (100 * elapsedCpuSeconds / process.uptime()).toFixed(1) + '%' : 'Warming up';
+  const deploymentVersion = String(process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || process.env.COMMIT_SHA || 'Not supplied').slice(0, 40);
   const uptime = Math.floor(process.uptime());
   const uptimeText = Math.floor(uptime / 86400) + 'd ' + Math.floor((uptime % 86400) / 3600) + 'h ' + Math.floor((uptime % 3600) / 60) + 'm';
   const fields = [
@@ -8303,6 +8307,9 @@ async function cmdSystemDiagnostics(interaction, mode) {
     { name: 'Event-loop delay (mean)', value: p.eventLoop.meanMs === null ? 'Warming up' : p.eventLoop.meanMs.toFixed(2) + ' ms', inline: true },
     { name: 'Event-loop delay (p99)', value: p.eventLoop.p99Ms === null ? 'Warming up' : p.eventLoop.p99Ms.toFixed(2) + ' ms', inline: true },
     { name: 'CPU load (1m)', value: (os.loadavg()[0] || 0).toFixed(2), inline: true },
+    { name: 'Process CPU (lifetime avg)', value: cpuPerUptime, inline: true },
+    { name: 'Deployment commit', value: deploymentVersion, inline: true },
+    { name: 'Google Drive', value: googleDriveIsConnected() ? 'OAuth configured' : 'Disconnected', inline: true },
     { name: 'Backup', value: lastBackupAt ? '<t:' + Math.floor(lastBackupAt / 1000) + ':R>' : 'No successful backup recorded', inline: true },
     { name: 'Recovery', value: restoreDone ? 'Startup recovery complete' : 'Recovery not complete', inline: true },
     { name: 'Last backup error', value: short(lastBackupError || 'None', 900), inline: false },
