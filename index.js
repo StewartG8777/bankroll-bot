@@ -4114,6 +4114,12 @@ async function cmdVault(interaction) {
       sha256: info.sha256,
       addedAt: Date.now(),
     };
+    try {
+      await uploadNonPaymentFileToDrive(filePath);
+    } catch (driveError) {
+      try { fs.unlinkSync(filePath); } catch {}
+      return interaction.editReply('Vault file was not added because Google Drive could not confirm permanent storage: ' + short(driveError.message, 350));
+    }
     delete blobBackedUp[relData(filePath)];
     saveVault();
     recordNotification('vault.add', 'Vault file added', `${key}: ${att.name}`, 'success');
@@ -4163,6 +4169,12 @@ async function cmdVault(interaction) {
       return interaction.editReply('Could not replace the vault file: ' + short(error.message, 400));
     }
 
+    try {
+      await uploadNonPaymentFileToDrive(replacementPath);
+    } catch (driveError) {
+      try { fs.unlinkSync(replacementPath); } catch {}
+      return interaction.editReply('Vault replacement cancelled: Google Drive did not confirm permanent storage: ' + short(driveError.message, 350));
+    }
     const previousPath = item.path;
     item.path = replacementPath;
     item.originalName = newName;
@@ -7419,6 +7431,21 @@ async function resolveGoogleDriveFolders(drive) {
     folders[name] = folder;
   }
   return folders;
+}
+
+// Direct non-payment object uploads are confirmed before vault changes are acknowledged.
+// The existing local file is retained as a compatibility cache for ZIP editing and
+// Discord attachment flows; payment files never pass through this helper.
+async function uploadNonPaymentFileToDrive(localPath) {
+  const relative = relData(localPath);
+  if (!relative) throw new Error('File is outside the Bankroll data directory');
+  if (!googleDriveIsConnected()) throw new Error('Google Drive must be connected before adding a vault file');
+  const { google } = require('googleapis');
+  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const folders = await resolveGoogleDriveFolders(drive);
+  const store = createDriveObjectStore({ drive, folders });
+  return store.put(relative, fs.createReadStream(localPath));
 }
 
 async function backupToGoogleDrive(databaseFiles, storedPaths) {
