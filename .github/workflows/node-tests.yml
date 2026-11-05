@@ -7,15 +7,17 @@ on:
   workflow_dispatch:
 jobs:
   unit-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
-          cache: npm
-      - run: npm ci
+      # The repository does not currently commit package-lock.json.
+      # npm ci and setup-node's npm cache both require a lockfile.
+      - name: Install dependencies without a lockfile
+        run: npm install --no-audit --no-fund
       - name: Syntax check application and modules
         run: |
           node --check index.js
