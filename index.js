@@ -484,7 +484,8 @@ const pendingDriveDatabaseSyncs = new Map();
 const DRIVE_DATABASE_EXCLUSIONS = new Set([
   'monzo_payments.json', 'monzo_review.json',
   'stripe_balance_history.json', 'stripe_balance_snapshots.json',
-  'webhook_events.json', 'google-drive-token.json',
+  'webhook_events.json', 'stripe_ledger.json',
+  'google-drive-token.json', 'google-oauth.json',
 ]);
 function queueNonPaymentDatabaseSync(file) {
   if (!restoreDone || !googleDriveIsConnected()) return;
