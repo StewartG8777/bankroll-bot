@@ -7891,7 +7891,7 @@ async function applyGoogleDriveRetention(drive, folders) {
   return { kept: keep.size, deletedManifests, deletedObjects };
 }
 
-async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = true, restoreCustomerDeliveries = true } = {}) {
+async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = true, restoreCustomerDeliveries = true, recoveryPointId = null, recoveryAt = null } = {}) {
   if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected; connect it with /drive connect first.');
   const { google } = require('googleapis');
   const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
@@ -7909,7 +7909,13 @@ async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = t
   } while (manifestPageToken);
   manifests.sort((a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0));
   if (!manifests.length) throw new Error('No Bankroll recovery manifest was found in Google Drive BANKROLL/BACKUPS.');
-  const manifestResponse = await drive.files.get({ fileId: manifests[0].id, alt: 'media' }, { responseType: 'stream' });
+  const { selectRecoveryPoint } = require('./systems/recovery-selection');
+  const selectedPoint = selectRecoveryPoint(
+    manifests.map(item => ({ id: item.id, createdAt: item.modifiedTime })),
+    { id: recoveryPointId, ...(recoveryAt ? { at: recoveryAt } : {}) }
+  );
+  if (!selectedPoint) throw new Error('Requested Google Drive recovery point does not exist.');
+  const manifestResponse = await drive.files.get({ fileId: selectedPoint.id, alt: 'media' }, { responseType: 'stream' });
   const manifestChunks = [];
   for await (const chunk of manifestResponse.data) manifestChunks.push(Buffer.from(chunk));
   const manifest = JSON.parse(Buffer.concat(manifestChunks).toString('utf8'));
