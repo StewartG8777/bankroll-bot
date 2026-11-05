@@ -7698,44 +7698,127 @@ async function cmdBackupManagement(interaction) {
 async function cmdMassBackup(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can export a full data archive.');
   if (!restoreDone) return interaction.editReply('Startup recovery is still running. Wait until /backup status reports recovery complete, then run /massbackup again.');
-  await interaction.editReply('Building a complete Bankroll data export. The finished ZIP will be posted publicly in this channel. Credentials and secret keys are deliberately excluded.');
-  let archivePath = null;
+  let archivePath = null, progressTimer = null, progressBusy = false;
+  let progress = { percent: 2, label: 'Preparing export', detail: 'Waiting for pending saves to finish…' };
+  const renderProgress = () => {
+    const pct = Math.max(0, Math.min(100, Math.round(progress.percent)));
+    const filled = Math.round(pct / 5);
+    return '📦 **Bankroll mass backup in progress**\n`[' + '█'.repeat(filled) + '░'.repeat(20-filled) + ']` **' + pct + '%**\n' + progress.label + '\n' + progress.detail + '\n\nThe final result will be one ZIP posted publicly in this channel.';
+  };
+  const setProgress = (percent, label, detail) => { progress = { percent, label, detail }; };
+  const updateProgress = async () => {
+    if (progressBusy) return;
+    progressBusy = true;
+    try { await interaction.editReply({ content: renderProgress() }); }
+    catch (error) { console.warn('Mass backup progress update failed:', error.message); }
+    finally { progressBusy = false; }
+  };
   try {
+    progressTimer = setInterval(() => { updateProgress().catch(() => {}); }, 1800);
+    await updateProgress();
     await flushSaves();
-    const zip = new AdmZip(), entries = [], skippedSecrets = [];
+    setProgress(5, 'Scanning Bankroll storage', 'Finding files and excluding credentials and temporary folders…');
+
+    const root = path.resolve(DATA_DIR);
     const secretName = /(^\.env|oauth|credential|secret|token|private[-_]?key|service[-_]?account)/i;
     const excludedDirs = new Set(['node_modules','.git','tmp','temp']);
-    const root = path.resolve(DATA_DIR);
-    function walk(dir) {
-      for (const item of fs.readdirSync(dir,{withFileTypes:true})) {
-        const full=path.join(dir,item.name), rel=path.relative(root,full).split(path.sep).join('/');
-        if(item.isSymbolicLink())continue;
-        if(item.isDirectory()){if(!excludedDirs.has(item.name.toLowerCase()))walk(full);continue;}
-        if(!item.isFile())continue;
-        if(secretName.test(item.name)||/^bankroll-massbackup/i.test(item.name)){skippedSecrets.push(rel);continue;}
-        const bytes=fs.readFileSync(full);
-        entries.push({path:rel,size:bytes.length,sha256:crypto.createHash('sha256').update(bytes).digest('hex')});
-        zip.addFile('bankroll-data/'+rel,bytes);
+    const files = [], skippedSecrets = [];
+    async function walk(dir) {
+      const items = await fs.promises.readdir(dir, { withFileTypes: true });
+      for (const item of items) {
+        const full = path.join(dir, item.name);
+        const rel = path.relative(root, full).split(path.sep).join('/');
+        if (item.isSymbolicLink()) continue;
+        if (item.isDirectory()) {
+          if (!excludedDirs.has(item.name.toLowerCase())) await walk(full);
+          continue;
+        }
+        if (!item.isFile()) continue;
+        if (secretName.test(item.name) || /^bankroll-massbackup/i.test(item.name)) {
+          skippedSecrets.push(rel);
+          continue;
+        }
+        files.push({ full, rel });
       }
     }
-    walk(root);
-    if(!entries.length)throw new Error('The data directory contained no exportable files.');
-    const manifest={format:'bankroll-massbackup-v1',createdAt:new Date().toISOString(),dataDirectory:DATA_DIR_STATUS,fileCount:entries.length,totalBytes:entries.reduce((sum,x)=>sum+x.size,0),files:entries,excludedSecretFiles:skippedSecrets,note:'Credential and secret files are intentionally excluded. SHA-256 hashes allow every exported file to be verified.'};
-    zip.addFile('bankroll-massbackup-manifest.json',Buffer.from(JSON.stringify(manifest,null,2)));
-    archivePath=path.join(os.tmpdir(),'bankroll-massbackup-'+Date.now()+'.zip');
-    zip.writeZip(archivePath);
-    const archive=fs.readFileSync(archivePath);
-    const uploadLimit=interaction.guild?.maximumUploadLimit || 25*1024*1024;
-    if(archive.length>uploadLimit) {
-      const size=(archive.length/1024/1024).toFixed(2), limit=(uploadLimit/1024/1024).toFixed(2);
-      return await interaction.editReply('❌ The ZIP is '+size+' MiB, but this server allows uploads up to '+limit+' MiB. No split files were created, so the export was not posted. Increase the server upload limit or reduce the export size, then try again.');
+    await walk(root);
+    if (!files.length) throw new Error('The data directory contained no exportable files.');
+    setProgress(12, 'Scanning complete', files.length + ' files found; hashing and adding them to the ZIP…');
+    await updateProgress();
+
+    const zip = new yazl.ZipFile(), entries = [];
+    let totalBytes = 0;
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index], hash = crypto.createHash('sha256');
+      let size = 0;
+      for await (const chunk of fs.createReadStream(file.full)) {
+        hash.update(chunk);
+        size += chunk.length;
+      }
+      entries.push({ path: file.rel, size, sha256: hash.digest('hex') });
+      totalBytes += size;
+      zip.addFile(file.full, 'bankroll-data/' + file.rel);
+      if ((index + 1) % 5 === 0 || index + 1 === files.length) {
+        const pct = 12 + Math.round(((index + 1) / files.length) * 53);
+        setProgress(pct, 'Preparing ZIP contents', (index + 1) + ' / ' + files.length + ' files verified (' + (totalBytes / 1024 / 1024).toFixed(2) + ' MiB).');
+        if ((index + 1) % 10 === 0 || index + 1 === files.length) await updateProgress();
+      }
     }
-    const attachment=new AttachmentBuilder(archive,{name:'bankroll-massbackup.zip'});
-    const summary='✅ **Bankroll mass backup** — '+entries.length+' files, '+(manifest.totalBytes/1024/1024).toFixed(2)+' MiB of source data; ZIP size **'+(archive.length/1024/1024).toFixed(2)+' MiB**. The archive includes a SHA-256 verification manifest.'+(skippedSecrets.length?'\n🔒 Excluded '+skippedSecrets.length+' credential/secret file(s) for security.':'')+'\n⚠️ This ZIP is visible and downloadable by everyone who can view this channel. It contains Bankroll data; share it only in a channel where that is appropriate.'+'\nThis export does not delete or alter live data.';
-    await interaction.editReply({content:summary,files:[attachment]});
-    console.log('Mass backup export created: '+entries.length+' files, '+archive.length+' bytes. Posted publicly in channel '+interaction.channelId+'.');
-  }catch(error){console.error('Mass backup export failed:',error.stack||error);await interaction.editReply('❌ Mass backup export failed: '+short(error.message||error,900)+'. No live data was deleted.');}
-  finally{if(archivePath)await fs.promises.unlink(archivePath).catch(()=>{});}
+    const manifest = {
+      format: 'bankroll-massbackup-v1',
+      createdAt: new Date().toISOString(),
+      dataDirectory: DATA_DIR_STATUS,
+      fileCount: entries.length,
+      totalBytes,
+      files: entries,
+      excludedSecretFiles: skippedSecrets,
+      note: 'Credential and secret files are intentionally excluded. SHA-256 hashes allow every exported file to be verified.'
+    };
+    zip.addBuffer(Buffer.from(JSON.stringify(manifest, null, 2)), 'bankroll-massbackup-manifest.json');
+
+    archivePath = path.join(os.tmpdir(), 'bankroll-massbackup-' + Date.now() + '.zip');
+    const output = fs.createWriteStream(archivePath);
+    let compressedBytes = 0;
+    zip.outputStream.on('data', chunk => { compressedBytes += chunk.length; });
+    zip.outputStream.on('error', error => output.destroy(error));
+    output.on('error', error => console.error('Mass backup ZIP stream failed:', error));
+    zip.outputStream.pipe(output);
+    const writeFinished = new Promise((resolve, reject) => {
+      output.once('finish', resolve);
+      output.once('error', reject);
+    });
+    zip.end();
+    setProgress(66, 'Compressing ZIP', 'Writing archive… ' + (compressedBytes / 1024 / 1024).toFixed(2) + ' MiB written.');
+    progressTimer && clearInterval(progressTimer);
+    progressTimer = setInterval(() => {
+      const estimatedTotal = Math.max(totalBytes * 1.05 + entries.length * 256, 1);
+      const compressionPct = Math.min(94, 66 + (compressedBytes / estimatedTotal) * 28);
+      setProgress(compressionPct, 'Compressing ZIP', (compressedBytes / 1024 / 1024).toFixed(2) + ' MiB written; ' + entries.length + ' files included.');
+      updateProgress().catch(() => {});
+    }, 1800);
+    await writeFinished;
+    setProgress(96, 'ZIP created', 'Checking upload size and preparing the public attachment…');
+    await updateProgress();
+
+    const archive = await fs.promises.readFile(archivePath);
+    const uploadLimit = interaction.guild?.maximumUploadLimit || 25 * 1024 * 1024;
+    if (archive.length > uploadLimit) {
+      const size = (archive.length / 1024 / 1024).toFixed(2), limit = (uploadLimit / 1024 / 1024).toFixed(2);
+      return await interaction.editReply('❌ The ZIP is ' + size + ' MiB, but this server allows uploads up to ' + limit + ' MiB. No split files were created, so the export was not posted. Increase the server upload limit or reduce the export size, then try again.');
+    }
+    const attachment = new AttachmentBuilder(archive, { name: 'bankroll-massbackup.zip' });
+    const summary = '✅ **Bankroll mass backup** — ' + entries.length + ' files, ' + (totalBytes / 1024 / 1024).toFixed(2) + ' MiB of source data; ZIP size **' + (archive.length / 1024 / 1024).toFixed(2) + ' MiB**. The archive includes a SHA-256 verification manifest.' + (skippedSecrets.length ? '\n🔒 Excluded ' + skippedSecrets.length + ' credential/secret file(s) for security.' : '') + '\n⚠️ This ZIP is visible and downloadable by everyone who can view this channel. It contains Bankroll data; share it only in a channel where that is appropriate.' + '\nThis export does not delete or alter live data.';
+    if (progressTimer) clearInterval(progressTimer);
+    progressTimer = null;
+    await interaction.editReply({ content: summary, files: [attachment] });
+    console.log('Mass backup export created: ' + entries.length + ' files, ' + archive.length + ' bytes. Posted publicly in channel ' + interaction.channelId + '.');
+  } catch (error) {
+    console.error('Mass backup export failed:', error.stack || error);
+    await interaction.editReply('❌ Mass backup export failed: ' + short(error.message || error, 900) + '. No live data was deleted.');
+  } finally {
+    if (progressTimer) clearInterval(progressTimer);
+    if (archivePath) await fs.promises.unlink(archivePath).catch(() => {});
+  }
 }
 
 async function cmdRecovery(interaction) {
