@@ -511,7 +511,7 @@ const DRIVE_DATABASE_EXCLUSIONS = new Set([
 // until Google Drive has committed it. Local files remain compatibility caches.
 function eligibleDriveDatabase(file) {
   const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
-  return /^[a-z0-9_.-]+\\.json$/i.test(relative) && !DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase()) ? relative : null;
+  return /^[a-z0-9_.-]+\.json$/i.test(relative) && !DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase()) ? relative : null;
 }
 async function commitNonPaymentDatabaseToDrive(file, value) {
   if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected');
