@@ -9461,7 +9461,8 @@ app.all('/:name/:token', async (req, res) => {
       delete downloads[token];
     }
     activeDownloadTokens.delete(token);
-    saveDownloads();
+    void commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads)
+      .catch(error => console.error('Completed download database commit failed:', error.message));
     recordDownloadEvent('download_completed', {
       file:t.name, customerId:t.customerId, agentId:t.agentId, token,
       detail:`${t.testMode ? '[TEST] ' : ''}Completed file transfer: ${expectedBytes} bytes in ${elapsedMs} ms at ${new Date(downloadedAt).toISOString()}.`
@@ -9488,7 +9489,14 @@ app.all('/:name/:token', async (req, res) => {
     }).catch(error => console.error('Interrupted download token release failed:', error.message));
   } });
   const stream = remoteSource.stream;
-  stream.on('error', (e) => { t.used=false;activeDownloadTokens.delete(token);saveDownloads();recordDownloadEvent('download_failed',{file:t.name,customerId:t.customerId,token,detail:short(e.message,180)});res.destroy(); });
+  stream.on('error', (e) => {
+    void lifecycle.interrupted().then(async () => {
+      activeDownloadTokens.delete(token);
+      await commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads);
+      recordDownloadEvent('download_failed', { file:t.name, customerId:t.customerId, token, detail:short(e.message,180) });
+    }).catch(error => console.error('Download failure recovery failed:', error.message));
+    res.destroy();
+  });
   stream.pipe(res);
 });
 
