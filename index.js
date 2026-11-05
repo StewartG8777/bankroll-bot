@@ -7698,12 +7698,12 @@ async function cmdBackupManagement(interaction) {
 async function cmdMassBackup(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can export a full data archive.');
   if (!restoreDone) return interaction.editReply('Startup recovery is still running. Wait until /backup status reports recovery complete, then run /massbackup again.');
-  await interaction.editReply('Building a complete Bankroll data export. Credentials and secret keys are deliberately excluded.');
+  await interaction.editReply('Building a complete Bankroll data export. The finished ZIP will be posted publicly in this channel. Credentials and secret keys are deliberately excluded.');
   let archivePath = null;
   try {
     await flushSaves();
     const zip = new AdmZip(), entries = [], skippedSecrets = [];
-    const secretName = /(^\.env|oauth|credential|secret|token|private[-_]?key|service[-_]?account)/i;
+    const secretName = /(^\\.env|oauth|credential|secret|token|private[-_]?key|service[-_]?account)/i;
     const excludedDirs = new Set(['node_modules','.git','tmp','temp']);
     const root = path.resolve(DATA_DIR);
     function walk(dir) {
@@ -7722,13 +7722,18 @@ async function cmdMassBackup(interaction) {
     if(!entries.length)throw new Error('The data directory contained no exportable files.');
     const manifest={format:'bankroll-massbackup-v1',createdAt:new Date().toISOString(),dataDirectory:DATA_DIR_STATUS,fileCount:entries.length,totalBytes:entries.reduce((sum,x)=>sum+x.size,0),files:entries,excludedSecretFiles:skippedSecrets,note:'Credential and secret files are intentionally excluded. SHA-256 hashes allow every exported file to be verified.'};
     zip.addFile('bankroll-massbackup-manifest.json',Buffer.from(JSON.stringify(manifest,null,2)));
-    archivePath=path.join(os.tmpdir(),'bankroll-massbackup-'+Date.now()+'.zip');zip.writeZip(archivePath);
-    const archive=fs.readFileSync(archivePath),partBytes=20*1024*1024,totalParts=Math.ceil(archive.length/partBytes),parts=[];
-    for(let offset=0;offset<archive.length;offset+=partBytes){const n=Math.floor(offset/partBytes)+1;parts.push(new AttachmentBuilder(archive.subarray(offset,Math.min(offset+partBytes,archive.length)),{name:totalParts===1?'bankroll-massbackup.zip':'bankroll-massbackup.zip.part'+String(n).padStart(3,'0')}));}
-    const summary='✅ Mass backup archive created. **'+entries.length+' files**, '+(manifest.totalBytes/1024/1024).toFixed(2)+' MiB of source data; ZIP size **'+(archive.length/1024/1024).toFixed(2)+' MiB**. Every included file has a SHA-256 entry in the manifest.'+(skippedSecrets.length?'\n🔒 Excluded '+skippedSecrets.length+' credential/secret file(s) for security.':'')+(totalParts>1?'\nThe ZIP is split into '+totalParts+' parts; download every part and concatenate in numeric order.':'')+'\nThis export does not delete or alter live data.';
-    await interaction.editReply({content:summary,files:parts.slice(0,10)});
-    for(let offset=10;offset<parts.length;offset+=10)await interaction.followUp({content:'Mass backup archive parts '+(offset+1)+'–'+Math.min(offset+10,totalParts)+' of '+totalParts+'.',files:parts.slice(offset,offset+10),ephemeral:true});
-    console.log('Mass backup export created: '+entries.length+' files, '+archive.length+' bytes.');
+    archivePath=path.join(os.tmpdir(),'bankroll-massbackup-'+Date.now()+'.zip');
+    zip.writeZip(archivePath);
+    const archive=fs.readFileSync(archivePath);
+    const uploadLimit=interaction.guild?.maximumUploadLimit || 25*1024*1024;
+    if(archive.length>uploadLimit) {
+      const size=(archive.length/1024/1024).toFixed(2), limit=(uploadLimit/1024/1024).toFixed(2);
+      return await interaction.editReply('❌ The ZIP is '+size+' MiB, but this server allows uploads up to '+limit+' MiB. No split files were created, so the export was not posted. Increase the server upload limit or reduce the export size, then try again.');
+    }
+    const attachment=new AttachmentBuilder(archive,{name:'bankroll-massbackup.zip'});
+    const summary='✅ **Bankroll mass backup** — '+entries.length+' files, '+(manifest.totalBytes/1024/1024).toFixed(2)+' MiB of source data; ZIP size **'+(archive.length/1024/1024).toFixed(2)+' MiB**. The archive includes a SHA-256 verification manifest.'+(skippedSecrets.length?'\\n🔒 Excluded '+skippedSecrets.length+' credential/secret file(s) for security.':'')+'\\n⚠️ This ZIP is visible and downloadable by everyone who can view this channel. It contains Bankroll data; share it only in a channel where that is appropriate.'+'\\nThis export does not delete or alter live data.';
+    await interaction.editReply({content:summary,files:[attachment]});
+    console.log('Mass backup export created: '+entries.length+' files, '+archive.length+' bytes. Posted publicly in channel '+interaction.channelId+'.');
   }catch(error){console.error('Mass backup export failed:',error.stack||error);await interaction.editReply('❌ Mass backup export failed: '+short(error.message||error,900)+'. No live data was deleted.');}
   finally{if(archivePath)await fs.promises.unlink(archivePath).catch(()=>{});}
 }
@@ -7941,7 +7946,7 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.deferReply({ ephemeral: true });
         return await cmdBackupManagement(interaction);
       case 'massbackup':
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ ephemeral: false });
         return await cmdMassBackup(interaction);
       case 'recovery':
         await interaction.deferReply({ ephemeral: true });
