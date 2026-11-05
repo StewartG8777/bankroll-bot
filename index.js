@@ -3095,6 +3095,12 @@ const onReady = async () => {
   } catch (e) { console.error('Restart-loop check failed:', e.message); }
   await autoRestoreOnStartup();
   try {
+    const recovered = await recoverNonPaymentDatabaseFromDrive();
+    console.log('Drive non-payment database recovery:', recovered.restored, 'restored,', recovered.skipped, 'preserved or unavailable');
+  } catch (error) {
+    console.error('Drive non-payment database recovery failed:', error.message);
+  }
+  try {
     const hydrated = await hydrateNonPaymentCacheFromDrive();
     console.log('Direct Drive cache hydration:', hydrated.restored, 'restored,', hydrated.skipped, 'skipped');
   } catch (error) {
@@ -7482,6 +7488,60 @@ async function uploadNonPaymentFileToDrive(localPath) {
 
 // Restore missing non-payment cache objects from the direct Drive store.
 // This runs before the bot starts serving requests, and never modifies payments.
+// Recover current non-payment JSON objects before processing orders or downloads.
+// Existing populated local data is preserved to avoid discarding offline changes.
+// Payment records and OAuth credentials are never read from this object store.
+async function recoverNonPaymentDatabaseFromDrive() {
+  if (!googleDriveIsConnected()) return { restored: 0, skipped: 0 };
+  const { google } = require('googleapis');
+  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+  const entries = [
+    ['vault.json', VAULT_FILE, 'object', value => { vault = value; }],
+    ['deliveries.json', DELIVERIES_FILE, 'object', value => { deliveries = value; }],
+    ['downloads.json', DOWNLOADS_FILE, 'object', value => { downloads = value; }],
+    ['scheduled_sends.json', SEND_JOBS_FILE, 'object', value => { sendJobs = value; }],
+    ['download_history.json', DOWNLOAD_HISTORY_FILE, 'array', value => { downloadHistory = value.slice(-500); }],
+    ['presence.json', PRESENCE_FILE, 'object', value => { savedPresence = value; }],
+  ];
+  let restored = 0, skipped = 0;
+  for (const [name, file, kind, apply] of entries) {
+    let local;
+    try { local = JSON.parse(await fs.promises.readFile(file, 'utf8')); } catch {}
+    if (local && typeof local === 'object' && Object.keys(local).length) {
+      apply(local);
+      skipped++;
+      continue;
+    }
+    const remote = await store.get(name);
+    if (!remote) { skipped++; continue; }
+    const chunks = [];
+    let bytes = 0;
+    for await (const chunk of remote.stream) {
+      bytes += chunk.length;
+      if (bytes > 16 * 1024 * 1024) throw new Error('Drive database exceeds recovery limit: ' + name);
+      chunks.push(Buffer.from(chunk));
+    }
+    const raw = Buffer.concat(chunks).toString('utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || (kind === 'array' ? !Array.isArray(parsed) : Array.isArray(parsed))) {
+      throw new Error('Invalid Drive database structure: ' + name);
+    }
+    const temp = file + '.drive-db-' + crypto.randomBytes(6).toString('hex');
+    try {
+      await fs.promises.writeFile(temp, raw, { flag: 'wx' });
+      await fs.promises.rename(temp, file);
+    } catch (error) {
+      await fs.promises.unlink(temp).catch(() => {});
+      throw error;
+    }
+    apply(parsed);
+    restored++;
+  }
+  return { restored, skipped };
+}
+
 async function hydrateNonPaymentCacheFromDrive() {
   if (!googleDriveIsConnected()) return { restored: 0, skipped: 0 };
   const { google } = require('googleapis');
