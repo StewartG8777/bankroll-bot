@@ -15,6 +15,7 @@ const os = require('os');
 const { getPerformanceSnapshot } = require('./systems/performance');
 const createGoogleDriveSystem = require('./systems/google-drive');
 const {requirePrimaryContext} = require('./systems/primary-storage-context');
+const {protectInteractionDurability,primaryWebhookGate}=require('./systems/primary-ack-guards');
 const {isAllowedRelativePath} = require('./systems/google-drive-primary-storage');
 const PRIMARY_MODE = process.env.BANKROLL_DRIVE_PRIMARY === '1';
 const PRIMARY_CONTEXT = PRIMARY_MODE ? requirePrimaryContext() : null;
@@ -30,26 +31,6 @@ function primaryDirty(file) {
 async function primaryDurableBarrier() {
   if (PRIMARY_MODE) await PRIMARY_MANAGER.flush();
 }
-function protectPrimaryInteraction(interaction) {
-  if (!PRIMARY_MODE) return;
-  for (const method of ['reply', 'editReply', 'followUp', 'update']) {
-    if (typeof interaction[method] !== 'function') continue;
-    const original = interaction[method].bind(interaction);
-    interaction[method] = async (...args) => {
-      try { await primaryDurableBarrier(); }
-      catch (error) {
-        console.error('[PrimaryDrive] Refused Discord success acknowledgment:', error.message);
-        return original({
-          content: 'Storage confirmation failed. This operation is NOT confirmed as durably saved. Contact the bot owner before retrying.',
-          embeds: [], components: [], files: [],
-          ...(method === 'reply' || method === 'followUp' ? { ephemeral: true } : {})
-        });
-      }
-      return original(...args);
-    };
-  }
-}
-
 const { whereFrom } = require('./systems/interaction-location');
 const { createDataPathHelpers } = require('./systems/data-paths');
 const { zipSpawnCodes } = require('./systems/spawn-code-parser');
@@ -7839,7 +7820,7 @@ client.on('interactionCreate', async (interaction) => {
       });
       return;
     }
-    protectPrimaryInteraction(interaction);
+    if (PRIMARY_MODE) protectInteractionDurability(interaction,PRIMARY_MANAGER);
     if (interaction.isMessageContextMenuCommand()) {
       if (!allowed.has(interaction.user.id) || interaction.user.id !== OWNER_ID) {
         return interaction.reply({ content: 'Only the bot owner can delete Bankroll messages.', ephemeral: true });
@@ -8303,37 +8284,8 @@ async function monitorRenderDeployments() {
 // ---------- Render deployment webhook ----------
 const app = express();
 
-// Gate live financial webhooks until Drive startup completes, and delay any 2xx
-// acknowledgment until the latest queued storage generation is confirmed.
-// Stripe and Monzo transaction/business logic remains unchanged.
-app.use((req, res, next) => {
-  if (!PRIMARY_MODE) return next();
-  if (req.method !== 'POST' || !['/webhook', '/monzo-webhook'].includes(req.path)) return next();
-  if (!PRIMARY_MANAGER.status().active) return res.status(503).send('Primary storage not ready; retry webhook.');
-  const originalSend = res.send.bind(res);
-  let responding = false;
-  res.send = (...args) => {
-    if (responding || res.statusCode < 200 || res.statusCode >= 300) return originalSend(...args);
-    responding = true;
-    void primaryDurableBarrier().then(
-      () => originalSend(...args),
-      error => {
-        console.error('[PrimaryDrive] Refused successful payment webhook acknowledgment:', error.message);
-        if (!res.headersSent) {
-          res.status(503);
-          res.removeHeader('Content-Length');
-          res.removeHeader('Content-Type');
-          originalSend('Primary storage unavailable; retry webhook.');
-        } else {
-          res.destroy(error);
-        }
-      }
-    );
-    return res;
-  };
-  next();
-});
-
+// Do not acknowledge payments before the authoritative generation is saved.
+if (PRIMARY_MODE) app.use(primaryWebhookGate(PRIMARY_MANAGER));
 
 // ShareX uploads are authenticated with a dedicated secret. ShareX sends the
 // captured image as the raw request body (Content-Type: image/png/jpeg/webp).
