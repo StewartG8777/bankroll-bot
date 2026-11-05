@@ -2249,7 +2249,11 @@ const driveCmd = common(new SlashCommandBuilder().setName('drive').setDescriptio
   .addSubcommand((sub) => sub.setName('connect').setDescription('Connect the Google account used for backups'))
   .addSubcommand((sub) => sub.setName('setup').setDescription('Create and verify the complete BANKROLL folder structure'))
   .addSubcommand((sub) => sub.setName('status').setDescription('Check Google Drive connection and backup status'))
-  .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate Discord and Google Drive backup')));
+  .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate Discord and Google Drive backup'))
+  .addSubcommand((sub) => sub.setName('snapshot').setDescription('Create a verified primary-storage generation (owner only)'))
+  .addSubcommand((sub) => sub.setName('generations').setDescription('List verified Drive snapshot generations (owner only)'))
+  .addSubcommand((sub) => sub.setName('rollback-check').setDescription('Verify a rollback generation without changing live data')
+    .addStringOption((o) => o.setName('generation').setDescription('Generation UUID from /drive generations').setRequired(true))));
 
 const driveCredentialsCmd = common(
   new SlashCommandBuilder()
@@ -8279,6 +8283,18 @@ async function cmdStorageDiagnostics(interaction) {
   return interaction.editReply({ embeds: [embed] });
 }
 
+// These controls are isolated from payments and existing backup uploads.
+// Only explicit owner-initiated primary snapshots use this serialized queue.
+const { createSerializedStorageQueue } = require('./systems/serialized-storage-queue');
+const primaryStorageQueue = createSerializedStorageQueue();
+async function createDriveGenerationStore(drive) {
+  const { createGoogleDrivePrimaryStorage } = require('./systems/google-drive-primary-storage');
+  const { google } = require('googleapis');
+  const folders = await resolveGoogleDriveFolders(drive);
+  const folderIds = Object.fromEntries(GOOGLE_DRIVE_FOLDER_NAMES.map((name) => [name, folders[name]?.id]));
+  return createGoogleDrivePrimaryStorage({ google, auth: makeGoogleOAuthClient(), dataDir: DATA_DIR, folderIds });
+}
+
 async function cmdDrive(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage Google Drive backups.');
   const sub = interaction.options.getSubcommand();
@@ -8297,6 +8313,27 @@ async function cmdDrive(interaction) {
   try {
     const { google } = require('googleapis');
     const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+    if (['snapshot', 'generations', 'rollback-check'].includes(sub)) {
+      const store = await createDriveGenerationStore(drive);
+      if (sub === 'snapshot') {
+        if (!restoreDone) return interaction.editReply('Refusing snapshot: startup recovery has not completed.');
+        const result = await primaryStorageQueue.enqueue(() => store.snapshot({ flush: async () => {
+          flushSaves();
+          await flushDriveDatabaseSyncs();
+        } }));
+        return interaction.editReply('Verified Drive snapshot created. Generation: ' + result.generation + '\\nFiles: ' + result.files + '. Existing Discord and Drive backups are unchanged.');
+      }
+      if (sub === 'generations') {
+        const items = await store.listGenerations();
+        if (!items.length) return interaction.editReply('No primary-storage generations yet. Run /drive snapshot first.');
+        return interaction.editReply('Recent BANKROLL generations:\\n' + items.slice(0, 12).map(item => item.generation + ' — ' + item.files + ' file(s) — ' + item.createdAt).join('\\n'));
+      }
+      if (sub === 'rollback-check') {
+        const generation = interaction.options.getString('generation');
+        const verified = await primaryStorageQueue.enqueue(() => store.verifyGeneration(generation));
+        return interaction.editReply('Verified SHA-256 and size for all ' + verified.files + ' file(s) in generation ' + verified.generation + '. No files were changed. Actual rollback is restricted to offline maintenance mode; stop the bot before applying an older generation.');
+      }
+    }
     if (sub === 'setup') {
       const folders = await resolveGoogleDriveFolders(drive);
       const lines = GOOGLE_DRIVE_FOLDER_NAMES.map((name) => '• BANKROLL/' + name);
