@@ -500,8 +500,16 @@ function queueNonPaymentDatabaseSync(file) {
     await store.put(relative, Buffer.from(await fs.promises.readFile(file)), { mimeType: 'application/json' });
   });
   pendingDriveDatabaseSyncs.set(relative, next);
-  next.catch(error => console.error('Google Drive database sync failed for', relative, error.message))
-    .finally(() => { if (pendingDriveDatabaseSyncs.get(relative) === next) pendingDriveDatabaseSyncs.delete(relative); });
+  next.catch(error => {
+    console.error('Google Drive database sync failed for', relative, error.message);
+    // Keep the local cache and retry: never discard an unconfirmed write.
+    const retry = setTimeout(() => {
+      if (fs.existsSync(file) && googleDriveIsConnected()) queueNonPaymentDatabaseSync(file);
+    }, 60 * 1000);
+    retry.unref?.();
+  }).finally(() => {
+    if (pendingDriveDatabaseSyncs.get(relative) === next) pendingDriveDatabaseSyncs.delete(relative);
+  });
 }
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
