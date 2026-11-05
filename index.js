@@ -473,9 +473,73 @@ function restorePendingDeliveryRetries() {
 
 // Write to a temp file then rename, so a crash mid-write can never leave a half-written data file.
 function atomicWrite(file, data) {
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, file);
+  // Unique temporary names avoid collisions between independent writers.
+  require('./systems/atomic-storage').atomicWriteFile(file, data);
+  // Non-payment JSON is asynchronously mirrored to Drive after a successful
+  // local atomic commit. Payment and credential files are deliberately excluded.
+  queueNonPaymentDatabaseSync(file);
+}
+const pendingDriveDatabaseSyncs = new Map();
+const DRIVE_DATABASE_EXCLUSIONS = new Set([
+  'monzo_payments.json', 'monzo_review.json',
+  'stripe_balance_history.json', 'stripe_balance_snapshots.json',
+  'webhook_events.json', 'stripe_ledger.json',
+  'google-drive-token.json', 'google-oauth.json',
+]);
+// Await this for operations which must not acknowledge a database change
+// until Google Drive has committed it. Local files remain compatibility caches.
+async function commitNonPaymentDatabaseToDrive(file, value) {
+  if (!googleDriveIsConnected()) throw new Error('Google Drive is not connected');
+  const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
+  if (!/^[a-z0-9_.-]+\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) {
+    throw new Error('This file is not an eligible non-payment database');
+  }
+  const snapshot = Buffer.from(JSON.stringify(value));
+  const previous = pendingDriveDatabaseSyncs.get(relative) || Promise.resolve();
+  const next = previous.catch(() => {}).then(async () => {
+    const { google } = require('googleapis');
+    const { createDriveObjectStore } = require('./systems/drive-object-store');
+    const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+    const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+    await store.put(relative, snapshot);
+    const tmp = file + '.cache-' + crypto.randomBytes(5).toString('hex');
+    try {
+      await fs.promises.writeFile(tmp, snapshot, { flag: 'wx' });
+      await fs.promises.rename(tmp, file);
+    } catch (error) {
+      await fs.promises.unlink(tmp).catch(() => {});
+      console.error('Drive commit succeeded but local cache update failed:', relative, error.message);
+    }
+  });
+  pendingDriveDatabaseSyncs.set(relative, next);
+  try { await next; } finally {
+    if (pendingDriveDatabaseSyncs.get(relative) === next) pendingDriveDatabaseSyncs.delete(relative);
+  }
+}
+function queueNonPaymentDatabaseSync(file) {
+  if (!restoreDone || !googleDriveIsConnected()) return;
+  const relative = path.relative(DATA_DIR, file).split(path.sep).join('/');
+  if (!/^[a-z0-9_.-]+\.json$/i.test(relative) || DRIVE_DATABASE_EXCLUSIONS.has(relative.toLowerCase())) return;
+  const snapshot = Buffer.from(fs.readFileSync(file));
+  const previous = pendingDriveDatabaseSyncs.get(relative) || Promise.resolve();
+  const next = previous.catch(() => {}).then(async () => {
+    const { google } = require('googleapis');
+    const { createDriveObjectStore } = require('./systems/drive-object-store');
+    const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+    const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+    await store.put(relative, snapshot, { mimeType: 'application/json' });
+  });
+  pendingDriveDatabaseSyncs.set(relative, next);
+  next.catch(error => {
+    console.error('Google Drive database sync failed for', relative, error.message);
+    // Keep the local cache and retry: never discard an unconfirmed write.
+    const retry = setTimeout(() => {
+      if (fs.existsSync(file) && googleDriveIsConnected()) queueNonPaymentDatabaseSync(file);
+    }, 60 * 1000);
+    retry.unref?.();
+  }).finally(() => {
+    if (pendingDriveDatabaseSyncs.get(relative) === next) pendingDriveDatabaseSyncs.delete(relative);
+  });
 }
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -861,18 +925,9 @@ async function streamToFile(url, dest, limitBytes) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(5 * 60 * 1000) });
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-      const hash = crypto.createHash('sha256');
-      let size = 0;
-      const meter = new Transform({
-        transform(chunk, _enc, cb) {
-          size += chunk.length;
-          if (size > limitBytes) return cb(new Error('TOO_BIG'));
-          hash.update(chunk);
-          cb(null, chunk);
-        },
-      });
+      const meter = require('./systems/stream-integrity').createIntegrityMeter({ maxBytes: limitBytes });
       await pipeline(Readable.fromWeb(res.body), meter, fs.createWriteStream(dest));
-      return { size, sha256: hash.digest('hex') };
+      return meter.result();
     } catch (e) {
       lastErr = e;
       try {
@@ -1065,7 +1120,8 @@ function cleanDownloads() {
   const now = Date.now(); let removed = 0;
   for (const [token, dl] of Object.entries(downloads)) {
     const expired = !dl || (dl.expiresAt != null && Number.isFinite(Number(dl.expiresAt)) && now > Number(dl.expiresAt));
-    const missing = !dl?.path || !fs.existsSync(dl.path);
+    // Missing local cache is normal with Drive-primary hosting; do not invalidate its link.
+    const missing = !dl?.path;
     if ((expired || missing || (dl.used && (!dl.multiUse || !!dl.vaultKey))) && !activeDownloadTokens.has(token)) {
       if (dl?.path) { try { fs.unlinkSync(dl.path); } catch {} }
       delete downloads[token]; removed++;
@@ -1185,6 +1241,13 @@ async function makeDownloadLink(d, paymentIntentId) {
   // A hard link is instant and uses no extra disk; fall back to a copy if links are not possible.
   try { await fs.promises.link(d.path, downloadPath); }
   catch { await fs.promises.copyFile(d.path, downloadPath); }
+  // Do not issue a customer link until its exact download object is durable in Drive.
+  try {
+    await uploadNonPaymentFileToDrive(downloadPath);
+  } catch (error) {
+    await fs.promises.unlink(downloadPath).catch(() => {});
+    throw new Error('Customer delivery could not be saved to Google Drive: ' + error.message);
+  }
   downloads[token] = {
     path: downloadPath,
     name: safeName,
@@ -1197,7 +1260,13 @@ async function makeDownloadLink(d, paymentIntentId) {
     multiUse: !!d.multiUse,
     testMode: !!d.testMode,
   };
-  saveDownloads();
+  try {
+    await commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads);
+  } catch (error) {
+    delete downloads[token];
+    await fs.promises.unlink(downloadPath).catch(() => {});
+    throw new Error('Customer download record was not committed to Google Drive: ' + error.message);
+  }
   recordDownloadEvent('link_created', { file: safeName, customerId: d.customerId || OWNER_ID, agentId: d.agentId || OWNER_ID, token, detail: d.multiUse ? 'Public multi-use vault export link; no time expiry.' : 'One-time download link; no time expiry. Link is invalidated after a successful download.' });
   const slug = (d.description || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '') || 'order';
   return `${BASE_URL}/bankroll-${slug}-download/${token}`;
@@ -3068,6 +3137,18 @@ const onReady = async () => {
     }
   } catch (e) { console.error('Restart-loop check failed:', e.message); }
   await autoRestoreOnStartup();
+  try {
+    const recovered = await recoverNonPaymentDatabaseFromDrive();
+    console.log('Drive non-payment database recovery:', recovered.restored, 'restored,', recovered.skipped, 'preserved or unavailable');
+  } catch (error) {
+    console.error('Drive non-payment database recovery failed:', error.message);
+  }
+  try {
+    const hydrated = await hydrateNonPaymentCacheFromDrive();
+    console.log('Direct Drive cache hydration:', hydrated.restored, 'restored,', hydrated.skipped, 'skipped');
+  } catch (error) {
+    console.error('Direct Drive cache hydration failed; local and recovery copies were left intact:', error.message);
+  }
   // Always establish a fresh recovery point after startup restore. Previously a
   // quiet bot could restart and never create a new snapshot until another save.
   void backupData();
@@ -4114,8 +4195,15 @@ async function cmdVault(interaction) {
       sha256: info.sha256,
       addedAt: Date.now(),
     };
+    try {
+      await uploadNonPaymentFileToDrive(filePath);
+      await commitNonPaymentDatabaseToDrive(VAULT_FILE, vault);
+    } catch (driveError) {
+      delete vault[key];
+      try { fs.unlinkSync(filePath); } catch {}
+      return interaction.editReply('Vault file was not added because Google Drive could not confirm permanent storage: ' + short(driveError.message, 350));
+    }
     delete blobBackedUp[relData(filePath)];
-    saveVault();
     recordNotification('vault.add', 'Vault file added', `${key}: ${att.name}`, 'success');
 
     let codeNote = '';
@@ -4163,15 +4251,28 @@ async function cmdVault(interaction) {
       return interaction.editReply('Could not replace the vault file: ' + short(error.message, 400));
     }
 
+    try {
+      await uploadNonPaymentFileToDrive(replacementPath);
+    } catch (driveError) {
+      try { fs.unlinkSync(replacementPath); } catch {}
+      return interaction.editReply('Vault replacement cancelled: Google Drive did not confirm permanent storage: ' + short(driveError.message, 350));
+    }
     const previousPath = item.path;
+    const previousRecord = { ...item };
     item.path = replacementPath;
     item.originalName = newName;
     item.size = info.size;
     item.sha256 = info.sha256;
     item.addedAt = Date.now();
     item.replacedAt = Date.now();
+    try {
+      await commitNonPaymentDatabaseToDrive(VAULT_FILE, vault);
+    } catch (driveError) {
+      Object.assign(item, previousRecord);
+      try { fs.unlinkSync(replacementPath); } catch {}
+      return interaction.editReply('Vault replacement cancelled: Drive database commit failed: ' + short(driveError.message, 350));
+    }
     delete blobBackedUp[relData(replacementPath)];
-    saveVault();
 
     // Refresh copies attached to invoices that are still awaiting payment.
     // Paid/delivered orders are deliberately left unchanged.
@@ -7421,6 +7522,107 @@ async function resolveGoogleDriveFolders(drive) {
   return folders;
 }
 
+// Direct non-payment object uploads are confirmed before vault changes are acknowledged.
+// The existing local file is retained as a compatibility cache for ZIP editing and
+// Discord attachment flows; payment files never pass through this helper.
+async function uploadNonPaymentFileToDrive(localPath) {
+  const relative = relData(localPath);
+  if (!relative) throw new Error('File is outside the Bankroll data directory');
+  if (!googleDriveIsConnected()) throw new Error('Google Drive must be connected before adding a vault file');
+  const { google } = require('googleapis');
+  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const folders = await resolveGoogleDriveFolders(drive);
+  const store = createDriveObjectStore({ drive, folders });
+  return store.put(relative, fs.createReadStream(localPath));
+}
+
+// Restore missing non-payment cache objects from the direct Drive store.
+// This runs before the bot starts serving requests, and never modifies payments.
+// Recover current non-payment JSON objects before processing orders or downloads.
+// Existing populated local data is preserved to avoid discarding offline changes.
+// Payment records and OAuth credentials are never read from this object store.
+async function recoverNonPaymentDatabaseFromDrive() {
+  if (!googleDriveIsConnected()) return { restored: 0, skipped: 0 };
+  const { google } = require('googleapis');
+  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+  const entries = [
+    ['vault.json', VAULT_FILE, 'object', value => { vault = value; }],
+    ['deliveries.json', DELIVERIES_FILE, 'object', value => { deliveries = value; }],
+    ['downloads.json', DOWNLOADS_FILE, 'object', value => { downloads = value; }],
+    ['scheduled_sends.json', SEND_JOBS_FILE, 'object', value => { sendJobs = value; }],
+    ['download_history.json', DOWNLOAD_HISTORY_FILE, 'array', value => { downloadHistory = value.slice(-500); }],
+    ['presence.json', PRESENCE_FILE, 'object', value => { savedPresence = value; }],
+    ['notifications.json', NOTIFICATIONS_FILE, 'array', value => { notificationHistory = value.slice(-100); }],
+    ['wiped_customers.json', WIPED_CUSTOMERS_FILE, 'array', value => { wipedCustomers = new Set(value.map(String)); }],
+  ];
+  let restored = 0, skipped = 0;
+  for (const [name, file, kind, apply] of entries) {
+    // Drive wins on restart, even if an old local cache contains valid JSON.
+    // If Drive has no object, retain the local cache for legacy migration.
+    const remote = await store.get(name);
+    if (!remote) { skipped++; continue; }
+    const chunks = [];
+    let bytes = 0;
+    for await (const chunk of remote.stream) {
+      bytes += chunk.length;
+      if (bytes > 16 * 1024 * 1024) throw new Error('Drive database exceeds recovery limit: ' + name);
+      chunks.push(Buffer.from(chunk));
+    }
+    const raw = Buffer.concat(chunks).toString('utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || (kind === 'array' ? !Array.isArray(parsed) : Array.isArray(parsed))) {
+      throw new Error('Invalid Drive database structure: ' + name);
+    }
+    const temp = file + '.drive-db-' + crypto.randomBytes(6).toString('hex');
+    try {
+      await fs.promises.writeFile(temp, raw, { flag: 'wx' });
+      await fs.promises.rename(temp, file);
+    } catch (error) {
+      await fs.promises.unlink(temp).catch(() => {});
+      throw error;
+    }
+    apply(parsed);
+    restored++;
+  }
+  return { restored, skipped };
+}
+
+async function hydrateNonPaymentCacheFromDrive() {
+  if (!googleDriveIsConnected()) return { restored: 0, skipped: 0 };
+  const { google } = require('googleapis');
+  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const folders = await resolveGoogleDriveFolders(drive);
+  const store = createDriveObjectStore({ drive, folders });
+  const candidates = new Set();
+  for (const entry of Object.values(vault || {})) if (entry?.path) candidates.add(entry.path);
+  for (const entry of [...Object.values(deliveries || {}), ...Object.values(downloads || {})]) {
+    if (entry?.path && !entry.backupDownload) candidates.add(entry.path);
+  }
+  let restored = 0, skipped = 0;
+  for (const filePath of candidates) {
+    const relative = relData(filePath);
+    if (!relative || !/^(vault|files|deliveries)\//.test(relative)) { skipped++; continue; }
+    if (fs.existsSync(filePath)) { skipped++; continue; }
+    const object = await store.get(relative);
+    if (!object) { skipped++; continue; }
+    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+    const temp = filePath + '.drive-cache-' + crypto.randomBytes(6).toString('hex');
+    try {
+      await pipeline(object.stream, fs.createWriteStream(temp, { flags: 'wx' }));
+      await fs.promises.rename(temp, filePath);
+      restored++;
+    } catch (error) {
+      await fs.promises.unlink(temp).catch(() => {});
+      throw error;
+    }
+  }
+  return { restored, skipped };
+}
+
 async function backupToGoogleDrive(databaseFiles, storedPaths) {
   if (!googleDriveIsConnected()) return { connected: false, uploaded: 0, skipped: true };
   const { google } = require('googleapis');
@@ -7713,6 +7915,14 @@ async function restoreFromGoogleDrive({ restoreDatabase = true, restoreVault = t
   const manifest = JSON.parse(Buffer.concat(manifestChunks).toString('utf8'));
   if (!['bankroll-drive-layout-v2', 'bankroll-drive-layout-v3'].includes(manifest.format)) {
     throw new Error('This Google Drive recovery point uses an unsupported manifest format. Run /drive backup once to create a current verified recovery point.');
+  }
+  // Never restore from an unverified or internally inconsistent recovery point.
+  // Check the entire snapshot before changing any local files.
+  const { auditRecoveryManifest } = require('./systems/drive-integrity');
+  const audit = await auditRecoveryManifest(drive, manifest);
+  if (!audit.ok) {
+    throw new Error('Recovery point failed integrity verification (' + audit.issues.length +
+      ' issue(s)): ' + audit.issues.slice(0, 3).map(issue => issue.path + ': ' + issue.reason).join(', '));
   }
   let restoredDatabase = 0;
   let restoredVault = 0;
@@ -8079,6 +8289,10 @@ async function cmdRecovery(interaction) {
 async function cmdSystemDiagnostics(interaction, mode) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can view system diagnostics.');
   const p = getPerformanceSnapshot();
+  const cpu = process.cpuUsage();
+  const elapsedCpuSeconds = (cpu.user + cpu.system) / 1e6;
+  const cpuPerUptime = process.uptime() > 0 ? (100 * elapsedCpuSeconds / process.uptime()).toFixed(1) + '%' : 'Warming up';
+  const deploymentVersion = String(process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || process.env.COMMIT_SHA || 'Not supplied').slice(0, 40);
   const uptime = Math.floor(process.uptime());
   const uptimeText = Math.floor(uptime / 86400) + 'd ' + Math.floor((uptime % 86400) / 3600) + 'h ' + Math.floor((uptime % 3600) / 60) + 'm';
   const fields = [
@@ -8091,6 +8305,9 @@ async function cmdSystemDiagnostics(interaction, mode) {
     { name: 'Event-loop delay (mean)', value: p.eventLoop.meanMs === null ? 'Warming up' : p.eventLoop.meanMs.toFixed(2) + ' ms', inline: true },
     { name: 'Event-loop delay (p99)', value: p.eventLoop.p99Ms === null ? 'Warming up' : p.eventLoop.p99Ms.toFixed(2) + ' ms', inline: true },
     { name: 'CPU load (1m)', value: (os.loadavg()[0] || 0).toFixed(2), inline: true },
+    { name: 'Process CPU (lifetime avg)', value: cpuPerUptime, inline: true },
+    { name: 'Deployment commit', value: deploymentVersion, inline: true },
+    { name: 'Google Drive', value: googleDriveIsConnected() ? 'OAuth configured' : 'Disconnected', inline: true },
     { name: 'Backup', value: lastBackupAt ? '<t:' + Math.floor(lastBackupAt / 1000) + ':R>' : 'No successful backup recorded', inline: true },
     { name: 'Recovery', value: restoreDone ? 'Startup recovery complete' : 'Recovery not complete', inline: true },
     { name: 'Last backup error', value: short(lastBackupError || 'None', 900), inline: false },
@@ -9151,9 +9368,28 @@ app.get('/bankroll-log-copy/:token', (req, res) => {
   fs.createReadStream(c.path).on('error', () => res.destroy()).pipe(res);
 });
 
-app.get('/bankroll-backup-file/:token', (req, res) => {
+app.get('/bankroll-backup-file/:token', async (req, res) => {
   const fp = dataFilePaths().find((f) => backupToken(relData(f)) === req.params.token);
-  if (!fp || !fs.existsSync(fp)) return res.status(404).send('Not found');
+  if (!fp) return res.status(404).send('Not found');
+  if (!fs.existsSync(fp)) {
+    try {
+      const relative = relData(fp);
+      if (!relative || !googleDriveIsConnected()) return res.status(404).send('Not found');
+      const { google } = require('googleapis');
+      const { createDriveObjectStore } = require('./systems/drive-object-store');
+      const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+      const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+      const object = await store.get(relative);
+      if (!object) return res.status(404).send('Not found');
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(fp))}`);
+      object.stream.on('error', () => res.destroy()).pipe(res);
+      return;
+    } catch (error) {
+      console.error('Drive backup-file stream failed:', error.message);
+      return res.status(503).send('File temporarily unavailable');
+    }
+  }
   const ua = req.headers['user-agent'] || '';
   if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) return res.status(200).send('Backup file');
   res.setHeader('Content-Type', 'application/octet-stream');
@@ -9161,38 +9397,74 @@ app.get('/bankroll-backup-file/:token', (req, res) => {
   fs.createReadStream(fp).on('error', () => res.destroy()).pipe(res);
 });
 
+async function resolveCustomerDownloadStream(filePath) {
+  if (fs.existsSync(filePath)) return { stream: fs.createReadStream(filePath), size: fs.statSync(filePath).size };
+  if (!googleDriveIsConnected()) return null;
+  const relative = relData(filePath);
+  if (!relative) return null;
+  const { google } = require('googleapis');
+  const { createDriveObjectStore } = require('./systems/drive-object-store');
+  const drive = google.drive({ version: 'v3', auth: makeGoogleOAuthClient() });
+  const store = createDriveObjectStore({ drive, folders: await resolveGoogleDriveFolders(drive) });
+  return store.get(relative);
+}
+const { validateDownload, shouldConsumeDownload } = require('./systems/download-policy');
 const downloadAttempts = new Map();
-app.all('/:name/:token', (req, res) => {
+app.all('/:name/:token', async (req, res) => {
   if (!req.params.name.startsWith('bankroll-')) return res.status(404).send('Not found');
   const token = req.params.token; const remote=String(req.ip||req.socket?.remoteAddress||'unknown');
   const attempt=downloadAttempts.get(remote)||{count:0,resetAt:Date.now()+60000}; if(Date.now()>attempt.resetAt){attempt.count=0;attempt.resetAt=Date.now()+60000;} attempt.count++;downloadAttempts.set(remote,attempt);
   if(attempt.count>40)return res.status(429).send('Too many download attempts. Try again in a minute.');
   if(downloadAttempts.size>5000){for(const [ip,value] of downloadAttempts)if(Date.now()>value.resetAt)downloadAttempts.delete(ip);}
-  if(!/^[a-f0-9]{48,64}$/i.test(token)){recordDownloadEvent('access_denied',{detail:'Malformed download token.'});return res.status(404).send('Not found');}
+  if (validateDownload({ record: downloads[token], token, active: activeDownloadTokens.has(token), safePath: true }) === 'malformed'){recordDownloadEvent('access_denied',{detail:'Malformed download token.'});return res.status(404).send('Not found');}
   const t=downloads[token]; const filesRoot=path.resolve(FILES_DIR)+path.sep; const safePath=t?.path&&path.resolve(String(t.path)).startsWith(filesRoot);
-  if(!t||(t.used&&(!t.multiUse||!!t.vaultKey))||activeDownloadTokens.has(token)||(t.expiresAt != null && Date.now()>Number(t.expiresAt))||!safePath||!fs.existsSync(t.path)){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
+  if(validateDownload({ record: t, token, active: activeDownloadTokens.has(token), safePath })){recordDownloadEvent('access_denied',{file:t?.name,customerId:t?.customerId,token,detail:'Expired, used, missing or invalid download token/path.'});return res.status(410).send('This download link has already been used or has expired.');}
 
   const ua = req.headers['user-agent'] || '';
   if (req.method === 'HEAD' || /bot|crawler|spider|preview|embed/i.test(ua)) return res.status(200).send('Download link');
   if (req.method === 'GET') { res.setHeader('Cache-Control', 'no-store'); return res.status(200).type('html').send('<form method="post"><p>Press below to use this one-time download link.</p><button>Confirm download</button></form>'); }
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
-  if (!t.multiUse || t.vaultKey) t.used = true; activeDownloadTokens.add(token); saveDownloads();
+  const { createDownloadLifecycle } = require('./systems/download-lifecycle');
+  const lifecycle = createDownloadLifecycle({
+    record: t,
+    shouldConsume: shouldConsumeDownload,
+    persist: () => commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads),
+    onCompleted: async () => {},
+    onInterrupted: async () => {},
+  });
+  activeDownloadTokens.add(token);
+  try {
+    await lifecycle.reserve();
+  } catch (error) {
+    activeDownloadTokens.delete(token);
+    console.error('Could not reserve download token on Drive:', error.message);
+    return res.status(503).send('Download temporarily unavailable; please retry.');
+  }
   const downloadStartedAt = Date.now();
-  const expectedBytes = fs.statSync(t.path).size;
+  const remoteSource = await resolveCustomerDownloadStream(t.path).catch(() => null);
+  if (!remoteSource) {
+    await lifecycle.interrupted();
+    activeDownloadTokens.delete(token);
+    await commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads).catch(error => console.error('Download release sync failed:', error.message));
+    return res.status(503).send('Download temporarily unavailable');
+  }
+  const expectedBytes = remoteSource.size;
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Length', String(expectedBytes));
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(t.name)}`);
   let finished = false;
   res.on('finish', () => {
     finished = true;
+    void lifecycle.completed().catch(error => console.error('Download completion state failed:', error.message));
     const downloadedAt = Date.now();
     const elapsedMs = downloadedAt - downloadStartedAt;
-    if (!t.multiUse || t.vaultKey) {
+    if (shouldConsumeDownload(t)) {
       try { fs.unlinkSync(t.path); } catch {}
       delete downloads[token];
     }
     activeDownloadTokens.delete(token);
-    saveDownloads();
+    void commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads)
+      .catch(error => console.error('Completed download database commit failed:', error.message));
     recordDownloadEvent('download_completed', {
       file:t.name, customerId:t.customerId, agentId:t.agentId, token,
       detail:`${t.testMode ? '[TEST] ' : ''}Completed file transfer: ${expectedBytes} bytes in ${elapsedMs} ms at ${new Date(downloadedAt).toISOString()}.`
@@ -9211,9 +9483,22 @@ app.all('/:name/:token', (req, res) => {
       downloaded_bytes: String(expectedBytes)
     });
   });
-  res.on('close', () => { if(!finished){t.used=false;activeDownloadTokens.delete(token);saveDownloads();recordDownloadEvent('download_interrupted',{file:t.name,customerId:t.customerId,token,detail:'Connection closed before the file finished; link re-enabled.'});} });
-  const stream = fs.createReadStream(t.path);
-  stream.on('error', (e) => { t.used=false;activeDownloadTokens.delete(token);saveDownloads();recordDownloadEvent('download_failed',{file:t.name,customerId:t.customerId,token,detail:short(e.message,180)});res.destroy(); });
+  res.on('close', () => { if (!finished) {
+    void lifecycle.interrupted().then(async () => {
+      activeDownloadTokens.delete(token);
+      await commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads);
+      recordDownloadEvent('download_interrupted', { file:t.name, customerId:t.customerId, token, detail:'Connection closed before the file finished; link re-enabled.' });
+    }).catch(error => console.error('Interrupted download token release failed:', error.message));
+  } });
+  const stream = remoteSource.stream;
+  stream.on('error', (e) => {
+    void lifecycle.interrupted().then(async () => {
+      activeDownloadTokens.delete(token);
+      await commitNonPaymentDatabaseToDrive(DOWNLOADS_FILE, downloads);
+      recordDownloadEvent('download_failed', { file:t.name, customerId:t.customerId, token, detail:short(e.message,180) });
+    }).catch(error => console.error('Download failure recovery failed:', error.message));
+    res.destroy();
+  });
   stream.pipe(res);
 });
 
