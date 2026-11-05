@@ -15,5 +15,5 @@ test('hashes streamed chunks without holding the full upload', async () => {
 });
 test('rejects transfers beyond configured limit', async () => {
   const meter = createIntegrityMeter({ maxBytes: 2 });
-  await assert.rejects(pipeline(Readable.from([Buffer.from('abc')]), meter, new Writable({ write(c,e,cb) { cb(); } })), /STREAM_SIZE_LIMIT/);
+  await assert.rejects(pipeline(Readable.from([Buffer.from('abc')]), meter, new Writable({ write(c,e,cb) { cb(); } })), /TOO_BIG/);
 });
