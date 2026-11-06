@@ -149,6 +149,10 @@ async function main(){
   const ledgerAudit=await auditRecoveredLedgers({store,dataDir:dir});
   if(ledgerAudit.failed)throw new Error('Primary startup blocked: '+ledgerAudit.failed+' financial ledgers failed authoritative checksum/JSON audit: '+ledgerAudit.results.filter(x=>x.status==='FAIL').map(x=>x.name).join(', '));
   console.log('[PrimaryBoot] Verified',ledgerAudit.passed,'required financial ledgers against authoritative Drive manifest (not an accounting balance audit).');
+  const {reconcileRecoveredData}=require('./systems/primary-recovery-reconciliation');
+  const recovery=await reconcileRecoveredData({store,dataDir:dir});
+  if(recovery.failed)throw new Error('Primary startup blocked: '+recovery.failed+' recovered files differ from authoritative Drive generation: '+recovery.results.filter(x=>x.status==='FAIL').map(x=>x.name).join(', '));
+  console.log('[PrimaryBoot] Reconciled',recovery.passed,'recovered files against immutable Drive generation (not an accounting balance audit).');
   const {applyPathRebase}=require('./systems/primary-path-rebase');
   const {manifest}=await store.currentManifest();
   const rebased=applyPathRebase({dataDir:dir,manifest});
