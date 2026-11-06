@@ -140,6 +140,12 @@ async function main(){
   const store=createGoogleDrivePrimaryStorage({google,auth,dataDir:dir,folderIds:ids});
   const allowSeed=process.env.BANKROLL_DRIVE_INITIALIZE==='I_HAVE_VERIFIED_BACKUPS';
   const result=await preparePrimaryData({store,dataDir:dir,allowSeed});
+  // Refuse to open payment/Discord handlers if any recovered required ledger
+  // differs from the authoritative manifest. Never seed from partial data.
+  const {auditRecoveredLedgers}=require('./systems/primary-ledger-audit');
+  const ledgerAudit=await auditRecoveredLedgers({store,dataDir:dir});
+  if(ledgerAudit.failed)throw new Error('Primary startup blocked: '+ledgerAudit.failed+' financial ledgers failed authoritative checksum/JSON audit: '+ledgerAudit.results.filter(x=>x.status==='FAIL').map(x=>x.name).join(', '));
+  console.log('[PrimaryBoot] Verified',ledgerAudit.passed,'required financial ledgers against authoritative Drive manifest (not an accounting balance audit).');
   const {applyPathRebase}=require('./systems/primary-path-rebase');
   const {manifest}=await store.currentManifest();
   const rebased=applyPathRebase({dataDir:dir,manifest});
