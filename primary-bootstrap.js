@@ -133,9 +133,9 @@ async function main(){
   if(preflight.failed)throw new Error('Primary deployment preflight failed: '+preflight.checks.filter(x=>!x.pass).map(x=>x.name).join(', '));
   const dir=writableDir();
   process.env.DATA_DIR=dir;
-  const lockPath=path.join(dir,'.drive-primary-writer.lock');
-  const lock=fs.openSync(lockPath,'wx',0o600);
-  process.on('exit',()=>{try{fs.closeSync(lock);fs.unlinkSync(lockPath);}catch{}});
+  const {acquireLocalWriterLock}=require('./systems/primary-local-writer-lock');
+  const writerLock=acquireLocalWriterLock(dir);
+  process.on('exit',()=>{try{writerLock.release();}catch(error){console.error('[PrimaryBoot] Lock cleanup failed:',error.message);}});
   await restoreCredentials(dir);
   const auth=oauth(dir);
   const drive=google.drive({version:'v3',auth});
