@@ -1,4 +1,4 @@
-name: Primary recovery integration
+name: Primary storage integration
 on:
   push:
     branches: [feature/drive-authoritative-primary-staging]
@@ -12,4 +12,4 @@ jobs:
         with:
           node-version: '24'
       - run: npm install --ignore-scripts --no-audit --no-fund
-      - run: node --test test/primary-integration.test.js
+      - run: node --test test/primary-integration.test.js test/primary-concurrency-payment.test.js
