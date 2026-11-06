@@ -2253,6 +2253,7 @@ const driveCmd = common(new SlashCommandBuilder().setName('drive').setDescriptio
   .addSubcommand((sub) => sub.setName('selftest').setDescription('Run safe Drive diagnostics and attach a TXT report'))
   .addSubcommand((sub) => sub.setName('readiness-test').setDescription('Run isolated Drive recovery and safety readiness checks'))
   .addSubcommand((sub) => sub.setName('migration-test').setDescription('Run safe isolated migration diagnostics and attach TXT report'))
+  .addSubcommand((sub) => sub.setName('remaining-checks').setDescription('Report remaining primary migration blockers safely'))
   .addSubcommand((sub) => sub.setName('backup').setDescription('Run an immediate Discord and Google Drive backup'))
   .addSubcommand((sub) => sub.setName('snapshot').setDescription('Create a verified primary-storage generation (owner only)'))
   .addSubcommand((sub) => sub.setName('generations').setDescription('List verified Drive snapshot generations (owner only)'))
@@ -7660,6 +7661,16 @@ async function createDriveGenerationStore(drive) {
 async function cmdDrive(interaction) {
   if (interaction.user.id !== OWNER_ID) return interaction.editReply('Only the bot owner can manage Google Drive backups.');
   const sub = interaction.options.getSubcommand();
+  if (sub === 'remaining-checks') {
+    try {
+      const { runRemainingChecks } = require('./systems/drive-remaining-checks');
+      const result = await runRemainingChecks({dataDir:DATA_DIR,primaryEnabled:process.env.BANKROLL_DRIVE_PRIMARY==='1'});
+      return interaction.editReply({content:'BANKROLL remaining checks: '+result.passed+' passed, '+result.failures+' failed, '+result.notRun+' not run.\\nPrimary migration NOT certified. See TXT report.',files:[result.attachment]});
+    } catch(error) {
+      console.error('[DriveRemainingChecks]',error);
+      return interaction.editReply('Remaining checks could not complete: '+String(error.message||error).slice(0,350));
+    }
+  }
   if (sub === 'migration-test') {
     try {
       if (!googleDriveIsConnected()) return interaction.editReply('Google Drive is not connected. Run /drive connect first.');
