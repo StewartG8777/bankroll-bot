@@ -1,0 +1,15 @@
+name: Primary recovery integration
+on:
+  push:
+    branches: [feature/drive-authoritative-primary-staging]
+  workflow_dispatch:
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install --ignore-scripts --no-audit --no-fund
+      - run: node --test test/primary-integration.test.js
