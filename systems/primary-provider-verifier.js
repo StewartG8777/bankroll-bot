@@ -9,16 +9,8 @@ async function verifyProviders({dataDir,stripe,monzoFetch,monzoAccountId,monzoTo
  const results={stripe:{status:'INCOMPLETE'},monzo:{status:'INCOMPLETE'}};
  if(stripe){
   try{
-   const savedIds=Object.keys(stripeSaved);
-   const provider=[];
-   // Retrieve each known ID individually: a 2000-record list cap is not an audit.
-   for(const id of savedIds){
-    const pi=await stripe.paymentIntents.retrieve(id);
-    provider.push(pi);
-   }
-   const comparison=reconcileStripeRecords(stripeSaved,provider);
-   // Individual lookups validate existing records but cannot discover absent ones.
-   results.stripe={status:comparison.issues.length?'MISMATCH':'PARTIAL',issues:comparison.issues,verified:comparison.verifiedProviderRecords,reason:'Existing payment IDs checked; provider-wide missing-payment scan not completed'};
+   const {scanStripeHistory}=require('./primary-stripe-history');
+   results.stripe=await scanStripeHistory({stripe,saved:stripeSaved});
   }catch(error){results.stripe={status:'INCOMPLETE',reason:String(error.message||error)};}
  }
  if(monzoFetch&&monzoToken&&monzoAccountId){
@@ -38,6 +30,6 @@ async function verifyProviders({dataDir,stripe,monzoFetch,monzoAccountId,monzoTo
    results.monzo={status:comparison.issues.length?'MISMATCH':'PARTIAL',issues:comparison.issues,verified:comparison.verifiedProviderRecords,reason:'Existing transaction IDs checked; provider-wide missing-payment scan not completed'};
   }catch(error){results.monzo={status:'INCOMPLETE',reason:String(error.message||error)};}
  }
- return {results,confirmedMismatch:Object.values(results).some(x=>x.status==='MISMATCH'),fullyVerified:false};
+ return {results,confirmedMismatch:Object.values(results).some(x=>x.status==='MISMATCH'),fullyVerified:Object.values(results).every(x=>x.status==='VERIFIED')};
 }
 module.exports={verifyProviders};
