@@ -128,6 +128,9 @@ async function main(){
   if(process.env.BANKROLL_PRIMARY_SINGLE_INSTANCE_CONFIRMED!=='I_HAVE_VERIFIED_ONE_INSTANCE') {
     throw new Error('Primary mode blocked: verify exactly one bot instance and set BANKROLL_PRIMARY_SINGLE_INSTANCE_CONFIRMED=I_HAVE_VERIFIED_ONE_INSTANCE. This is not distributed locking.');
   }
+  const {assessPrimaryDeployment}=require('./systems/primary-deployment-preflight');
+  const preflight=assessPrimaryDeployment();
+  if(preflight.failed)throw new Error('Primary deployment preflight failed: '+preflight.checks.filter(x=>!x.pass).map(x=>x.name).join(', '));
   const dir=writableDir();
   process.env.DATA_DIR=dir;
   const lockPath=path.join(dir,'.drive-primary-writer.lock');
