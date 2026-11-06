@@ -157,6 +157,20 @@ async function main(){
   const accounting=await auditRecoveredAccounting({dataDir:dir});
   if(!accounting.passed)throw new Error('Primary startup blocked: recovered accounting records failed schema audit: '+accounting.issues.join('; '));
   console.log('[PrimaryBoot] Recovered accounting records validated:',accounting.totals.stripePayments,'Stripe and',accounting.totals.monzoPaidTransactions,'deduplicated paid Monzo records. External provider reconciliation remains pending.');
+  const {verifyProviders}=require('./systems/primary-provider-verifier');
+  const Stripe=require('stripe');
+  const providerAudit=await verifyProviders({
+    dataDir:dir,
+    stripe:process.env.STRIPE_SECRET_KEY?new Stripe(process.env.STRIPE_SECRET_KEY):null,
+    monzoFetch:globalThis.fetch,
+    monzoAccountId:process.env.MONZO_ACCOUNT_ID,
+    monzoToken:process.env.MONZO_ACCESS_TOKEN
+  });
+  if(providerAudit.confirmedMismatch)throw new Error('Primary startup blocked: confirmed provider mismatch');
+  console.log('[PrimaryBoot] Provider verification states:',Object.fromEntries(
+    Object.entries(providerAudit.results).map(([name,state])=>[name,state.status])
+  ));
+  if(!providerAudit.fullyVerified)console.warn('[PrimaryBoot] Financial provider verification remains partial or unavailable.');
   const {applyPathRebase}=require('./systems/primary-path-rebase');
   const {manifest}=await store.currentManifest();
   const rebased=applyPathRebase({dataDir:dir,manifest});
