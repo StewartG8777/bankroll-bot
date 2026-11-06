@@ -121,6 +121,13 @@ async function main(){
     require('./index');
     return;
   }
+  // Google Drive does not provide an atomic compare-and-swap lease. Until a
+  // genuine distributed fencing mechanism exists, primary mode is limited to
+  // a deliberately confirmed single-instance deployment. A local lock alone
+  // cannot protect against another Render instance or machine.
+  if(process.env.BANKROLL_PRIMARY_SINGLE_INSTANCE_CONFIRMED!=='I_HAVE_VERIFIED_ONE_INSTANCE') {
+    throw new Error('Primary mode blocked: verify exactly one bot instance and set BANKROLL_PRIMARY_SINGLE_INSTANCE_CONFIRMED=I_HAVE_VERIFIED_ONE_INSTANCE. This is not distributed locking.');
+  }
   const dir=writableDir();
   process.env.DATA_DIR=dir;
   const lockPath=path.join(dir,'.drive-primary-writer.lock');
