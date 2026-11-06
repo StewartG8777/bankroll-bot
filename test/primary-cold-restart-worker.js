@@ -34,6 +34,11 @@ function drive(){
  }};
 }
 (async()=>{
+ if(!objectsDir||!cache){
+  // node --test discovers helper files under test/; only execute in child process.
+  if(process.argv[2]==='seed'||process.argv[2]==='restore')throw Error('Test Drive fixture environment is missing');
+  return;
+ }
  const store=createGoogleDrivePrimaryStorage({google:{drive},auth:{},dataDir:cache,folderIds:FOLDERS,logger:{info(){},warn(){}}});
  if(process.argv[2]==='seed'){
   await fs.mkdir(cache,{recursive:true});
