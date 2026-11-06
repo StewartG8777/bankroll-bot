@@ -153,6 +153,10 @@ async function main(){
   const recovery=await reconcileRecoveredData({store,dataDir:dir});
   if(recovery.failed)throw new Error('Primary startup blocked: '+recovery.failed+' recovered files differ from authoritative Drive generation: '+recovery.results.filter(x=>x.status==='FAIL').map(x=>x.name).join(', '));
   console.log('[PrimaryBoot] Reconciled',recovery.passed,'recovered files against immutable Drive generation (not an accounting balance audit).');
+  const {auditRecoveredAccounting}=require('./systems/primary-accounting-audit');
+  const accounting=await auditRecoveredAccounting({dataDir:dir});
+  if(!accounting.passed)throw new Error('Primary startup blocked: recovered accounting records failed schema audit: '+accounting.issues.join('; '));
+  console.log('[PrimaryBoot] Recovered accounting records validated:',accounting.totals.stripePayments,'Stripe and',accounting.totals.monzoPaidTransactions,'deduplicated paid Monzo records. External provider reconciliation remains pending.');
   const {applyPathRebase}=require('./systems/primary-path-rebase');
   const {manifest}=await store.currentManifest();
   const rebased=applyPathRebase({dataDir:dir,manifest});
