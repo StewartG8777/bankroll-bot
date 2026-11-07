@@ -21,3 +21,10 @@ test('unattributed payments do not invent customer balances',()=>{
  assert.deepEqual(result.totals,{});
  assert.equal(result.issues[0].type,'unattributed-payment');
 });
+
+test('boolean Stripe refund flags cannot be misreported as a 1p refund',()=>{
+ const result=customerPaymentTotals({stripePayments:{pi:{id:'pi',customerId:'alice',amount:10000,refunded:true,currency:'gbp'}}});
+ assert.equal(result.complete,false);
+ assert.deepEqual(result.issues,[{type:'invalid-stripe-refund',id:'pi'}]);
+ assert.deepEqual(result.totals,{});
+});
