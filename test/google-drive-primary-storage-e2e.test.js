@@ -107,7 +107,7 @@ test('offline verified rollback creates safety point, restores older data and mo
   assert.notEqual(older.generation,newer.generation);
   const result=await verifiedOfflineRollback({
     queue:createSerializedStorageQueue(),store,generation:older.generation,confirm:true,
-    assertStopped:async()=>true
+    assertStopped:async()=>true,reconcileAfterRollback:async()=>({safeToPromote:true})
   });
   assert.equal((await store.status()).generation,older.generation);
   assert.equal(JSON.parse(await fs.readFile(path.join(root,'orders.json'),'utf8')).orders,1);
@@ -122,7 +122,7 @@ test('rollback refuses a corrupt generation without changing current pointer or 
   const oldBlob=[...items.values()].find(f=>f.name.endsWith('_orders.json')&&f.bytes.toString().includes('"orders":1'));
   oldBlob.bytes=Buffer.from('corrupt');
   await assert.rejects(verifiedOfflineRollback({
-    queue:createSerializedStorageQueue(),store,generation:first.generation,confirm:true,assertStopped:async()=>true
+    queue:createSerializedStorageQueue(),store,generation:first.generation,confirm:true,assertStopped:async()=>true,reconcileAfterRollback:async()=>({safeToPromote:true})
   }),/verification failed/);
   assert.equal((await store.status()).generation,second.generation);
   assert.equal(JSON.parse(await fs.readFile(path.join(root,'orders.json'),'utf8')).orders,2);
