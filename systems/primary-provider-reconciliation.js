@@ -29,7 +29,7 @@ function reconcileMonzoRecords(saved,transactions){
   const matches=byTx.get(String(tx.id))||[];
   for(const {p} of matches){
    // Monzo API amounts are minor units; saved ledger amounts are major units.
-   if(!Number.isFinite(Number(p.amount))||Math.round(Number(p.amount)*100)!==Math.abs(Number(tx.amount)))issues.push({type:'amount-mismatch',id:tx.id});
+   if(!Number.isFinite(Number(p.amount))||!Number.isSafeInteger(tx.amount)||tx.amount<=0||Math.round(Number(p.amount)*100)!==tx.amount)issues.push({type:'amount-mismatch',id:tx.id});
    if(p.currency&&tx.currency&&String(p.currency).toLowerCase()!==String(tx.currency).toLowerCase())issues.push({type:'currency-mismatch',id:tx.id});
   }
  }
