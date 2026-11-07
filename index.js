@@ -16,6 +16,7 @@ const { getPerformanceSnapshot } = require('./systems/performance');
 const createGoogleDriveSystem = require('./systems/google-drive');
 const {requirePrimaryContext} = require('./systems/primary-storage-context');
 const {protectInteractionDurability,primaryWebhookGate}=require('./systems/primary-ack-guards');
+const {paymentOutageGate,isReadOnlyInteraction}=require('./systems/primary-payment-outage');
 const {isAllowedRelativePath} = require('./systems/google-drive-primary-storage');
 const PRIMARY_MODE = process.env.BANKROLL_DRIVE_PRIMARY === '1';
 const PRIMARY_CONTEXT = PRIMARY_MODE ? requirePrimaryContext() : null;
@@ -7835,6 +7836,13 @@ async function cmdDriveCredentials(interaction) {
 // ---------- Interaction router ----------
 client.on('interactionCreate', async (interaction) => {
   try {
+    if (PRIMARY_MODE && process.env.BANKROLL_PRIMARY_PAYMENT_DEGRADED==='1' && !isReadOnlyInteraction(interaction)) {
+      if (interaction.isRepliable?.()) await interaction.reply({
+        content:'Payment verification is temporarily unavailable. Financial and modifying commands are disabled until verified.',
+        ephemeral:true
+      });
+      return;
+    }
     if (PRIMARY_MODE && !PRIMARY_MANAGER.status().active) {
       if (interaction.isRepliable?.()) await interaction.reply({
         content: 'Bankroll primary storage is still being verified. Please retry shortly.',
@@ -8307,6 +8315,7 @@ async function monitorRenderDeployments() {
 const app = express();
 
 // Do not acknowledge payments before the authoritative generation is saved.
+if (PRIMARY_MODE) app.use(paymentOutageGate({degraded:process.env.BANKROLL_PRIMARY_PAYMENT_DEGRADED==='1'}));
 if (PRIMARY_MODE) app.use(primaryWebhookGate(PRIMARY_MANAGER));
 
 // ShareX uploads are authenticated with a dedicated secret. ShareX sends the
