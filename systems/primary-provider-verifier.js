@@ -7,10 +7,11 @@ async function verifyProviders({dataDir,stripe,monzoFetch,monzoAccountId,monzoTo
  const stripeSaved=JSON.parse(await fs.readFile(path.join(dataDir,'stripe_ledger.json'),'utf8')).payments;
  const monzoSaved=JSON.parse(await fs.readFile(path.join(dataDir,'monzo_payments.json'),'utf8'));
  const results={stripe:{status:'INCOMPLETE'},monzo:{status:'INCOMPLETE'}};
+ const stripeProvider=[],monzoProvider=[];
  if(stripe){
   try{
    const {scanStripeHistory}=require('./primary-stripe-history');
-   results.stripe=await scanStripeHistory({stripe,saved:stripeSaved});
+   results.stripe=await scanStripeHistory({stripe,saved:stripeSaved,onPayment:pi=>stripeProvider.push(pi)});
   }catch(error){results.stripe={status:'INCOMPLETE',reason:String(error.message||error)};}
  }
  if(monzoFetch&&monzoToken&&monzoAccountId){
@@ -25,6 +26,7 @@ async function verifyProviders({dataDir,stripe,monzoFetch,monzoAccountId,monzoTo
     const body=await response.json();
     if(!body.transaction||String(body.transaction.account_id)!==String(monzoAccountId))throw Error('Monzo transaction account mismatch');
     transactions.push(body.transaction);
+    monzoProvider.push(body.transaction);
    }
    const comparison=reconcileMonzoRecords(monzoSaved,transactions);
    if(comparison.issues.length){
@@ -42,6 +44,10 @@ async function verifyProviders({dataDir,stripe,monzoFetch,monzoAccountId,monzoTo
    }
   }catch(error){results.monzo={status:'INCOMPLETE',reason:String(error.message||error)};}
  }
- return {results,confirmedMismatch:Object.values(results).some(x=>x.status==='MISMATCH'),fullyVerified:Object.values(results).every(x=>x.status==='VERIFIED')};
+ const {verifyCustomerPayments}=require('./primary-customer-provider-verification');
+ const customers=verifyCustomerPayments({stripeSaved,stripeProvider,monzoSaved,monzoProvider,
+  stripeHistoryComplete:results.stripe.complete===true,
+  monzoHistoryComplete:results.monzo.status==='VERIFIED'});
+ return {results,customers,confirmedMismatch:Object.values(results).some(x=>x.status==='MISMATCH'),fullyVerified:Object.values(results).every(x=>x.status==='VERIFIED')};
 }
 module.exports={verifyProviders};
