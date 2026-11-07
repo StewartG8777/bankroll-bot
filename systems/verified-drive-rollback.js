@@ -15,7 +15,10 @@ async function verifiedOfflineRollback({ queue, store, generation, flush = async
     try {
       const applied = await store.restoreGeneration(generation);
       const reconciliation=await reconcileAfterRollback({targetGeneration:generation,safetyGeneration:safety.generation});
-      if(reconciliation?.safeToPromote!==true)throw new Error('Post-rollback payment reconciliation did not approve promotion');
+      if(reconciliation?.safeToPromote!==true){
+        await store.restoreGeneration(safety.generation);
+        throw new Error('Post-rollback payment reconciliation did not approve promotion; safety generation restored locally');
+      }
       const promoted = await store.promoteGeneration(generation);
       return { restored: applied, promoted, safetyGeneration: safety.generation, verifiedFiles: target.files };
     } catch (error) {
