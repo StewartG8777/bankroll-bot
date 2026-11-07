@@ -12,7 +12,8 @@ function customerPaymentTotals({stripePayments={},monzoPayments={}}){
  };
  for(const [key,p] of Object.entries(stripePayments)){
   if(!p||p.id!==key||!Number.isSafeInteger(p.amount)||p.amount<0){issues.push({type:'invalid-stripe-record',id:key});continue;}
-  const refunded=Number(p.refunded||0);
+  // Boolean refund flags are not monetary amounts; fail closed rather than inventing 1p.
+  const refunded=typeof p.refunded==='boolean'?NaN:Number(p.refunded??0);
   if(!Number.isSafeInteger(refunded)||refunded<0||refunded>p.amount){issues.push({type:'invalid-stripe-refund',id:key});continue;}
   const currency=String(p.currency||'').toLowerCase();
   if(!currency){issues.push({type:'missing-currency',provider:'stripe',id:key});continue;}
