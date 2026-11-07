@@ -170,7 +170,12 @@ async function main(){
   console.log('[PrimaryBoot] Provider verification states:',Object.fromEntries(
     Object.entries(providerAudit.results).map(([name,state])=>[name,state.status])
   ));
-  if(!providerAudit.fullyVerified)console.warn('[PrimaryBoot] Financial provider verification remains partial or unavailable.');
+  // Until payment-specific command and webhook gates are independently tested,
+  // do not start a process that can accept payments on incomplete verification.
+  if(!providerAudit.fullyVerified)throw new Error(
+    'Primary startup blocked: provider reconciliation incomplete. Payment operations cannot safely be enabled. '+
+    'Keep the existing production deployment active; do not bypass this guard.'
+  );
   const {applyPathRebase}=require('./systems/primary-path-rebase');
   const {manifest}=await store.currentManifest();
   const rebased=applyPathRebase({dataDir:dir,manifest});
