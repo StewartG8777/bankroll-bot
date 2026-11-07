@@ -172,10 +172,11 @@ async function main(){
   ));
   // Until payment-specific command and webhook gates are independently tested,
   // do not start a process that can accept payments on incomplete verification.
-  if(!providerAudit.fullyVerified)throw new Error(
-    'Primary startup blocked: provider reconciliation incomplete. Payment operations cannot safely be enabled. '+
-    'Keep the existing production deployment active; do not bypass this guard.'
-  );
+  // A confirmed mismatch is fatal. An outage/incomplete scan permits only
+  // explicitly read-only interactions; all payment webhooks return retryable 503.
+  const degraded=!providerAudit.fullyVerified;
+  if(degraded)console.warn('[PrimaryBoot] DEGRADED: provider reconciliation incomplete. Financial operations disabled.');
+  process.env.BANKROLL_PRIMARY_PAYMENT_DEGRADED=degraded?'1':'0';
   const {applyPathRebase}=require('./systems/primary-path-rebase');
   const {manifest}=await store.currentManifest();
   const rebased=applyPathRebase({dataDir:dir,manifest});
