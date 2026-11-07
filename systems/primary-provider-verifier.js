@@ -27,7 +27,19 @@ async function verifyProviders({dataDir,stripe,monzoFetch,monzoAccountId,monzoTo
     transactions.push(body.transaction);
    }
    const comparison=reconcileMonzoRecords(monzoSaved,transactions);
-   results.monzo={status:comparison.issues.length?'MISMATCH':'PARTIAL',issues:comparison.issues,verified:comparison.verifiedProviderRecords,reason:'Existing transaction IDs checked; provider-wide missing-payment scan not completed'};
+   if(comparison.issues.length){
+    results.monzo={status:'MISMATCH',issues:comparison.issues,verified:comparison.verifiedProviderRecords};
+   }else if(process.env.BANKROLL_MONZO_HISTORY_SINCE){
+    const since=Date.parse(process.env.BANKROLL_MONZO_HISTORY_SINCE);
+    const {scanMonzoHistory}=require('./primary-monzo-history');
+    const review=JSON.parse(await fs.readFile(path.join(dataDir,'monzo_review.json'),'utf8'));
+    const scan=await scanMonzoHistory({fetch:monzoFetch,token:monzoToken,accountId:monzoAccountId,
+     saved:monzoSaved,review,since});
+    results.monzo={...scan,verifiedSavedTransactions:comparison.verifiedProviderRecords};
+   }else{
+    results.monzo={status:'PARTIAL',verified:comparison.verifiedProviderRecords,
+     reason:'Saved transaction IDs verified; set BANKROLL_MONZO_HISTORY_SINCE to scan account history. Unclassified incoming transfers require review.'};
+   }
   }catch(error){results.monzo={status:'INCOMPLETE',reason:String(error.message||error)};}
  }
  return {results,confirmedMismatch:Object.values(results).some(x=>x.status==='MISMATCH'),fullyVerified:Object.values(results).every(x=>x.status==='VERIFIED')};
