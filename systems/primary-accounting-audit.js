@@ -36,6 +36,14 @@ async function auditRecoveredAccounting({dataDir}){
    totals.monzoMajorUnitsByCurrency[currency]=(totals.monzoMajorUnitsByCurrency[currency]||0)+p.amount;
   }
  }
- return {passed:issues.length===0,issues,totals,externalProviderVerified:false,customerBalancesRecomputed:false};
+ const {customerPaymentTotals}=require('./primary-customer-reconciliation');
+ const customerReconciliation=customerPaymentTotals({
+  stripePayments:stripe?.payments||{},monzoPayments:monzo||{}
+ });
+ // Unattributed historical payments are reported as incomplete, not invented
+ // customer balances. Keep legacy startup schema behavior unchanged.
+ return {passed:issues.length===0,issues,totals,
+  customerReconciliation,externalProviderVerified:false,
+  customerBalancesRecomputed:false};
 }
 module.exports={auditRecoveredAccounting};
