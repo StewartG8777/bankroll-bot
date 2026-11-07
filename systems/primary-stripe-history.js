@@ -1,7 +1,7 @@
 'use strict';
 // Exhaustive Stripe PaymentIntent scan. No fixed 2000-record cap.
 // Never classify a truncated/failed scan as an authoritative mismatch.
-async function scanStripeHistory({stripe,saved,maxPages=100000}){
+async function scanStripeHistory({stripe,saved,maxPages=100000,onPayment}){
  if(!stripe?.paymentIntents?.list)throw Error('Stripe payment listing unavailable');
  const found=new Map(),issues=[];
  let cursor,complete=false,pages=0;
@@ -14,6 +14,7 @@ async function scanStripeHistory({stripe,saved,maxPages=100000}){
    if(!pi?.id)throw Error('Stripe payment without ID');
    if(found.has(pi.id))throw Error('Duplicate Stripe pagination ID');
    found.set(pi.id,pi);
+   if(onPayment)onPayment(pi);
   }
   complete=!page.has_more;
   if(!complete){
