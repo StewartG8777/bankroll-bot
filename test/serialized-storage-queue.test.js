@@ -36,7 +36,7 @@ test('offline rollback refuses unconfirmed or online operations', async () => {
   const q = createSerializedStorageQueue();
   const store = {verifyGeneration(){ throw Error('should not be called'); }};
   await assert.rejects(verifiedOfflineRollback({queue:q,store,generation:'g',assertStopped:async()=>true}),/confirmation/);
-  await assert.rejects(verifiedOfflineRollback({queue:q,store,generation:'g',confirm:true,assertStopped:async()=>false}),/stopped/);
+  await assert.rejects(verifiedOfflineRollback({queue:q,store,generation:'g',confirm:true,assertStopped:async()=>false,reconcileAfterRollback:async()=>({safeToPromote:true})}),/stopped/);
 });
 test('offline rollback verifies target and saves a safety generation before applying', async () => {
   const q = createSerializedStorageQueue(), order = [];
@@ -46,7 +46,7 @@ test('offline rollback verifies target and saves a safety generation before appl
     async restoreGeneration(id) { order.push('restore:'+id);return {generation:id}; },
     async promoteGeneration(id) { order.push('promote:'+id);return {generation:id}; }
   };
-  const result = await verifiedOfflineRollback({queue:q,store,generation:'older',confirm:true,assertStopped:async()=>true});
+  const result = await verifiedOfflineRollback({queue:q,store,generation:'older',confirm:true,assertStopped:async()=>true,reconcileAfterRollback:async()=>({safeToPromote:true})});
   assert.deepEqual(order,['verify:older','safety','restore:older','promote:older']);
   assert.equal(result.safetyGeneration,'before');
   assert.equal(result.promoted.generation,'older');
