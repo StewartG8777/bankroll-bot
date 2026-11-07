@@ -1,0 +1,22 @@
+name: Read-only live payment provider smoke test
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  provider-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund --package-lock=false
+      - name: Verify Stripe and Monzo read-only API access
+        env:
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          MONZO_ACCESS_TOKEN: ${{ secrets.MONZO_ACCESS_TOKEN }}
+          MONZO_ACCOUNT_ID: ${{ secrets.MONZO_ACCOUNT_ID }}
+        run: node scripts/provider-api-smoke.js
