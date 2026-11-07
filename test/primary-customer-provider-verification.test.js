@@ -27,3 +27,9 @@ test('missing Monzo provider transaction remains unverified',()=>{
  const r=verifyCustomerPayments({monzoSaved:{one:{status:'paid',txId:'tx',customerId:'alice',amount:50,currency:'gbp'}}});
  assert.equal(r.issues[0].type,'unverified-monzo-transaction');
 });
+
+test('outgoing Monzo transfer cannot verify a paid invoice',()=>{
+ const {reconcileMonzoRecords}=require('../systems/primary-provider-reconciliation');
+ const result=reconcileMonzoRecords({invoice:{status:'paid',txId:'tx',amount:50,currency:'gbp'}},[{id:'tx',amount:-5000,currency:'GBP'}]);
+ assert.ok(result.issues.some(issue=>issue.type==='amount-mismatch'));
+});
